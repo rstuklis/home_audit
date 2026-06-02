@@ -40,6 +40,7 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -433,12 +434,14 @@ def speed_test(duration=6):
 def tplink_dsl_stats(ip, password):
     """Log into the TP-Link VX420-G2h and scrape DSL line statistics.
 
-    Returns a dict with keys: downstream_kbps, upstream_kbps,
-    downstream_snr_db, upstream_snr_db, downstream_attn_db, upstream_attn_db.
-    Any value may be None if it could not be read.
+    The VX420-G2h uses a JavaScript-driven login via:
+      POST /cgi/login?UserName=admin&Passwd=<base64pwd>&Action=1&LoginStatus=0
+
+    Returns (stats_dict, note_string). Stats keys:
+      downstream_kbps, upstream_kbps, downstream_snr_db, upstream_snr_db,
+      downstream_attn_db, upstream_attn_db.  Any value may be None.
     """
-    import base64
-    import http.cookiejar
+    import base64, http.cookiejar, http.client
 
     base = f"http://{ip}"
     stats = {
@@ -449,61 +452,71 @@ def tplink_dsl_stats(ip, password):
 
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    hdrs = {"User-Agent": "home_net_audit", "Referer": base + "/"}
 
-    # TP-Link VX420 uses Basic Auth or a form POST depending on firmware.
-    # Try Basic Auth first (most common for ISP-provisioned units).
-    creds = base64.b64encode(f"admin:{password}".encode()).decode()
-    headers = {
-        "User-Agent": "home_net_audit",
-        "Authorization": f"Basic {creds}",
-        "Referer": base + "/",
-    }
+    def fetch(url, post=False):
+        try:
+            req = urllib.request.Request(url, data=(b"" if post else None), headers=hdrs)
+            with opener.open(req, timeout=6) as r:
+                return r.read().decode("utf-8", "ignore")
+        except http.client.IncompleteRead as e:
+            return e.partial.decode("utf-8", "ignore")
+        except Exception:
+            return ""
 
-    # Candidate pages that may contain DSL stats on TP-Link VDSL routers
+    # --- Login ---
+    b64pwd = base64.b64encode(password.encode()).decode()
+    login_url = (f"{base}/cgi/login?UserName=admin"
+                 f"&Passwd={urllib.parse.quote(b64pwd)}"
+                 f"&Action=1&LoginStatus=0")
+    login_resp = fetch(login_url, post=True)
+    if not jar._cookies and "success" not in login_resp.lower():
+        # Try MD5 hash variant some firmwares use
+        import hashlib
+        md5pwd = hashlib.md5(password.encode()).hexdigest().upper()
+        login_url2 = (f"{base}/cgi/login?UserName=admin"
+                      f"&Passwd={md5pwd}&Action=1&LoginStatus=0")
+        fetch(login_url2, post=True)
+
+    # --- Fetch DSL stats pages ---
     dsl_paths = [
-        "/cgi-bin/luci/admin/network/dslstatus",
-        "/cgi-bin/luci/;stok=/admin/network/xdsl",
-        "/cgi-bin/luci/admin/xdsl",
-        "/html/status/dslstatus.html",
-        "/cgi?8",                        # TP-Link TR-069 style
+        "/html/status/xdslStatus.html",
+        "/html/advance/xdsl.html",
+        "/html/status/dslStatus.html",
+        "/cgi/getAdsl",
+        "/cgi/getDsl",
+        "/cgi/getXdsl",
+        "/cgi/getStatus?resource=dsl",
+        "/userRpm/StatusRpm.htm",
     ]
 
-    raw_html = ""
+    raw = ""
     for path in dsl_paths:
-        try:
-            req = urllib.request.Request(base + path, headers=headers)
-            with opener.open(req, timeout=5) as r:
-                raw_html = r.read().decode("utf-8", "ignore")
-            if any(kw in raw_html.lower() for kw in ["snr", "downstream", "attenuation", "sync"]):
-                break
-            raw_html = ""
-        except Exception:
-            continue
+        raw = fetch(base + path)
+        if raw and any(kw in raw.lower() for kw in
+                       ["snr", "attenuation", "downstream", "upstream", "sync rate"]):
+            break
+        raw = ""
 
-    if not raw_html:
-        # Fallback: try fetching the main status page
-        try:
-            req = urllib.request.Request(base + "/", headers=headers)
-            with opener.open(req, timeout=5) as r:
-                raw_html = r.read().decode("utf-8", "ignore")
-        except Exception:
-            return stats, "Could not connect to TP-Link admin page"
+    if not raw:
+        return stats, ("Could not retrieve DSL stats — authentication may have failed "
+                       "or firmware uses unknown page paths")
 
-    # Parse numeric values from HTML — TP-Link embeds them in various formats
+    # --- Parse ---
     patterns = {
-        "downstream_kbps":  [r"[Dd]ownstream[^<]*?(\d{3,6})\s*[Kk]bps",
-                              r"[Dd]own[^<]*?[Ss]peed[^<]*?(\d{3,6})"],
-        "upstream_kbps":    [r"[Uu]pstream[^<]*?(\d{3,6})\s*[Kk]bps",
-                              r"[Uu]p[^<]*?[Ss]peed[^<]*?(\d{3,6})"],
-        "downstream_snr_db":[r"[Dd]ownstream[^<]*?SNR[^<]*?([\d.]+)",
-                              r"SNR[^<]*?[Mm]argin[^<]*?([\d.]+)"],
-        "upstream_snr_db":  [r"[Uu]pstream[^<]*?SNR[^<]*?([\d.]+)"],
-        "downstream_attn_db":[r"[Dd]ownstream[^<]*?[Aa]ttenuation[^<]*?([\d.]+)"],
-        "upstream_attn_db": [r"[Uu]pstream[^<]*?[Aa]ttenuation[^<]*?([\d.]+)"],
+        "downstream_kbps":   [r"[Dd]own(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps",
+                               r"[Ss]ync\s*[Rr]ate[^<]{0,30}[Dd]own[^<]{0,20}(\d{3,6})"],
+        "upstream_kbps":     [r"[Uu]p(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps",
+                               r"[Ss]ync\s*[Rr]ate[^<]{0,30}[Uu]p[^<]{0,20}(\d{3,6})"],
+        "downstream_snr_db": [r"[Dd]own(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)",
+                               r"SNR[^<]{0,20}[Mm]argin[^<]{0,30}([\d.]+)"],
+        "upstream_snr_db":   [r"[Uu]p(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)"],
+        "downstream_attn_db":[r"[Dd]own(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)"],
+        "upstream_attn_db":  [r"[Uu]p(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)"],
     }
     for key, pats in patterns.items():
         for pat in pats:
-            m = re.search(pat, raw_html)
+            m = re.search(pat, raw)
             if m:
                 try:
                     stats[key] = float(m.group(1))
@@ -512,7 +525,7 @@ def tplink_dsl_stats(ip, password):
                 break
 
     note = "" if any(v is not None for v in stats.values()) else \
-        "Connected but no DSL stats found — firmware may use a different page layout"
+        "Connected but no DSL values parsed — page found but format unrecognised"
     return stats, note
 
 
