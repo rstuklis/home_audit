@@ -243,7 +243,7 @@ def is_real_host(ip, mac, subnet):
     return True
 
 
-def discover_devices(subnet, workers=120):
+def discover_devices(subnet, workers=50):
     """Ping-sweep the subnet, then read the ARP cache to map IP -> MAC."""
     hosts = [h for h in subnet.hosts()]
     alive = set()
