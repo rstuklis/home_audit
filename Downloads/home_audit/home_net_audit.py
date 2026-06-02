@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 
 BASELINE_DIR = os.path.expanduser("~/.home_net_audit")
 BASELINE_FILE = os.path.join(BASELINE_DIR, "baseline.json")
+LABELS_FILE = os.path.join(BASELINE_DIR, "labels.json")
 
 # Ports worth checking on the router, with a plain-English risk note.
 # (port: (service, risk_level, explanation))
@@ -338,6 +339,21 @@ def save_baseline(state):
         json.dump(state, f, indent=2)
 
 
+def load_labels():
+    """Return {mac: label} dict from the labels file."""
+    try:
+        with open(LABELS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_labels(labels):
+    os.makedirs(BASELINE_DIR, exist_ok=True)
+    with open(LABELS_FILE, "w") as f:
+        json.dump(labels, f, indent=2)
+
+
 def diff_baseline(old, new):
     """Return human-readable changes between two audit states."""
     notes = []
@@ -380,11 +396,23 @@ def main():
     ap.add_argument("--full", action="store_true", help="Full router port scan (1-65535, slower)")
     ap.add_argument("--no-vendors", action="store_true", help="Skip online vendor lookups (faster)")
     ap.add_argument("--no-save-baseline", action="store_true", help="Skip saving this run as the comparison baseline")
+    ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
+                    help="Tag a device MAC with a friendly name, e.g. --label b8:27:eb:5d:38:ca='Clever Logger'")
     ap.add_argument("--no-discovery", action="store_true", help="Skip the LAN device sweep")
     args = ap.parse_args()
 
     if sys.platform != "darwin":
         print("Note: written for macOS. Some system commands may differ on this OS.\n")
+
+    # --- Labels ---
+    labels = load_labels()
+    if args.label:
+        for entry in args.label:
+            if "=" in entry:
+                mac, name = entry.split("=", 1)
+                labels[mac.strip().lower()] = name.strip()
+        save_labels(labels)
+        print(f"Labels saved ({len(labels)} total).\n")
 
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
@@ -487,10 +515,20 @@ def main():
 
         state["devices"] = all_devices
         print(f"\nFound {len(all_devices)} device(s) across {len(subnets_to_sweep)} subnet(s):")
+        unlabelled = []
         for d in all_devices:
-            vend = f"  {d.get('vendor','')}" if d.get("vendor") else ""
-            print(f"  {d['ip']:<15} {d['mac']}  [{d.get('subnet','')}]{vend}")
-        print("\nReview this list: anything you don't recognise is worth chasing down.")
+            mac = d["mac"]
+            name = labels.get(mac.lower(), "")
+            vend = d.get("vendor", "")
+            display_name = name or vend
+            tag = f"  {display_name}" if display_name else ""
+            flag = "" if name else "  <-- unlabelled"
+            print(f"  {d['ip']:<15} {mac}  [{d.get('subnet','')}]{tag}{flag}")
+            if not name:
+                unlabelled.append(mac)
+        if unlabelled:
+            print(f"\n{len(unlabelled)} unlabelled device(s). Tag them with:")
+            print(f"  python3 home_net_audit.py --label MAC='Device Name' ...")
 
     # --- Baseline comparison ---
     hr("CHANGE DETECTION (vs saved baseline)")
