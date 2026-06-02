@@ -379,7 +379,7 @@ def main():
     ap.add_argument("--upstream", help="IP of an upstream modem to scan separately, e.g. 192.168.0.1")
     ap.add_argument("--full", action="store_true", help="Full router port scan (1-65535, slower)")
     ap.add_argument("--no-vendors", action="store_true", help="Skip online vendor lookups (faster)")
-    ap.add_argument("--save-baseline", action="store_true", help="Save this run as the comparison baseline")
+    ap.add_argument("--no-save-baseline", action="store_true", help="Skip saving this run as the comparison baseline")
     ap.add_argument("--no-discovery", action="store_true", help="Skip the LAN device sweep")
     args = ap.parse_args()
 
@@ -508,7 +508,7 @@ def main():
         print("No baseline saved yet. Run again with --save-baseline once you've")
         print("confirmed everything above looks correct, to enable change detection.")
 
-    if args.save_baseline:
+    if not args.no_save_baseline:
         save_baseline(state)
         print(f"\nBaseline saved to {BASELINE_FILE}")
 
