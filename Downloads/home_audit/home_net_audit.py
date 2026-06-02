@@ -40,6 +40,7 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,52 @@ def diff_baseline(old, new):
 # Reporting
 # ---------------------------------------------------------------------------
 
+def speed_test(duration=6):
+    """Measure download and upload speed using Cloudflare's speed test endpoints.
+    Returns (download_mbps, upload_mbps) — either may be None on failure.
+    Uses only the standard library; no pip installs required.
+    """
+    # --- Download: fetch a 10 MB file from Cloudflare's CDN ---
+    dl_url = "https://speed.cloudflare.com/__down?bytes=10000000"
+    dl_mbps = None
+    try:
+        req = urllib.request.Request(dl_url, headers={"User-Agent": "home_net_audit"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=15) as r:
+            total = 0
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if time.time() - t0 > duration:
+                    break
+        elapsed = time.time() - t0
+        if elapsed > 0 and total > 0:
+            dl_mbps = (total * 8) / elapsed / 1_000_000
+    except Exception:
+        pass
+
+    # --- Upload: POST random data to Cloudflare's upload endpoint ---
+    ul_url = "https://speed.cloudflare.com/__up"
+    ul_mbps = None
+    try:
+        data = os.urandom(5_000_000)  # 5 MB
+        req = urllib.request.Request(ul_url, data=data,
+                                     headers={"User-Agent": "home_net_audit",
+                                              "Content-Type": "application/octet-stream"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+        elapsed = time.time() - t0
+        if elapsed > 0:
+            ul_mbps = (len(data) * 8) / elapsed / 1_000_000
+    except Exception:
+        pass
+
+    return dl_mbps, ul_mbps
+
+
 def hr(title=""):
     print("\n" + "=" * 64)
     if title:
@@ -400,6 +447,7 @@ def main():
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
                     help="Tag a device MAC with a friendly name, e.g. --label b8:27:eb:5d:38:ca='Clever Logger'")
     ap.add_argument("--no-discovery", action="store_true", help="Skip the LAN device sweep")
+    ap.add_argument("--no-speedtest", action="store_true", help="Skip the speed test")
     args = ap.parse_args()
 
     if sys.platform != "darwin":
@@ -538,6 +586,24 @@ def main():
         if unlabelled:
             print(f"\n{len(unlabelled)} unidentified device(s). Tag them with:")
             print(f"  python3 home_net_audit.py --label MAC='Device Name' ...")
+
+    # --- Speed test ---
+    if not args.no_speedtest:
+        hr("SPEED TEST")
+        dl, ul = speed_test()
+        if dl:
+            print(f"Download : {dl:.1f} Mbps")
+            rating = "good" if dl >= 20 else "slow" if dl >= 5 else "very slow"
+            print(f"           ({rating} for FTTC — typical range 20-100 Mbps on a dry day)")
+        else:
+            print("Download : could not measure (no internet?)")
+        if ul:
+            print(f"Upload   : {ul:.1f} Mbps")
+        else:
+            print("Upload   : could not measure")
+        state["speed_download_mbps"] = dl
+        state["speed_upload_mbps"] = ul
+        state["speed_timestamp"] = datetime.now(timezone.utc).isoformat()
 
     # --- Baseline comparison ---
     hr("CHANGE DETECTION (vs saved baseline)")
