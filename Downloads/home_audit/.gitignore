@@ -1,0 +1,11 @@
+# Ignore everything outside this project folder
+../../*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
