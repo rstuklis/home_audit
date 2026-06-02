@@ -104,7 +104,6 @@ def get_default_gateway():
     m = re.search(r"gateway:\s*([\d.]+)", out)
     if m:
         return m.group(1)
-    # Fallback for other layouts
     out = run(["netstat", "-rn"])
     for line in out.splitlines():
         if line.startswith("default"):
@@ -112,6 +111,35 @@ def get_default_gateway():
             if len(parts) >= 2 and re.match(r"[\d.]+$", parts[1]):
                 return parts[1]
     return None
+
+
+def get_all_interfaces():
+    """Return a list of (interface, local_ip, subnet) for every active IPv4
+    interface — so Wi-Fi, a second mesh network, or a wired port are all found."""
+    out = run(["ifconfig", "-a"])
+    results = []
+    current_iface = None
+    for line in out.splitlines():
+        iface_m = re.match(r"^(\w+):", line)
+        if iface_m:
+            current_iface = iface_m.group(1)
+        inet_m = re.search(r"inet ([\d.]+)\s+netmask (0x[0-9a-f]+|[\d.]+)", line)
+        if inet_m and current_iface:
+            ip = inet_m.group(1)
+            mask_raw = inet_m.group(2)
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            try:
+                if mask_raw.startswith("0x"):
+                    mask_int = int(mask_raw, 16)
+                    mask = socket.inet_ntoa(mask_int.to_bytes(4, "big"))
+                else:
+                    mask = mask_raw
+                net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+                results.append((current_iface, ip, net))
+            except ValueError:
+                pass
+    return results
 
 
 def get_local_ip():
@@ -347,7 +375,8 @@ def hr(title=""):
 
 def main():
     ap = argparse.ArgumentParser(description="Defensive audit of your own home network.")
-    ap.add_argument("--subnet", help="Override subnet, e.g. 192.168.1.0/24")
+    ap.add_argument("--subnet", nargs="+", help="One or more subnets to sweep, e.g. 192.168.1.0/24 192.168.86.0/24")
+    ap.add_argument("--upstream", help="IP of an upstream modem to scan separately, e.g. 192.168.0.1")
     ap.add_argument("--full", action="store_true", help="Full router port scan (1-65535, slower)")
     ap.add_argument("--no-vendors", action="store_true", help="Skip online vendor lookups (faster)")
     ap.add_argument("--save-baseline", action="store_true", help="Save this run as the comparison baseline")
@@ -359,38 +388,51 @@ def main():
 
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
-    # --- Router ---
-    hr("ROUTER")
-    gateway = get_default_gateway()
+    # --- Network interfaces ---
+    hr("NETWORK INTERFACES")
+    interfaces = get_all_interfaces()
     local_ip = get_local_ip()
-    print(f"Your Mac's IP : {local_ip}")
-    print(f"Router (gateway): {gateway}")
+    print(f"Your Mac's primary IP: {local_ip}")
+    if interfaces:
+        print("Active interfaces found:")
+        for iface, ip, net in interfaces:
+            print(f"  {iface:<8} {ip:<16} subnet: {net}")
+    else:
+        print("Could not enumerate interfaces; falling back to primary IP only.")
+
+    # --- Router(s) ---
+    hr("ROUTER / GATEWAY")
+    gateway = get_default_gateway()
+    print(f"Default gateway: {gateway}")
     state["gateway"] = gateway
 
-    if gateway:
+    def audit_host(label, host):
         port_set = range(1, 65536) if args.full else COMMON_PORTS
-        print(f"Scanning {'all 65535' if args.full else len(COMMON_PORTS)} ports on the router...")
+        print(f"\nScanning {'all 65535' if args.full else len(COMMON_PORTS)} ports on {label} ({host})...")
         t0 = time.time()
-        open_ports = scan_ports(gateway, port_set)
-        state["router_open_ports"] = open_ports
+        open_ports = scan_ports(host, port_set)
         print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
-
-        hr("ROUTER SERVICE ASSESSMENT")
         if not open_ports:
-            print("No open ports detected on the router from the LAN side.")
+            print("  No open ports detected.")
         for p in open_ports:
             svc, risk, note = PORTS_OF_INTEREST.get(p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
             print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
-
-        tls = check_tls(gateway)
-        print(f"\nHTTPS admin certificate present: {tls.get('present')}")
+        tls = check_tls(host)
+        print(f"  HTTPS certificate present: {tls.get('present')}")
         if open_ports and 80 in open_ports and 443 not in open_ports:
-            print("  Note: port 80 is open without 443. If your router exposes a")
-            print("  browser-based admin page, prefer HTTPS for it. But app-managed")
-            print("  mesh systems (Google Nest Wifi, eero, etc.) have NO web login —")
-            print("  on those, 80/5000/8080 are local service ports used by the")
-            print("  vendor's app, not an exposed admin panel. What actually matters")
-            print("  is WAN (internet-side) exposure, not these LAN-side ports.")
+            print("  Note: port 80 open without 443. App-managed mesh systems")
+            print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
+        return open_ports
+
+    if gateway:
+        open_ports = audit_host("default gateway", gateway)
+        state["router_open_ports"] = open_ports
+
+    if args.upstream:
+        hr("UPSTREAM MODEM")
+        print(f"Scanning upstream modem at {args.upstream} ...")
+        upstream_ports = audit_host("upstream modem", args.upstream)
+        state["upstream_open_ports"] = upstream_ports
 
     # --- DNS ---
     hr("DNS SETTINGS")
@@ -411,27 +453,44 @@ def main():
     # --- Devices ---
     if not args.no_discovery:
         hr("CONNECTED DEVICES")
-        subnet = ipaddress.ip_network(args.subnet, strict=False) if args.subnet else guess_subnet(local_ip)
-        if subnet:
+        # Build list of subnets to sweep: CLI overrides first, then auto-detected interfaces
+        if args.subnet:
+            subnets_to_sweep = [ipaddress.ip_network(s, strict=False) for s in args.subnet]
+        elif interfaces:
+            subnets_to_sweep = list({net for _, _, net in interfaces})
+        else:
+            fb = guess_subnet(local_ip)
+            subnets_to_sweep = [fb] if fb else []
+
+        if not subnets_to_sweep:
+            print("Could not determine any subnet; pass one with --subnet 192.168.1.0/24")
+
+        all_devices = []
+        seen_ips = set()
+        for subnet in subnets_to_sweep:
             print(f"Sweeping {subnet} (this takes ~10-30s)...")
             devices = discover_devices(subnet)
-            if not args.no_vendors:
-                print("Looking up device vendors (the free API is rate-limited, "
-                      "so this adds a few seconds)...")
-                for d in devices:
-                    mac = d["mac"]
-                    hits_api = mac != "unknown" and not is_randomized_mac(mac)
-                    d["vendor"] = lookup_vendor(mac)
-                    if hits_api:
-                        time.sleep(1.1)  # be polite to the free vendor API
-            state["devices"] = devices
-            print(f"\nFound {len(devices)} device(s):")
             for d in devices:
-                vend = f"  {d.get('vendor','')}" if d.get("vendor") else ""
-                print(f"  {d['ip']:<15} {d['mac']}{vend}")
-            print("\nReview this list: anything you don't recognise is worth chasing down.")
-        else:
-            print("Could not determine subnet; pass one with --subnet 192.168.1.0/24")
+                if d["ip"] not in seen_ips:
+                    seen_ips.add(d["ip"])
+                    all_devices.append({**d, "subnet": str(subnet)})
+
+        if not args.no_vendors and all_devices:
+            print("Looking up device vendors (the free API is rate-limited, "
+                  "so this adds a few seconds)...")
+            for d in all_devices:
+                mac = d["mac"]
+                hits_api = mac != "unknown" and not is_randomized_mac(mac)
+                d["vendor"] = lookup_vendor(mac)
+                if hits_api:
+                    time.sleep(1.1)  # be polite to the free vendor API
+
+        state["devices"] = all_devices
+        print(f"\nFound {len(all_devices)} device(s) across {len(subnets_to_sweep)} subnet(s):")
+        for d in all_devices:
+            vend = f"  {d.get('vendor','')}" if d.get("vendor") else ""
+            print(f"  {d['ip']:<15} {d['mac']}  [{d.get('subnet','')}]{vend}")
+        print("\nReview this list: anything you don't recognise is worth chasing down.")
 
     # --- Baseline comparison ---
     hr("CHANGE DETECTION (vs saved baseline)")
