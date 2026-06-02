@@ -169,12 +169,9 @@ def guess_subnet(local_ip):
 def get_dns_servers():
     """Parse `scutil --dns` for the resolvers macOS is actually using."""
     out = run(["scutil", "--dns"])
-    servers = []
-    for m in re.finditer(r"nameserver\[\d+\]\s*:\s*([\d.]+)", out):
-        ip = m.group(1)
-        if ip not in servers:
-            servers.append(ip)
-    return servers
+    return list(dict.fromkeys(
+        m.group(1) for m in re.finditer(r"nameserver\[\d+\]\s*:\s*([\d.]+)", out)
+    ))
 
 
 def read_arp_table():
@@ -208,7 +205,7 @@ def check_port(host, port, timeout=0.6):
         s.close()
 
 
-def scan_ports(host, ports, workers=200):
+def scan_ports(host, ports, workers=100):
     """Concurrently scan a list of ports on one host; return sorted open ports."""
     open_ports = []
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -256,8 +253,7 @@ def discover_devices(subnet, workers=50):
                 alive.add(res)
     arp = read_arp_table()          # populated by the sweep above
     devices = []
-    for ip in sorted(alive | set(arp.keys()),
-                     key=lambda x: tuple(int(p) for p in x.split("."))):
+    for ip in sorted(alive | set(arp.keys()), key=ipaddress.ip_address):
         mac = arp.get(ip, "unknown")
         if is_real_host(ip, mac, subnet):
             devices.append({"ip": ip, "mac": mac})
@@ -297,14 +293,13 @@ def lookup_vendor(mac):
         return "(randomized/private MAC)"
     prefix = ":".join(mac.split(":")[:3])
     try:
-        import urllib.request
         req = urllib.request.Request("https://api.macvendors.com/" + mac,
                                      headers={"User-Agent": "home_net_audit"})
         with urllib.request.urlopen(req, timeout=4) as r:
             name = r.read().decode("utf-8", "ignore").strip()
             if name:
                 return name
-    except Exception:
+    except (urllib.error.URLError, OSError, ValueError):
         pass
     return OUI_HINTS.get(prefix, "")
 
@@ -388,47 +383,65 @@ def diff_baseline(old, new):
 def speed_test(duration=6):
     """Measure download and upload speed using Cloudflare's speed test endpoints.
     Returns (download_mbps, upload_mbps) — either may be None on failure.
+    Download and upload run concurrently to halve total elapsed time.
     Uses only the standard library; no pip installs required.
     """
-    # --- Download: fetch a 10 MB file from Cloudflare's CDN ---
-    dl_url = "https://speed.cloudflare.com/__down?bytes=10000000"
-    dl_mbps = None
-    try:
-        req = urllib.request.Request(dl_url, headers={"User-Agent": "home_net_audit"})
-        t0 = time.time()
-        with urllib.request.urlopen(req, timeout=15) as r:
-            total = 0
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if time.time() - t0 > duration:
-                    break
-        elapsed = time.time() - t0
-        if elapsed > 0 and total > 0:
-            dl_mbps = (total * 8) / elapsed / 1_000_000
-    except Exception:
-        pass
-
-    # --- Upload: POST random data to Cloudflare's upload endpoint ---
-    ul_url = "https://speed.cloudflare.com/__up"
-    ul_mbps = None
-    try:
-        data = os.urandom(5_000_000)  # 5 MB
-        req = urllib.request.Request(ul_url, data=data,
-                                     headers={"User-Agent": "home_net_audit",
-                                              "Content-Type": "application/octet-stream"})
-        t0 = time.time()
-        with urllib.request.urlopen(req, timeout=15):
+    def _download():
+        try:
+            req = urllib.request.Request(
+                "https://speed.cloudflare.com/__down?bytes=10000000",
+                headers={"User-Agent": "home_net_audit"})
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=15) as r:
+                total = 0
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if time.time() - t0 > duration:
+                        break
+            elapsed = time.time() - t0
+            if elapsed > 0 and total > 0:
+                return (total * 8) / elapsed / 1_000_000
+        except (urllib.error.URLError, OSError, TimeoutError):
             pass
-        elapsed = time.time() - t0
-        if elapsed > 0:
-            ul_mbps = (len(data) * 8) / elapsed / 1_000_000
-    except Exception:
-        pass
+        return None
 
-    return dl_mbps, ul_mbps
+    def _upload():
+        try:
+            data = os.urandom(5_000_000)
+            req = urllib.request.Request(
+                "https://speed.cloudflare.com/__up", data=data,
+                headers={"User-Agent": "home_net_audit",
+                         "Content-Type": "application/octet-stream"})
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=15):
+                pass
+            elapsed = time.time() - t0
+            if elapsed > 0:
+                return (len(data) * 8) / elapsed / 1_000_000
+        except (urllib.error.URLError, OSError, TimeoutError):
+            pass
+        return None
+
+    with futures.ThreadPoolExecutor(max_workers=2) as pool:
+        dl_fut = pool.submit(_download)
+        ul_fut = pool.submit(_upload)
+        return dl_fut.result(), ul_fut.result()
+
+
+_DSL_PATTERNS = {
+    "downstream_kbps":   [re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps"),
+                           re.compile(r"[Ss]ync\s*[Rr]ate[^<]{0,30}[Dd]own[^<]{0,20}(\d{3,6})")],
+    "upstream_kbps":     [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps"),
+                           re.compile(r"[Ss]ync\s*[Rr]ate[^<]{0,30}[Uu]p[^<]{0,20}(\d{3,6})")],
+    "downstream_snr_db": [re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)"),
+                           re.compile(r"SNR[^<]{0,20}[Mm]argin[^<]{0,30}([\d.]+)")],
+    "upstream_snr_db":   [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)")],
+    "downstream_attn_db":[re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)")],
+    "upstream_attn_db":  [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)")],
+}
 
 
 def tplink_dsl_stats(ip, password):
@@ -503,20 +516,9 @@ def tplink_dsl_stats(ip, password):
                        "or firmware uses unknown page paths")
 
     # --- Parse ---
-    patterns = {
-        "downstream_kbps":   [r"[Dd]own(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps",
-                               r"[Ss]ync\s*[Rr]ate[^<]{0,30}[Dd]own[^<]{0,20}(\d{3,6})"],
-        "upstream_kbps":     [r"[Uu]p(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps",
-                               r"[Ss]ync\s*[Rr]ate[^<]{0,30}[Uu]p[^<]{0,20}(\d{3,6})"],
-        "downstream_snr_db": [r"[Dd]own(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)",
-                               r"SNR[^<]{0,20}[Mm]argin[^<]{0,30}([\d.]+)"],
-        "upstream_snr_db":   [r"[Uu]p(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)"],
-        "downstream_attn_db":[r"[Dd]own(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)"],
-        "upstream_attn_db":  [r"[Uu]p(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)"],
-    }
-    for key, pats in patterns.items():
+    for key, pats in _DSL_PATTERNS.items():
         for pat in pats:
-            m = re.search(pat, raw)
+            m = pat.search(raw)
             if m:
                 try:
                     stats[key] = float(m.group(1))
@@ -683,12 +685,17 @@ def main():
             for d in all_devices:
                 mac = d["mac"]
                 if labels.get(mac.lower()):
-                    d["vendor"] = ""  # already named, no lookup needed
-                elif mac == "unknown" or is_randomized_mac(mac):
-                    d["vendor"] = lookup_vendor(mac)  # returns the randomized label, no API hit
+                    d["vendor"] = ""
+                elif mac == "unknown":
+                    d["vendor"] = ""
+                elif is_randomized_mac(mac):
+                    d["vendor"] = "(randomized/private MAC)"
                 else:
-                    d["vendor"] = lookup_vendor(mac)
+                    d["vendor"] = ""
+            for i, d in enumerate(needs_lookup):
+                if i > 0:
                     time.sleep(1.1)  # be polite to the free vendor API
+                d["vendor"] = lookup_vendor(d["mac"])
 
         state["devices"] = all_devices
         print(f"\nFound {len(all_devices)} device(s) across {len(subnets_to_sweep)} subnet(s):")
