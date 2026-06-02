@@ -504,13 +504,21 @@ def main():
                     all_devices.append({**d, "subnet": str(subnet)})
 
         if not args.no_vendors and all_devices:
-            print("Looking up device vendors (the free API is rate-limited, "
-                  "so this adds a few seconds)...")
+            needs_lookup = [d for d in all_devices
+                            if not labels.get(d["mac"].lower())
+                            and d["mac"] != "unknown"
+                            and not is_randomized_mac(d["mac"])]
+            if needs_lookup:
+                print(f"Looking up vendors for {len(needs_lookup)} unlabelled device(s) "
+                      "(free API is rate-limited, so this adds a few seconds)...")
             for d in all_devices:
                 mac = d["mac"]
-                hits_api = mac != "unknown" and not is_randomized_mac(mac)
-                d["vendor"] = lookup_vendor(mac)
-                if hits_api:
+                if labels.get(mac.lower()):
+                    d["vendor"] = ""  # already named, no lookup needed
+                elif mac == "unknown" or is_randomized_mac(mac):
+                    d["vendor"] = lookup_vendor(mac)  # returns the randomized label, no API hit
+                else:
+                    d["vendor"] = lookup_vendor(mac)
                     time.sleep(1.1)  # be polite to the free vendor API
 
         state["devices"] = all_devices
@@ -522,12 +530,12 @@ def main():
             vend = d.get("vendor", "")
             display_name = name or vend
             tag = f"  {display_name}" if display_name else ""
-            flag = "" if name else "  <-- unlabelled"
+            flag = "" if (name or vend) else "  <-- unlabelled"
             print(f"  {d['ip']:<15} {mac}  [{d.get('subnet','')}]{tag}{flag}")
-            if not name:
+            if not name and not vend:
                 unlabelled.append(mac)
         if unlabelled:
-            print(f"\n{len(unlabelled)} unlabelled device(s). Tag them with:")
+            print(f"\n{len(unlabelled)} unidentified device(s). Tag them with:")
             print(f"  python3 home_net_audit.py --label MAC='Device Name' ...")
 
     # --- Baseline comparison ---
