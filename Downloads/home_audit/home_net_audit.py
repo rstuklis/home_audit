@@ -430,6 +430,92 @@ def speed_test(duration=6):
     return dl_mbps, ul_mbps
 
 
+def tplink_dsl_stats(ip, password):
+    """Log into the TP-Link VX420-G2h and scrape DSL line statistics.
+
+    Returns a dict with keys: downstream_kbps, upstream_kbps,
+    downstream_snr_db, upstream_snr_db, downstream_attn_db, upstream_attn_db.
+    Any value may be None if it could not be read.
+    """
+    import base64
+    import http.cookiejar
+
+    base = f"http://{ip}"
+    stats = {
+        "downstream_kbps": None, "upstream_kbps": None,
+        "downstream_snr_db": None, "upstream_snr_db": None,
+        "downstream_attn_db": None, "upstream_attn_db": None,
+    }
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+    # TP-Link VX420 uses Basic Auth or a form POST depending on firmware.
+    # Try Basic Auth first (most common for ISP-provisioned units).
+    creds = base64.b64encode(f"admin:{password}".encode()).decode()
+    headers = {
+        "User-Agent": "home_net_audit",
+        "Authorization": f"Basic {creds}",
+        "Referer": base + "/",
+    }
+
+    # Candidate pages that may contain DSL stats on TP-Link VDSL routers
+    dsl_paths = [
+        "/cgi-bin/luci/admin/network/dslstatus",
+        "/cgi-bin/luci/;stok=/admin/network/xdsl",
+        "/cgi-bin/luci/admin/xdsl",
+        "/html/status/dslstatus.html",
+        "/cgi?8",                        # TP-Link TR-069 style
+    ]
+
+    raw_html = ""
+    for path in dsl_paths:
+        try:
+            req = urllib.request.Request(base + path, headers=headers)
+            with opener.open(req, timeout=5) as r:
+                raw_html = r.read().decode("utf-8", "ignore")
+            if any(kw in raw_html.lower() for kw in ["snr", "downstream", "attenuation", "sync"]):
+                break
+            raw_html = ""
+        except Exception:
+            continue
+
+    if not raw_html:
+        # Fallback: try fetching the main status page
+        try:
+            req = urllib.request.Request(base + "/", headers=headers)
+            with opener.open(req, timeout=5) as r:
+                raw_html = r.read().decode("utf-8", "ignore")
+        except Exception:
+            return stats, "Could not connect to TP-Link admin page"
+
+    # Parse numeric values from HTML — TP-Link embeds them in various formats
+    patterns = {
+        "downstream_kbps":  [r"[Dd]ownstream[^<]*?(\d{3,6})\s*[Kk]bps",
+                              r"[Dd]own[^<]*?[Ss]peed[^<]*?(\d{3,6})"],
+        "upstream_kbps":    [r"[Uu]pstream[^<]*?(\d{3,6})\s*[Kk]bps",
+                              r"[Uu]p[^<]*?[Ss]peed[^<]*?(\d{3,6})"],
+        "downstream_snr_db":[r"[Dd]ownstream[^<]*?SNR[^<]*?([\d.]+)",
+                              r"SNR[^<]*?[Mm]argin[^<]*?([\d.]+)"],
+        "upstream_snr_db":  [r"[Uu]pstream[^<]*?SNR[^<]*?([\d.]+)"],
+        "downstream_attn_db":[r"[Dd]ownstream[^<]*?[Aa]ttenuation[^<]*?([\d.]+)"],
+        "upstream_attn_db": [r"[Uu]pstream[^<]*?[Aa]ttenuation[^<]*?([\d.]+)"],
+    }
+    for key, pats in patterns.items():
+        for pat in pats:
+            m = re.search(pat, raw_html)
+            if m:
+                try:
+                    stats[key] = float(m.group(1))
+                except ValueError:
+                    pass
+                break
+
+    note = "" if any(v is not None for v in stats.values()) else \
+        "Connected but no DSL stats found — firmware may use a different page layout"
+    return stats, note
+
+
 def hr(title=""):
     print("\n" + "=" * 64)
     if title:
@@ -448,6 +534,8 @@ def main():
                     help="Tag a device MAC with a friendly name, e.g. --label b8:27:eb:5d:38:ca='Clever Logger'")
     ap.add_argument("--no-discovery", action="store_true", help="Skip the LAN device sweep")
     ap.add_argument("--no-speedtest", action="store_true", help="Skip the speed test")
+    ap.add_argument("--tplink-password", metavar="PASSWORD",
+                    help="TP-Link admin password to fetch DSL line stats (SNR, sync speed)")
     args = ap.parse_args()
 
     if sys.platform != "darwin":
@@ -510,6 +598,25 @@ def main():
         print(f"Scanning upstream modem at {args.upstream} ...")
         upstream_ports = audit_host("upstream modem", args.upstream)
         state["upstream_open_ports"] = upstream_ports
+
+    # --- DSL line stats ---
+    if args.tplink_password:
+        hr("DSL LINE STATS (TP-Link VX420-G2h)")
+        tplink_ip = args.upstream or "192.168.1.1"
+        print(f"Fetching DSL stats from {tplink_ip} ...")
+        dsl, note = tplink_dsl_stats(tplink_ip, args.tplink_password)
+        if note:
+            print(f"  Note: {note}")
+        def fmt_stat(val, unit):
+            return f"{val}{unit}" if val is not None else "n/a"
+        print(f"  Downstream sync : {fmt_stat(dsl['downstream_kbps'], ' Kbps')}")
+        print(f"  Upstream sync   : {fmt_stat(dsl['upstream_kbps'], ' Kbps')}")
+        print(f"  Downstream SNR  : {fmt_stat(dsl['downstream_snr_db'], ' dB')}  "
+              f"(healthy >6 dB; wet weather often drops this)")
+        print(f"  Upstream SNR    : {fmt_stat(dsl['upstream_snr_db'], ' dB')}")
+        print(f"  Downstream attn : {fmt_stat(dsl['downstream_attn_db'], ' dB')}")
+        print(f"  Upstream attn   : {fmt_stat(dsl['upstream_attn_db'], ' dB')}")
+        state["dsl"] = dsl
 
     # --- DNS ---
     hr("DNS SETTINGS")
