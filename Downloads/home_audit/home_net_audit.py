@@ -141,7 +141,9 @@ def get_all_interfaces():
                     mask = mask_raw
                 net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
                 results.append((current_iface, ip, net))
-            except ValueError:
+            except (ValueError, OverflowError):
+                # OverflowError: a malformed netmask wider than 32 bits would
+                # make mask_int.to_bytes(4, "big") raise.
                 pass
     return results
 
@@ -182,10 +184,16 @@ def read_arp_table():
         ip_m = re.search(r"\(([\d.]+)\)", line)
         mac_m = re.search(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", line)
         if ip_m and mac_m:
+            # Validate/normalise the IP so a malformed capture (e.g. leading
+            # zeros) can't later crash sorted(..., key=ipaddress.ip_address).
+            try:
+                ip = str(ipaddress.ip_address(ip_m.group(1)))
+            except ValueError:
+                continue
             # Normalise MAC to two-digit lowercase octets
             raw = mac_m.group(1).split(":")
             mac = ":".join(f"{int(x, 16):02x}" for x in raw)
-            table[ip_m.group(1)] = mac
+            table[ip] = mac
     return table
 
 
@@ -195,14 +203,17 @@ def read_arp_table():
 
 def check_port(host, port, timeout=0.6):
     """Return True if a TCP connection to host:port succeeds."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
     try:
-        return s.connect_ex((host, port)) == 0
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex((host, port)) == 0
+        finally:
+            s.close()
     except OSError:
+        # socket() itself can raise (e.g. EMFILE "too many open files" under
+        # high worker counts); treat any socket error as "port not open".
         return False
-    finally:
-        s.close()
 
 
 def scan_ports(host, ports, workers=100):
@@ -211,15 +222,27 @@ def scan_ports(host, ports, workers=100):
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = {pool.submit(check_port, host, p): p for p in ports}
         for fut in futures.as_completed(results):
-            if fut.result():
-                open_ports.append(results[fut])
+            try:
+                if fut.result():
+                    open_ports.append(results[fut])
+            except OSError:
+                # A single failed probe should not abort the whole scan.
+                pass
     return sorted(open_ports)
 
 
 def ping(ip):
-    """Single ping (macOS syntax). Returns the ip if it replies, else None."""
-    out = subprocess.run(["ping", "-c", "1", "-t", "1", str(ip)],
-                        capture_output=True, text=True)
+    """Single ping (macOS syntax). Returns the ip if it replies, else None.
+
+    A hard subprocess timeout guards against a ping that never exits (on Linux
+    `-t` sets the TTL rather than a deadline, so without this a hung host would
+    block its worker thread and stall the whole sweep).
+    """
+    try:
+        out = subprocess.run(["ping", "-c", "1", "-t", "1", str(ip)],
+                             capture_output=True, text=True, timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     return str(ip) if out.returncode == 0 else None
 
 
@@ -235,6 +258,10 @@ def is_real_host(ip, mac, subnet):
     except ValueError:
         return False
     if addr.is_multicast or addr.is_unspecified:
+        return False
+    if addr not in subnet:
+        # ARP cache holds entries for every subnet the host has talked to
+        # (other interfaces, VPNs); only keep IPs that belong to this sweep.
         return False
     if ip == str(subnet.network_address) or ip == str(subnet.broadcast_address):
         return False
@@ -483,7 +510,9 @@ def tplink_dsl_stats(ip, password):
                  f"&Passwd={urllib.parse.quote(b64pwd)}"
                  f"&Action=1&LoginStatus=0")
     login_resp = fetch(login_url, post=True)
-    if not jar._cookies and "success" not in login_resp.lower():
+    # Use the public CookieJar iterator rather than the private _cookies dict,
+    # which is a CPython implementation detail not guaranteed on every runtime.
+    if not list(jar) and "success" not in login_resp.lower():
         # Try MD5 hash variant some firmwares use
         import hashlib
         md5pwd = hashlib.md5(password.encode()).hexdigest().upper()
@@ -550,8 +579,26 @@ def main():
     ap.add_argument("--no-discovery", action="store_true", help="Skip the LAN device sweep")
     ap.add_argument("--no-speedtest", action="store_true", help="Skip the speed test")
     ap.add_argument("--tplink-password", metavar="PASSWORD",
-                    help="TP-Link admin password to fetch DSL line stats (SNR, sync speed)")
+                    help="TP-Link admin password to fetch DSL line stats (SNR, sync speed). "
+                         "WARNING: visible to other users via `ps`; prefer the "
+                         "TPLINK_PASSWORD env var or --tplink-password-prompt.")
+    ap.add_argument("--tplink-password-prompt", action="store_true",
+                    help="Securely prompt for the TP-Link password instead of "
+                         "passing it on the command line.")
     args = ap.parse_args()
+
+    # Resolve the TP-Link password from the safest available source.
+    tplink_password = None
+    if args.tplink_password_prompt:
+        import getpass
+        tplink_password = getpass.getpass("TP-Link admin password: ")
+    elif args.tplink_password:
+        tplink_password = args.tplink_password
+        print("Warning: passing --tplink-password on the command line exposes it "
+              "in the process list. Prefer the TPLINK_PASSWORD env var or "
+              "--tplink-password-prompt.\n")
+    else:
+        tplink_password = os.environ.get("TPLINK_PASSWORD")
 
     if sys.platform != "darwin":
         print("Note: written for macOS. Some system commands may differ on this OS.\n")
@@ -615,11 +662,11 @@ def main():
         state["upstream_open_ports"] = upstream_ports
 
     # --- DSL line stats ---
-    if args.tplink_password:
+    if tplink_password:
         hr("DSL LINE STATS (TP-Link VX420-G2h)")
         tplink_ip = args.upstream or "192.168.1.1"
         print(f"Fetching DSL stats from {tplink_ip} ...")
-        dsl, note = tplink_dsl_stats(tplink_ip, args.tplink_password)
+        dsl, note = tplink_dsl_stats(tplink_ip, tplink_password)
         if note:
             print(f"  Note: {note}")
         def fmt_stat(val, unit):
@@ -654,7 +701,13 @@ def main():
         hr("CONNECTED DEVICES")
         # Build list of subnets to sweep: CLI overrides first, then auto-detected interfaces
         if args.subnet:
-            subnets_to_sweep = [ipaddress.ip_network(s, strict=False) for s in args.subnet]
+            subnets_to_sweep = []
+            for s in args.subnet:
+                try:
+                    subnets_to_sweep.append(ipaddress.ip_network(s, strict=False))
+                except ValueError:
+                    print(f"  Skipping invalid subnet {s!r} "
+                          "(expected CIDR like 192.168.1.0/24).")
         elif interfaces:
             subnets_to_sweep = list({net for _, _, net in interfaces})
         else:
@@ -748,7 +801,14 @@ def main():
         print("No baseline saved yet. Run again with --save-baseline once you've")
         print("confirmed everything above looks correct, to enable change detection.")
 
-    if not args.no_save_baseline:
+    if args.no_save_baseline:
+        pass
+    elif gateway is None:
+        # Saving a gateway-less run would drop router_open_ports from the
+        # baseline and trigger false "NEW open port" alarms on the next run.
+        print("\nSkipping baseline save: gateway could not be determined, so this "
+              "scan is incomplete and would corrupt change detection.")
+    else:
         save_baseline(state)
         print(f"\nBaseline saved to {BASELINE_FILE}")
 
