@@ -680,7 +680,7 @@ def action_wifi_security():
 # NEW FEATURE 2: Rogue DHCP detector
 # ---------------------------------------------------------------------------
 
-def check_rogue_dhcp(local_ip, timeout=4):
+def check_rogue_dhcp(timeout=4):
     """
     Send a DHCP (Dynamic Host Configuration Protocol) DISCOVER broadcast and
     collect all OFFER responses. More than one responder means a rogue DHCP
@@ -690,13 +690,17 @@ def check_rogue_dhcp(local_ip, timeout=4):
     DHCP_SERVER_PORT = 67
     DHCP_CLIENT_PORT = 68
 
-    # Build a minimal DHCP DISCOVER packet
+    # Build a minimal DHCP DISCOVER packet. The source MAC only fills the chaddr
+    # field (it doesn't affect responder counting), so extract one from ifconfig
+    # defensively and fall back to a placeholder if it can't be parsed.
     xid = os.urandom(4)
-    mac_bytes = bytes.fromhex(
-        run(["ifconfig"]).split("ether")[1].split()[0].replace(":", "")
-        if "ether" in run(["ifconfig"]) else "aabbccddeeff"
-    )[:6]
-    mac_bytes = mac_bytes.ljust(6, b"\x00")
+    ether_m = re.search(r"ether\s+([0-9a-fA-F:]{17})", run(["ifconfig"]))
+    try:
+        mac_bytes = bytes.fromhex(ether_m.group(1).replace(":", "")) if ether_m \
+            else b"\xaa\xbb\xcc\xdd\xee\xff"
+    except ValueError:
+        mac_bytes = b"\xaa\xbb\xcc\xdd\xee\xff"
+    mac_bytes = mac_bytes[:6].ljust(6, b"\x00")
 
     packet = struct.pack(
         "!BBBBLHH4s4s4s4s16s64s128s",
@@ -757,9 +761,8 @@ def check_rogue_dhcp(local_ip, timeout=4):
 
 def action_rogue_dhcp():
     hr("ROGUE DHCP DETECTOR")
-    local_ip = get_local_ip()
     print("  Sending DHCP DISCOVER broadcast (waiting 4s for responses)...")
-    responders, err = check_rogue_dhcp(local_ip)
+    responders, err = check_rogue_dhcp()
     if err:
         print(f"  [SKIP] {err}")
         return {"responders": [], "error": err}
@@ -1293,47 +1296,46 @@ def check_listening_services():
     servers, etc.).
     Returns list of dicts: {proto, local_addr, port, pid, process}
     """
-    out = run(["netstat", "-anp", "tcp"], timeout=10)
-    out += run(["netstat", "-anp", "udp"], timeout=10)
-    # Also try lsof for process names
-    lsof_out = run(["lsof", "-i", "-n", "-P", "-s", "TCP:LISTEN"], timeout=10)
-
     listeners = {}
 
-    # Parse lsof output (more useful: has process names)
-    for line in lsof_out.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) < 9:
-            continue
-        process = parts[0]
-        pid = parts[1]
-        addr_field = parts[8] if len(parts) > 8 else ""
-        if "->" in addr_field:
-            continue
-        m = re.match(r"(?:\*|\d+[\d.]*):(\d+)$", addr_field)
-        if m:
-            port = int(m.group(1))
-            key = ("TCP", port)
+    def _add_from_lsof(lsof_out, proto):
+        # lsof's NAME column puts ':' before the port for the *:p, ipv4:p AND
+        # bracketed [ipv6]:p forms, so a trailing ':<port>' match covers all
+        # three (the old IPv4-only regex silently dropped IPv6 listeners).
+        for line in lsof_out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 9:
+                continue
+            addr_field = parts[8]
+            if "->" in addr_field:
+                continue  # established connection, not a listener
+            m = re.search(r":(\d+)$", addr_field)
+            if not m:
+                continue
+            key = (proto, int(m.group(1)))
             if key not in listeners:
-                listeners[key] = {"proto": "TCP", "port": port,
-                                  "pid": pid, "process": process}
+                listeners[key] = {"proto": proto, "port": int(m.group(1)),
+                                  "pid": parts[1], "process": parts[0]}
 
-    # Parse netstat as fallback / UDP supplement
+    # lsof gives process names for TCP listeners AND UDP-bound sockets
+    # (netstat alone can't supply process names on macOS).
+    _add_from_lsof(run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], timeout=10), "TCP")
+    _add_from_lsof(run(["lsof", "-nP", "-iUDP"], timeout=10), "UDP")
+
+    # netstat fills any (proto, port) lsof missed; process stays unknown there.
+    out = run(["netstat", "-anp", "tcp"], timeout=10) + run(["netstat", "-anp", "udp"], timeout=10)
     for line in out.splitlines():
         if "LISTEN" in line or line.startswith("udp"):
             parts = line.split()
             if len(parts) < 4:
                 continue
             proto = parts[0].upper().replace("6", "").replace("4", "")
-            local = parts[3] if len(parts) > 3 else ""
-            # macOS netstat uses a DOT before the port (e.g. "*.59882",
-            # "127.0.0.1.19292"); accept a dot or a colon separator.
-            m = re.search(r"[.:](\d+)$", local)
+            # macOS netstat uses a DOT before the port (e.g. "*.59882").
+            m = re.search(r"[.:](\d+)$", parts[3])
             if m:
-                port = int(m.group(1))
-                key = (proto, port)
+                key = (proto, int(m.group(1)))
                 if key not in listeners:
-                    listeners[key] = {"proto": proto, "port": port,
+                    listeners[key] = {"proto": proto, "port": int(m.group(1)),
                                       "pid": "?", "process": "?"}
 
     return sorted(listeners.values(), key=lambda x: x["port"])
@@ -1886,7 +1888,7 @@ def audit_host(label, host, full_scan=False):
 
 def action_port_scan(full_scan=False, upstream_ip=None):
     hr("PORT SCAN")
-    interfaces, local_ip, gateway = print_network_info()
+    _, _, gateway = print_network_info()
 
     open_ports = []
     if gateway:
@@ -2105,7 +2107,7 @@ def action_compare_baseline(state):
 
 def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
-                      extra_subnets=None, probe_creds=False):
+                      extra_subnets=None, probe_creds=False, no_discovery=False):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -2148,19 +2150,20 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
             print(f"  {d}  <-- unfamiliar")
 
     # Devices
-    hr("CONNECTED DEVICES")
-    labels = load_labels()
-    networks = load_networks()
-    subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
-    if subnets_to_sweep:
-        all_devices = collect_devices(subnets_to_sweep, labels, networks, no_vendors=no_vendors)
-        state["devices"] = all_devices
-        _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
+    if not no_discovery:
+        hr("CONNECTED DEVICES")
+        labels = load_labels()
+        networks = load_networks()
+        subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
+        if subnets_to_sweep:
+            all_devices = collect_devices(subnets_to_sweep, labels, networks, no_vendors=no_vendors)
+            state["devices"] = all_devices
+            _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
 
     # Speed test
     if not no_speedtest:
         hr("SPEED TEST")
-        print("Testing speed via Cloudflare...")
+        print("Testing speed via Cloudflare (~15 MB of traffic; use --no-speedtest to skip)...")
         dl, ul = speed_test()
         if dl:
             rating = "good" if dl >= 20 else "slow" if dl >= 5 else "very slow"
@@ -2340,7 +2343,7 @@ def interactive_menu():
 
         elif choice == "7":
             hr("SPEED TEST")
-            print("Testing speed via Cloudflare (~15s)...")
+            print("Testing speed via Cloudflare (~15s, ~15 MB of traffic)...")
             dl, ul = speed_test()
             rating = ("good" if dl >= 20 else "slow" if dl >= 5 else "very slow") if dl else ""
             print(f"Download : {f'{dl:.1f} Mbps  ({rating})' if dl else 'could not measure'}")
@@ -2487,6 +2490,7 @@ def main():
         subnet_overrides=args.subnet,
         extra_subnets=getattr(args, "extra_subnet", None),
         probe_creds=args.probe_creds,
+        no_discovery=args.no_discovery,
     )
 
     if args.no_save_baseline:
