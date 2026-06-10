@@ -1,11 +1,20 @@
-# Ignore everything outside this project folder
-../../*
+# Audit data saved by the script at runtime — never commit these
+~/.home_net_audit/
+.home_net_audit/
+
+# Local scan output files
+*.json
+*.log
+*.txt
+audit_report_*.html
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-.env
+*.py[cod]
 
 # macOS
 .DS_Store
+
+# Environment / secrets
+.env
+.env.*
