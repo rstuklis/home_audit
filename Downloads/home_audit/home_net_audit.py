@@ -167,7 +167,9 @@ def get_all_interfaces():
                     mask = mask_raw
                 net = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
                 results.append((current_iface, ip, net))
-            except ValueError:
+            except (ValueError, OverflowError):
+                # OverflowError: a malformed netmask wider than 32 bits would
+                # make mask_int.to_bytes(4, "big") raise.
                 pass
     return results
 
@@ -206,9 +208,15 @@ def read_arp_table():
         ip_m = re.search(r"\(([\d.]+)\)", line)
         mac_m = re.search(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", line)
         if ip_m and mac_m:
+            # Validate/normalise the IP so a malformed capture (e.g. leading
+            # zeros) can't later crash sorted(..., key=ipaddress.ip_address).
+            try:
+                ip = str(ipaddress.ip_address(ip_m.group(1)))
+            except ValueError:
+                continue
             raw = mac_m.group(1).split(":")
             mac = ":".join(f"{int(x, 16):02x}" for x in raw)
-            table[ip_m.group(1)] = mac
+            table[ip] = mac
     return table
 
 
@@ -217,29 +225,45 @@ def read_arp_table():
 # ---------------------------------------------------------------------------
 
 def check_port(host, port, timeout=0.6):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
     try:
-        return s.connect_ex((host, port)) == 0
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex((host, port)) == 0
+        finally:
+            s.close()
     except OSError:
+        # socket() itself can raise (e.g. EMFILE "too many open files" under
+        # high worker counts); treat any socket error as "port not open".
         return False
-    finally:
-        s.close()
 
 
-def scan_ports(host, ports, workers=200):
+def scan_ports(host, ports, workers=100):
     open_ports = []
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = {pool.submit(check_port, host, p): p for p in ports}
         for fut in futures.as_completed(results):
-            if fut.result():
-                open_ports.append(results[fut])
+            try:
+                if fut.result():
+                    open_ports.append(results[fut])
+            except OSError:
+                # A single failed probe should not abort the whole scan.
+                pass
     return sorted(open_ports)
 
 
 def ping(ip):
-    out = subprocess.run(["ping", "-c", "1", "-t", "1", str(ip)],
-                         capture_output=True, text=True)
+    """Single ping (macOS syntax). Returns the ip if it replies, else None.
+
+    A hard subprocess timeout guards against a ping that never exits (on Linux
+    `-t` sets the TTL rather than a deadline, so without this a hung host would
+    block its worker thread and stall the whole sweep).
+    """
+    try:
+        out = subprocess.run(["ping", "-c", "1", "-t", "1", str(ip)],
+                             capture_output=True, text=True, timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
     return str(ip) if out.returncode == 0 else None
 
 
@@ -275,8 +299,7 @@ def discover_devices(subnet, workers=50):
                 alive.add(res)
     arp = read_arp_table()
     devices = []
-    for ip in sorted(alive | set(arp.keys()),
-                     key=lambda x: tuple(int(p) for p in x.split("."))):
+    for ip in sorted(alive | set(arp.keys()), key=ipaddress.ip_address):
         mac = arp.get(ip, "unknown")
         if is_real_host(ip, mac, subnet):
             devices.append({"ip": ip, "mac": mac})
@@ -313,7 +336,7 @@ def lookup_vendor(mac):
             name = r.read().decode("utf-8", "ignore").strip()
             if name:
                 return name
-    except Exception:
+    except (urllib.error.URLError, OSError, ValueError):
         pass
     return OUI_HINTS.get(prefix, "")
 
@@ -418,43 +441,65 @@ def diff_baseline(old, new):
 # ---------------------------------------------------------------------------
 
 def speed_test(duration=6):
-    dl_url = "https://speed.cloudflare.com/__down?bytes=10000000"
-    dl_mbps = None
-    try:
-        req = urllib.request.Request(dl_url, headers={"User-Agent": "home_net_audit"})
-        t0 = time.time()
-        with urllib.request.urlopen(req, timeout=15) as r:
-            total = 0
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if time.time() - t0 > duration:
-                    break
-        elapsed = time.time() - t0
-        if elapsed > 0 and total > 0:
-            dl_mbps = (total * 8) / elapsed / 1_000_000
-    except Exception:
-        pass
-
-    ul_url = "https://speed.cloudflare.com/__up"
-    ul_mbps = None
-    try:
-        data = os.urandom(5_000_000)
-        req = urllib.request.Request(ul_url, data=data,
-                                     headers={"User-Agent": "home_net_audit",
-                                              "Content-Type": "application/octet-stream"})
-        t0 = time.time()
-        with urllib.request.urlopen(req, timeout=15):
+    """Measure download and upload speed via Cloudflare's speed-test endpoints.
+    Download and upload run concurrently to roughly halve total elapsed time.
+    Returns (download_mbps, upload_mbps); either may be None on failure.
+    """
+    def _download():
+        try:
+            req = urllib.request.Request(
+                "https://speed.cloudflare.com/__down?bytes=10000000",
+                headers={"User-Agent": "home_net_audit"})
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=15) as r:
+                total = 0
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if time.time() - t0 > duration:
+                        break
+            elapsed = time.time() - t0
+            if elapsed > 0 and total > 0:
+                return (total * 8) / elapsed / 1_000_000
+        except (urllib.error.URLError, OSError, TimeoutError):
             pass
-        elapsed = time.time() - t0
-        if elapsed > 0:
-            ul_mbps = (len(data) * 8) / elapsed / 1_000_000
-    except Exception:
-        pass
+        return None
 
-    return dl_mbps, ul_mbps
+    def _upload():
+        try:
+            data = os.urandom(5_000_000)
+            req = urllib.request.Request(
+                "https://speed.cloudflare.com/__up", data=data,
+                headers={"User-Agent": "home_net_audit",
+                         "Content-Type": "application/octet-stream"})
+            t0 = time.time()
+            with urllib.request.urlopen(req, timeout=15):
+                pass
+            elapsed = time.time() - t0
+            if elapsed > 0:
+                return (len(data) * 8) / elapsed / 1_000_000
+        except (urllib.error.URLError, OSError, TimeoutError):
+            pass
+        return None
+
+    with futures.ThreadPoolExecutor(max_workers=2) as pool:
+        dl_fut = pool.submit(_download)
+        ul_fut = pool.submit(_upload)
+        return dl_fut.result(), ul_fut.result()
+
+
+# DSL stat regexes, pre-compiled once at import (the scrape loop runs them
+# against every candidate page).
+_DSL_PATTERNS = {
+    "downstream_kbps":   [re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps")],
+    "upstream_kbps":     [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps")],
+    "downstream_snr_db": [re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)")],
+    "upstream_snr_db":   [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)")],
+    "downstream_attn_db":[re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)")],
+    "upstream_attn_db":  [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)")],
+}
 
 
 def tplink_dsl_stats(ip, password):
@@ -484,7 +529,9 @@ def tplink_dsl_stats(ip, password):
                  f"&Passwd={urllib.parse.quote(b64pwd)}"
                  f"&Action=1&LoginStatus=0")
     login_resp = fetch(login_url, post=True)
-    if not jar._cookies and "success" not in login_resp.lower():
+    # Use the public CookieJar iterator rather than the private _cookies dict,
+    # which is a CPython implementation detail not guaranteed on every runtime.
+    if not list(jar) and "success" not in login_resp.lower():
         import hashlib
         md5pwd = hashlib.md5(password.encode()).hexdigest().upper()
         fetch(f"{base}/cgi/login?UserName=admin&Passwd={md5pwd}&Action=1&LoginStatus=0", post=True)
@@ -505,17 +552,9 @@ def tplink_dsl_stats(ip, password):
     if not raw:
         return stats, "Could not retrieve DSL stats — auth failed or unknown page paths"
 
-    patterns = {
-        "downstream_kbps":   [r"[Dd]own(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps"],
-        "upstream_kbps":     [r"[Uu]p(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps"],
-        "downstream_snr_db": [r"[Dd]own(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)"],
-        "upstream_snr_db":   [r"[Uu]p(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)"],
-        "downstream_attn_db":[r"[Dd]own(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)"],
-        "upstream_attn_db":  [r"[Uu]p(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)"],
-    }
-    for key, pats in patterns.items():
+    for key, pats in _DSL_PATTERNS.items():
         for pat in pats:
-            m = re.search(pat, raw)
+            m = pat.search(raw)
             if m:
                 try:
                     stats[key] = float(m.group(1))
@@ -1816,7 +1855,13 @@ def action_discover_devices(no_vendors=False, subnet_overrides=None, extra_subne
     networks = load_networks()
 
     if subnet_overrides:
-        subnets_to_sweep = [ipaddress.ip_network(s, strict=False) for s in subnet_overrides]
+        subnets_to_sweep = []
+        for s in subnet_overrides:
+            try:
+                subnets_to_sweep.append(ipaddress.ip_network(s, strict=False))
+            except ValueError:
+                print(f"  Skipping invalid subnet {s!r} "
+                      "(expected CIDR like 192.168.1.0/24).")
     elif interfaces:
         subnets_to_sweep = list({net for _, _, net in interfaces})
     else:
@@ -1852,15 +1897,19 @@ def action_discover_devices(no_vendors=False, subnet_overrides=None, extra_subne
                         and not is_randomized_mac(d["mac"])]
         if needs_lookup:
             print(f"  Looking up vendors for {len(needs_lookup)} unlabelled device(s)...")
+        # Labelled / unknown / randomized MACs need no online lookup.
         for d in all_devices:
             mac = d["mac"]
-            if labels.get(mac.lower()):
-                d["vendor"] = ""
-            elif mac == "unknown" or is_randomized_mac(mac):
-                d["vendor"] = lookup_vendor(mac)
+            if is_randomized_mac(mac) and not labels.get(mac.lower()):
+                d["vendor"] = "(randomized/private MAC)"
             else:
-                d["vendor"] = lookup_vendor(mac)
+                d["vendor"] = ""
+        # Only the genuinely-unknown real MACs hit the API; sleep BETWEEN calls
+        # (not after the last) to stay under the free tier's rate limit.
+        for i, d in enumerate(needs_lookup):
+            if i > 0:
                 time.sleep(1.1)
+            d["vendor"] = lookup_vendor(d["mac"])
 
     _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
     return all_devices
@@ -1989,7 +2038,13 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     labels = load_labels()
     networks = load_networks()
     if subnet_overrides:
-        subnets_to_sweep = [ipaddress.ip_network(s, strict=False) for s in subnet_overrides]
+        subnets_to_sweep = []
+        for s in subnet_overrides:
+            try:
+                subnets_to_sweep.append(ipaddress.ip_network(s, strict=False))
+            except ValueError:
+                print(f"  Skipping invalid subnet {s!r} "
+                      "(expected CIDR like 192.168.1.0/24).")
     elif interfaces:
         subnets_to_sweep = list({net for _, _, net in interfaces})
     else:
@@ -2013,13 +2068,22 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                     seen_ips.add(d["ip"])
                     all_devices.append({**d, "subnet": str(subnet)})
         if not no_vendors and all_devices:
+            needs_lookup = [d for d in all_devices
+                            if not labels.get(d["mac"].lower())
+                            and d["mac"] != "unknown"
+                            and not is_randomized_mac(d["mac"])]
+            # Labelled / unknown / randomized MACs need no online lookup.
             for d in all_devices:
                 mac = d["mac"]
-                if not labels.get(mac.lower()) and mac != "unknown" and not is_randomized_mac(mac):
-                    d["vendor"] = lookup_vendor(mac)
-                    time.sleep(1.1)
+                if is_randomized_mac(mac) and not labels.get(mac.lower()):
+                    d["vendor"] = "(randomized/private MAC)"
                 else:
-                    d["vendor"] = lookup_vendor(mac)
+                    d["vendor"] = ""
+            # Only genuinely-unknown real MACs hit the API; sleep between calls.
+            for i, d in enumerate(needs_lookup):
+                if i > 0:
+                    time.sleep(1.1)
+                d["vendor"] = lookup_vendor(d["mac"])
         state["devices"] = all_devices
         _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
 
@@ -2293,7 +2357,12 @@ def main():
     ap.add_argument("--no-speedtest", action="store_true",
                     help="Skip the speed test")
     ap.add_argument("--tplink-password", metavar="PASSWORD",
-                    help="TP-Link admin password to fetch DSL line stats")
+                    help="TP-Link admin password to fetch DSL line stats. "
+                         "WARNING: visible to other users via `ps`; prefer the "
+                         "TPLINK_PASSWORD env var or --tplink-password-prompt.")
+    ap.add_argument("--tplink-password-prompt", action="store_true",
+                    help="Securely prompt for the TP-Link password instead of "
+                         "passing it on the command line.")
     ap.add_argument("--probe-creds", action="store_true",
                     help="Actively test default admin credentials against the gateway. "
                          "NOT read-only and can trigger router lockout; off by default.")
@@ -2307,12 +2376,25 @@ def main():
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
         args.full, args.no_vendors, args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
-        args.probe_creds, args.html_report,
+        args.tplink_password_prompt, args.probe_creds, args.html_report,
     ])
 
     if not cli_args_given or args.menu:
         interactive_menu()
         return
+
+    # Resolve the TP-Link password from the safest available source.
+    tplink_password = None
+    if args.tplink_password_prompt:
+        import getpass
+        tplink_password = getpass.getpass("TP-Link admin password: ")
+    elif args.tplink_password:
+        tplink_password = args.tplink_password
+        print("Warning: passing --tplink-password on the command line exposes it "
+              "in the process list. Prefer the TPLINK_PASSWORD env var or "
+              "--tplink-password-prompt.\n")
+    else:
+        tplink_password = os.environ.get("TPLINK_PASSWORD")
 
     if sys.platform != "darwin":
         print("Note: written for macOS. Some system commands may differ.\n")
@@ -2331,13 +2413,20 @@ def main():
         no_vendors=args.no_vendors,
         no_speedtest=args.no_speedtest,
         upstream_ip=args.upstream,
-        tplink_password=args.tplink_password,
+        tplink_password=tplink_password,
         subnet_overrides=args.subnet,
         extra_subnets=getattr(args, "extra_subnet", None),
         probe_creds=args.probe_creds,
     )
 
-    if not args.no_save_baseline:
+    if args.no_save_baseline:
+        pass
+    elif state.get("gateway") is None:
+        # Saving a gateway-less run would drop router_open_ports from the
+        # baseline and trigger false "NEW open port" alarms on the next run.
+        print("\nSkipping baseline save: gateway could not be determined, so this "
+              "scan is incomplete and would corrupt change detection.")
+    else:
         save_baseline(state)
         print(f"\nBaseline saved to {BASELINE_FILE}")
 
