@@ -570,53 +570,91 @@ def tplink_dsl_stats(ip, password):
 # NEW FEATURE 1: Wi-Fi security mode
 # ---------------------------------------------------------------------------
 
+def _parse_connected_wifi_block(text):
+    """Return (ssid, block_body) for the CONNECTED Wi-Fi network from
+    `system_profiler SPAirPortDataType` output.
+
+    Anchors to the first 'Current Network Information:' whose next deeper-indented
+    line is a bare 'name:' key (the en0 block — the awdl0/AirDrop block has none),
+    and bounds the body before 'Other Local Wi-Fi Networks:' so a neighbour's
+    Security value can never be read by mistake.
+    """
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() != "Current Network Information:":
+            continue
+        cur_indent = len(ln) - len(ln.lstrip())
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j >= len(lines):
+            continue
+        key_indent = len(lines[j]) - len(lines[j].lstrip())
+        name = lines[j].strip()
+        # Must be a deeper-indented 'name:' key, not a 'Field: value' child.
+        if key_indent > cur_indent and name.endswith(":") and ":" not in name[:-1]:
+            body = []
+            for k in range(j + 1, len(lines)):
+                s = lines[k]
+                if not s.strip():
+                    continue
+                ind = len(s) - len(s.lstrip())
+                if s.strip().startswith("Other Local Wi-Fi Networks:") or ind <= key_indent:
+                    break
+                body.append(s)
+            return name[:-1].strip(), "\n".join(body)
+    return None, ""
+
+
 def check_wifi_security():
     """
-    Use the airport utility to report the current Wi-Fi (Wireless Fidelity)
-    security mode. WEP (Wired Equivalent Privacy) is broken; open networks
-    have no encryption at all.
-    Returns a dict with keys: ssid, auth, cipher, risk, note.
-    """
-    airport = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
-    out = run([airport, "-I"])
-    if not out:
-        # Fallback: try system_profiler
-        out = run(["system_profiler", "SPAirPortDataType"], timeout=15)
+    Report the connected Wi-Fi network's security mode from system_profiler.
+    (The legacy `airport` utility was removed on current macOS.) WEP is broken;
+    open networks have no encryption at all.
 
+    Returns a dict: ssid, auth, cipher, risk, note. ssid is None when
+    system_profiler redacts it (it does unless the audit is run with sudo).
+    """
+    out = run(["system_profiler", "SPAirPortDataType"], timeout=15) or ""
     result = {"ssid": None, "auth": None, "cipher": None, "risk": "UNKNOWN", "note": ""}
 
-    # Parse airport -I output
-    ssid_m = re.search(r"\s+SSID:\s*(.+)", out)
-    auth_m  = re.search(r"(?i)link auth:\s*(\S+)", out)
-    cipher_m = re.search(r"(?i)(?:cipher|encryption):\s*(\S+)", out)
+    ssid_raw, block = _parse_connected_wifi_block(out)
+    if ssid_raw and ssid_raw != "<redacted>":
+        result["ssid"] = ssid_raw
 
-    if ssid_m:
-        result["ssid"] = ssid_m.group(1).strip()
-    if auth_m:
-        result["auth"] = auth_m.group(1).strip()
-    if cipher_m:
-        result["cipher"] = cipher_m.group(1).strip()
+    # Security is scoped to the connected block only — never a neighbour's value.
+    m = re.search(r"^\s*Security:\s*(.+?)\s*$", block, re.MULTILINE)
+    if m:
+        result["auth"] = m.group(1).strip()
 
-    # Also try grabbing from system_profiler if airport gave nothing useful
-    if not result["auth"]:
-        sp_auth = re.search(r"Security:\s*(.+)", out)
-        if sp_auth:
-            result["auth"] = sp_auth.group(1).strip()
-
-    auth = (result["auth"] or "").lower()
-    if not auth or auth in ("none", "open"):
+    a = (result["auth"] or "").lower()
+    if a in ("none", "open"):
+        # Only the literal macOS 'None' string means a truly open network.
         result["risk"] = "HIGH"
         result["note"] = "OPEN network — all traffic is unencrypted. Use WPA2 or WPA3."
-    elif "wep" in auth:
+    elif not a:
+        # No Security value parsed — a failure to read, NOT a confirmed open net.
+        result["risk"] = "REVIEW"
+        result["note"] = ("Could not read the Wi-Fi security mode (are you on Wi-Fi? "
+                          "some details need the audit to be run with sudo).")
+    elif "wep" in a:
         result["risk"] = "HIGH"
         result["note"] = "WEP is cryptographically broken. Upgrade to WPA2 or WPA3 immediately."
-    elif "wpa3" in auth:
-        result["risk"] = "GOOD"
-        result["note"] = "WPA3 — current best practice."
-    elif "wpa2" in auth:
-        result["risk"] = "OK"
-        result["note"] = "WPA2 — acceptable. WPA3 preferred if your router supports it."
-    elif "wpa" in auth:
+    elif "wpa3" in a:
+        if "wpa2" in a:
+            result["risk"] = "OK"
+            result["note"] = "WPA2/WPA3 transitional — good, but a WPA2 fallback is still allowed."
+        else:
+            result["risk"] = "GOOD"
+            result["note"] = "WPA3 — current best practice."
+    elif "wpa2" in a:
+        if "wpa/" in a:
+            result["risk"] = "MEDIUM"
+            result["note"] = "WPA/WPA2 mixed — the legacy WPA fallback weakens security. Set WPA2/WPA3 only."
+        else:
+            result["risk"] = "OK"
+            result["note"] = "WPA2 — acceptable. WPA3 preferred if your router supports it."
+    elif "wpa" in a:
         result["risk"] = "MEDIUM"
         result["note"] = "WPA (original) has known weaknesses. Upgrade to WPA2 or WPA3."
     else:
@@ -629,7 +667,7 @@ def check_wifi_security():
 def action_wifi_security():
     hr("WI-FI SECURITY MODE")
     r = check_wifi_security()
-    print(f"  SSID (network name) : {r['ssid'] or 'unknown'}")
+    print(f"  SSID (network name) : {r['ssid'] or 'unknown (run with sudo to reveal SSID)'}")
     print(f"  Auth / encryption   : {r['auth'] or 'unknown'}")
     if r["cipher"]:
         print(f"  Cipher              : {r['cipher']}")
@@ -1340,26 +1378,44 @@ def action_listening_services():
 # NEW FEATURE 8: Sharing services check
 # ---------------------------------------------------------------------------
 
+def _launchd_running(label):
+    """Return True if the launchd label is loaded AND running, False if it is
+    absent (not loaded into the system domain), or None on error.
+
+    Uses `launchctl print system/<label>` (works unprivileged on current macOS,
+    unlike `launchctl list <label>` which fails for system-domain daemons). The
+    value after 'state =' is compared exactly so 'state = not running' is never
+    misread as running.
+    """
+    try:
+        p = subprocess.run(["launchctl", "print", "system/" + label],
+                           capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if p.returncode != 0:
+        return False  # label not loaded → service off
+    for line in p.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("state ="):
+            return s.split("=", 1)[1].strip() == "running"
+    return False
+
+
 def check_sharing_services():
     """
-    Query macOS for enabled sharing services. Each enabled service is an
-    inbound network attack surface. Returns list of enabled service dicts.
+    Query macOS for enabled sharing services — each is an inbound attack
+    surface. Returns a list of dicts: name, enabled (True/False/None=unknown),
+    risk, note.
+
+    `systemsetup -get*` needs admin and otherwise prints an admin-access message
+    with exit 0; we string-match it and report UNKNOWN rather than a false OFF.
+    smbd is launch-on-demand, so its authoritative on/off comes from
+    `launchctl print-disabled system`, corroborated by a live listener probe.
     """
     services = []
 
-    checks = [
-        ("Remote Login (SSH)",    ["systemsetup", "-getremotelogin"],       r"Remote Login:\s*(\w+)"),
-        ("Remote Management",     ["systemsetup", "-getremoteappleevents"], r"Remote Apple Events:\s*(\w+)"),
-        ("Screen Sharing",        ["defaults", "read", "/var/db/launchd.db/com.apple.launchd/overrides.plist",
-                                   "com.apple.screensharing"],              r"Disabled\s*=\s*(\d)"),
-        ("File Sharing (AFP/SMB)",["launchctl", "list", "com.apple.smbd"], None),
-        ("Printer Sharing",       ["launchctl", "list", "com.apple.cupsd"], None),
-        ("Bluetooth Sharing",     ["defaults", "read", "com.apple.Bluetooth", "PrefKeyServicesEnabled"], None),
-    ]
-
-    # Use systemsetup for reliable results
-    ssh_out = run(["systemsetup", "-getremotelogin"], timeout=5)
-    ssh_on = "on" in ssh_out.lower()
+    # Remote Login (SSH): launchd state OR a live listener on 22.
+    ssh_on = bool(_launchd_running("com.openssh.sshd")) or check_port("127.0.0.1", 22, timeout=0.4)
     services.append({
         "name": "Remote Login (SSH)",
         "enabled": ssh_on,
@@ -1367,18 +1423,8 @@ def check_sharing_services():
         "note": "SSH enabled — fine if intentional; disable if not needed." if ssh_on else "Disabled.",
     })
 
-    rae_out = run(["systemsetup", "-getremoteappleevents"], timeout=5)
-    rae_on = "on" in rae_out.lower()
-    services.append({
-        "name": "Remote Apple Events",
-        "enabled": rae_on,
-        "risk": "REVIEW" if rae_on else "OK",
-        "note": "Allows remote Apple Script control." if rae_on else "Disabled.",
-    })
-
-    # Screen sharing via launchctl
-    ss_out = run(["launchctl", "list", "com.apple.screensharing"], timeout=5)
-    ss_on = bool(ss_out and "PID" in ss_out and "-\t0\t" not in ss_out)
+    # Screen Sharing / VNC: launchd state OR a live listener on 5900.
+    ss_on = bool(_launchd_running("com.apple.screensharing")) or check_port("127.0.0.1", 5900, timeout=0.4)
     services.append({
         "name": "Screen Sharing / VNC",
         "enabled": ss_on,
@@ -1386,9 +1432,18 @@ def check_sharing_services():
         "note": "Screen visible to anyone with credentials; use only if needed." if ss_on else "Disabled.",
     })
 
-    # SMB file sharing
-    smb_out = run(["launchctl", "list", "com.apple.smbd"], timeout=5)
-    smb_on = bool(smb_out and "PID" in smb_out)
+    # File Sharing (SMB): authoritative config flag, OR live state/listener.
+    smb_cfg = None
+    try:
+        p = subprocess.run(["launchctl", "print-disabled", "system"],
+                           capture_output=True, text=True, timeout=5)
+        m = re.search(r'"com\.apple\.smbd"\s*=>\s*(\w+)', p.stdout)
+        if m:
+            smb_cfg = (m.group(1) == "enabled")
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    smb_on = bool(smb_cfg) or (_launchd_running("com.apple.smbd") is True) \
+        or check_port("127.0.0.1", 445, timeout=0.4)
     services.append({
         "name": "File Sharing (SMB)",
         "enabled": smb_on,
@@ -1396,7 +1451,32 @@ def check_sharing_services():
         "note": "File shares visible on the network." if smb_on else "Disabled.",
     })
 
-    # AirDrop / AirPlay via discoveryd / mDNSResponder — just note it's always on
+    # Remote Apple Events: only determinable with root. Report UNKNOWN (never a
+    # false OFF) when the admin-access message comes back (note: exit code is 0).
+    rae_out = (run(["systemsetup", "-getremoteappleevents"], timeout=5) or "").lower()
+    if "you need administrator access" in rae_out or not rae_out.strip():
+        services.append({
+            "name": "Remote Apple Events",
+            "enabled": None,
+            "risk": "UNKNOWN",
+            "note": "Unknown — re-run this audit with sudo to determine its state.",
+        })
+    elif "remote apple events: on" in rae_out:
+        services.append({
+            "name": "Remote Apple Events",
+            "enabled": True,
+            "risk": "REVIEW",
+            "note": "Allows remote AppleScript control.",
+        })
+    else:
+        services.append({
+            "name": "Remote Apple Events",
+            "enabled": False,
+            "risk": "OK",
+            "note": "Disabled.",
+        })
+
+    # mDNS / Bonjour: always on; informational.
     services.append({
         "name": "mDNS / Bonjour",
         "enabled": True,
@@ -1409,12 +1489,12 @@ def check_sharing_services():
 
 def action_sharing_services():
     hr("SHARING SERVICES CHECK")
-    print("  Checking macOS sharing services (may require sudo for full info)...")
+    print("  Checking macOS sharing services (run with sudo for full detail)...")
     services = check_sharing_services()
 
     for s in services:
-        state = "ON " if s["enabled"] else "OFF"
-        print(f"  [{s['risk']:6}] {state}  {s['name']:<30} {s['note']}")
+        state = "?  " if s["enabled"] is None else ("ON " if s["enabled"] else "OFF")
+        print(f"  [{s['risk']:7}] {state}  {s['name']:<22} {s['note']}")
 
     enabled = [s for s in services if s["enabled"] and s["risk"] not in ("INFO", "OK")]
     if enabled:
@@ -1439,11 +1519,36 @@ def check_firewall():
     stealth_out = run([fw_cmd, "--getstealthmode"], timeout=5)
     blockall_out = run([fw_cmd, "--getblockall"], timeout=5)
 
-    result["enabled"] = "enabled" in global_out.lower() or "state = 1" in global_out.lower()
-    result["stealth_mode"] = "enabled" in stealth_out.lower()
-    result["block_all"] = "enabled" in blockall_out.lower()
+    # Global state: parse the documented "(State = N)" integer. 1 = on (allow
+    # signed apps), 2 = on (block-all); 0 = off. The old "enabled" substring
+    # rule was brittle; the integer is the stable signal. None = unknown.
+    m = re.search(r"State\s*=\s*(\d+)", global_out)
+    result["enabled"] = (int(m.group(1)) >= 1) if m else None
 
-    if not result["enabled"]:
+    # Stealth mode reports "...stealth mode is on/off" — note there is NO
+    # "enabled" token, which is why the old `"enabled" in out` rule always
+    # reported stealth OFF even when it was on.
+    sl = stealth_out.lower()
+    if "is on" in sl or "enabled" in sl:
+        result["stealth_mode"] = True
+    elif "is off" in sl or "disabled" in sl:
+        result["stealth_mode"] = False
+    else:
+        result["stealth_mode"] = None
+
+    # Block-all reports "...block all state set to enabled/disabled." Test for
+    # "disabled" FIRST so a loose "enabled" match can't misfire.
+    bl = blockall_out.lower()
+    if "disabled" in bl:
+        result["block_all"] = False
+    elif "enabled" in bl or "block all is on" in bl:
+        result["block_all"] = True
+    else:
+        result["block_all"] = None
+
+    if result["enabled"] is None:
+        result["note"] = "Could not determine firewall state (unexpected command output)."
+    elif not result["enabled"]:
         result["note"] = "Firewall is OFF. Enable it in System Settings → Network → Firewall."
     elif result["block_all"]:
         result["note"] = "Block all mode — maximum restriction. Verify legitimate apps still work."
@@ -1458,15 +1563,15 @@ def check_firewall():
 def action_firewall_check():
     hr("FIREWALL STATUS")
     fw = check_firewall()
-    enabled_str = "ON" if fw["enabled"] else "OFF"
-    stealth_str  = "ON" if fw["stealth_mode"] else "OFF"
-    blockall_str = "ON" if fw["block_all"] else "OFF"
 
-    risk = "OK" if fw["enabled"] else "HIGH"
-    print(f"  [{risk}] Application Firewall : {enabled_str}")
-    print(f"          Stealth Mode         : {stealth_str}")
-    print(f"          Block All            : {blockall_str}")
-    print(f"          Note                 : {fw['note']}")
+    def onoff(v):
+        return "UNKNOWN" if v is None else ("ON" if v else "OFF")
+
+    risk = "REVIEW" if fw["enabled"] is None else ("OK" if fw["enabled"] else "HIGH")
+    print(f"  [{risk:6}] Application Firewall : {onoff(fw['enabled'])}")
+    print(f"            Stealth Mode         : {onoff(fw['stealth_mode'])}")
+    print(f"            Block All            : {onoff(fw['block_all'])}")
+    print(f"            Note                 : {fw['note']}")
     return fw
 
 
@@ -1756,37 +1861,42 @@ def print_network_info():
 # Individual audit actions (original)
 # ---------------------------------------------------------------------------
 
+def audit_host(label, host, full_scan=False):
+    """Port-scan one host, print a risk-annotated summary, and return open ports.
+
+    Shared by action_port_scan and action_full_audit (previously duplicated).
+    """
+    port_set = range(1, 65536) if full_scan else COMMON_PORTS
+    n = "all 65535" if full_scan else str(len(COMMON_PORTS))
+    print(f"\nScanning {n} ports on {label} ({host})...")
+    t0 = time.time()
+    open_ports = scan_ports(host, port_set)
+    print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
+    for p in open_ports:
+        svc, risk, note = PORTS_OF_INTEREST.get(
+            p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
+        print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
+    tls = check_tls(host)
+    print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
+    if open_ports and 80 in open_ports and 443 not in open_ports:
+        print("  Note: port 80 open without 443. App-managed mesh systems")
+        print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
+    return open_ports
+
+
 def action_port_scan(full_scan=False, upstream_ip=None):
     hr("PORT SCAN")
     interfaces, local_ip, gateway = print_network_info()
 
-    def audit_host(label, host):
-        port_set = range(1, 65536) if full_scan else COMMON_PORTS
-        n = "all 65535" if full_scan else str(len(COMMON_PORTS))
-        print(f"\nScanning {n} ports on {label} ({host})...")
-        t0 = time.time()
-        open_ports = scan_ports(host, port_set)
-        print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
-        for p in open_ports:
-            svc, risk, note = PORTS_OF_INTEREST.get(
-                p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
-            print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
-        tls = check_tls(host)
-        print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
-        if open_ports and 80 in open_ports and 443 not in open_ports:
-            print("  Note: port 80 open without 443. App-managed mesh systems")
-            print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
-        return open_ports
-
     open_ports = []
     if gateway:
-        open_ports = audit_host("default gateway", gateway)
+        open_ports = audit_host("default gateway", gateway, full_scan)
     else:
         print("Could not determine default gateway.")
 
     if upstream_ip:
         hr("UPSTREAM MODEM")
-        audit_host("upstream modem", upstream_ip)
+        audit_host("upstream modem", upstream_ip, full_scan)
 
     return gateway, open_ports
 
@@ -1841,6 +1951,77 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
         print(f"    python3 home_net_audit.py --label MAC='Device Name' ...")
 
 
+def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
+    """Build the ordered list of subnets to sweep: CLI overrides (validated) or
+    auto-detected interfaces, plus any explicit extras. Invalid CIDRs are
+    skipped with a warning rather than crashing."""
+    if subnet_overrides:
+        subnets = []
+        for s in subnet_overrides:
+            try:
+                subnets.append(ipaddress.ip_network(s, strict=False))
+            except ValueError:
+                print(f"  Skipping invalid subnet {s!r} "
+                      "(expected CIDR like 192.168.1.0/24).")
+    elif interfaces:
+        subnets = list({net for _, _, net in interfaces})
+    else:
+        fb = guess_subnet(local_ip)
+        subnets = [fb] if fb else []
+
+    for s in (extra_subnets or []):
+        try:
+            subnets.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            print(f"  Skipping invalid extra subnet {s!r}.")
+
+    # De-duplicate while preserving scan order (avoids sweeping a subnet twice
+    # if it appears in both the overrides and the extras, or is repeated).
+    seen, ordered = set(), []
+    for net in subnets:
+        if net not in seen:
+            seen.add(net)
+            ordered.append(net)
+    return ordered
+
+
+def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_note=""):
+    """Ping-sweep each subnet (de-duplicating by IP), then resolve vendors.
+
+    Vendor lookups skip labelled / unknown / randomized MACs entirely and sleep
+    only BETWEEN real API calls. Shared by action_discover_devices and
+    action_full_audit (previously duplicated). Returns the device list.
+    """
+    all_devices = []
+    seen_ips = set()
+    for subnet in subnets_to_sweep:
+        net_name = network_name_for_subnet(str(subnet), networks)
+        print(f"  Sweeping {subnet}  [{net_name}]{sweep_note}...")
+        for d in discover_devices(subnet):
+            if d["ip"] not in seen_ips:
+                seen_ips.add(d["ip"])
+                all_devices.append({**d, "subnet": str(subnet)})
+
+    if not no_vendors and all_devices:
+        needs_lookup = [d for d in all_devices
+                        if not labels.get(d["mac"].lower())
+                        and d["mac"] != "unknown"
+                        and not is_randomized_mac(d["mac"])]
+        if needs_lookup:
+            print(f"  Looking up vendors for {len(needs_lookup)} unlabelled device(s)...")
+        for d in all_devices:
+            mac = d["mac"]
+            if is_randomized_mac(mac) and not labels.get(mac.lower()):
+                d["vendor"] = "(randomized/private MAC)"
+            else:
+                d["vendor"] = ""
+        for i, d in enumerate(needs_lookup):
+            if i > 0:
+                time.sleep(1.1)  # rate-limit between real API calls only
+            d["vendor"] = lookup_vendor(d["mac"])
+    return all_devices
+
+
 def action_discover_devices(no_vendors=False, subnet_overrides=None, extra_subnets=None):
     """
     Discover devices on one or more subnets.
@@ -1854,63 +2035,13 @@ def action_discover_devices(no_vendors=False, subnet_overrides=None, extra_subne
     labels = load_labels()
     networks = load_networks()
 
-    if subnet_overrides:
-        subnets_to_sweep = []
-        for s in subnet_overrides:
-            try:
-                subnets_to_sweep.append(ipaddress.ip_network(s, strict=False))
-            except ValueError:
-                print(f"  Skipping invalid subnet {s!r} "
-                      "(expected CIDR like 192.168.1.0/24).")
-    elif interfaces:
-        subnets_to_sweep = list({net for _, _, net in interfaces})
-    else:
-        fb = guess_subnet(local_ip)
-        subnets_to_sweep = [fb] if fb else []
-
-    # Append any extra subnets the user specified (e.g. Pearl network)
-    if extra_subnets:
-        for s in extra_subnets:
-            net = ipaddress.ip_network(s, strict=False)
-            if net not in subnets_to_sweep:
-                subnets_to_sweep.append(net)
-
+    subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
     if not subnets_to_sweep:
         print("  Could not determine any subnet. Pass one with --subnet 192.168.1.0/24")
         return []
 
-    all_devices = []
-    seen_ips = set()
-    for subnet in subnets_to_sweep:
-        net_name = network_name_for_subnet(str(subnet), networks)
-        print(f"  Sweeping {subnet}  [{net_name}]  (this takes ~10-30s)...")
-        devices = discover_devices(subnet)
-        for d in devices:
-            if d["ip"] not in seen_ips:
-                seen_ips.add(d["ip"])
-                all_devices.append({**d, "subnet": str(subnet)})
-
-    if not no_vendors and all_devices:
-        needs_lookup = [d for d in all_devices
-                        if not labels.get(d["mac"].lower())
-                        and d["mac"] != "unknown"
-                        and not is_randomized_mac(d["mac"])]
-        if needs_lookup:
-            print(f"  Looking up vendors for {len(needs_lookup)} unlabelled device(s)...")
-        # Labelled / unknown / randomized MACs need no online lookup.
-        for d in all_devices:
-            mac = d["mac"]
-            if is_randomized_mac(mac) and not labels.get(mac.lower()):
-                d["vendor"] = "(randomized/private MAC)"
-            else:
-                d["vendor"] = ""
-        # Only the genuinely-unknown real MACs hit the API; sleep BETWEEN calls
-        # (not after the last) to stay under the free tier's rate limit.
-        for i, d in enumerate(needs_lookup):
-            if i > 0:
-                time.sleep(1.1)
-            d["vendor"] = lookup_vendor(d["mac"])
-
+    all_devices = collect_devices(subnets_to_sweep, labels, networks,
+                                  no_vendors=no_vendors, sweep_note="  (this takes ~10-30s)")
     _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
     return all_devices
 
@@ -1983,28 +2114,11 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     # Port scan
     hr("ROUTER / GATEWAY PORT SCAN")
-    def audit_host(label, host):
-        port_set = range(1, 65536) if full_scan else COMMON_PORTS
-        n = "all 65535" if full_scan else str(len(COMMON_PORTS))
-        print(f"\nScanning {n} ports on {label} ({host})...")
-        t0 = time.time()
-        open_ports = scan_ports(host, port_set)
-        print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
-        for p in open_ports:
-            svc, risk, note = PORTS_OF_INTEREST.get(
-                p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
-            print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
-        tls = check_tls(host)
-        print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
-        if open_ports and 80 in open_ports and 443 not in open_ports:
-            print("  Note: port 80 open without 443. Mesh systems use 80/5000 locally.")
-        return open_ports
-
     if gateway:
-        state["router_open_ports"] = audit_host("default gateway", gateway)
+        state["router_open_ports"] = audit_host("default gateway", gateway, full_scan)
     if upstream_ip:
         hr("UPSTREAM MODEM")
-        state["upstream_open_ports"] = audit_host("upstream modem", upstream_ip)
+        state["upstream_open_ports"] = audit_host("upstream modem", upstream_ip, full_scan)
 
     # DSL stats
     if tplink_password:
@@ -2037,53 +2151,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     hr("CONNECTED DEVICES")
     labels = load_labels()
     networks = load_networks()
-    if subnet_overrides:
-        subnets_to_sweep = []
-        for s in subnet_overrides:
-            try:
-                subnets_to_sweep.append(ipaddress.ip_network(s, strict=False))
-            except ValueError:
-                print(f"  Skipping invalid subnet {s!r} "
-                      "(expected CIDR like 192.168.1.0/24).")
-    elif interfaces:
-        subnets_to_sweep = list({net for _, _, net in interfaces})
-    else:
-        fb = guess_subnet(local_ip)
-        subnets_to_sweep = [fb] if fb else []
-
-    if extra_subnets:
-        for s in extra_subnets:
-            net = ipaddress.ip_network(s, strict=False)
-            if net not in subnets_to_sweep:
-                subnets_to_sweep.append(net)
-
+    subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
     if subnets_to_sweep:
-        all_devices = []
-        seen_ips = set()
-        for subnet in subnets_to_sweep:
-            net_name = network_name_for_subnet(str(subnet), networks)
-            print(f"  Sweeping {subnet}  [{net_name}]...")
-            for d in discover_devices(subnet):
-                if d["ip"] not in seen_ips:
-                    seen_ips.add(d["ip"])
-                    all_devices.append({**d, "subnet": str(subnet)})
-        if not no_vendors and all_devices:
-            needs_lookup = [d for d in all_devices
-                            if not labels.get(d["mac"].lower())
-                            and d["mac"] != "unknown"
-                            and not is_randomized_mac(d["mac"])]
-            # Labelled / unknown / randomized MACs need no online lookup.
-            for d in all_devices:
-                mac = d["mac"]
-                if is_randomized_mac(mac) and not labels.get(mac.lower()):
-                    d["vendor"] = "(randomized/private MAC)"
-                else:
-                    d["vendor"] = ""
-            # Only genuinely-unknown real MACs hit the API; sleep between calls.
-            for i, d in enumerate(needs_lookup):
-                if i > 0:
-                    time.sleep(1.1)
-                d["vendor"] = lookup_vendor(d["mac"])
+        all_devices = collect_devices(subnets_to_sweep, labels, networks, no_vendors=no_vendors)
         state["devices"] = all_devices
         _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
 
