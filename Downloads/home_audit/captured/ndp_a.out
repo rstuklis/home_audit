@@ -1,0 +1,23 @@
+Neighbor                                Linklayer Address  Netif Expire    St Flgs Prbs
+2001:db8::4   02:00:00:05:05:05    en0 16h33m46s S      
+2001:db8::3  02:00:00:06:06:06    en0 permanent R      
+2001:db8::2  a4:83:e7:03:03:03    en0 17h19m44s S      
+2001:db8::1 02:00:00:07:07:07    en0 7s        R      
+fe80::1%lo0                             (incomplete)         lo0 permanent R      
+fe80::aede:48ff:fe00:1122%en5           ac:de:48:0:11:22     en5 permanent R      
+fe80::aede:48ff:fe33:4455%en5           ac:de:48:33:44:55    en5 1s        D      
+fe80::c%ap1           02:00:00:08:08:08    ap1 permanent R      
+fe80::13%en0             a4:83:e7:03:03:03    en0 23h52m15s S      
+fe80::10%en0            02:00:00:07:07:07    en0 23h21m24s S      
+fe80::f%en0            02:00:00:06:06:06    en0 permanent R      
+fe80::e%en0            02:00:00:04:04:04    en0 23h59m55s S      
+fe80::11%en0            02:00:00:05:05:05    en0 8s        R      
+fe80::12%en0            a4:83:e7:09:09:09    en0 10s       R  R   
+fe80::8%awdl0         02:00:00:0a:0a:0a  awdl0 permanent R      
+fe80::b%llw0          02:00:00:0a:0a:0a   llw0 permanent R      
+fe80::6%utun0         (incomplete)       utun0 permanent R      
+fe80::9%utun1         (incomplete)       utun1 permanent R      
+fe80::7%utun2         (incomplete)       utun2 permanent R      
+fe80::d%utun3           (incomplete)       utun3 permanent R      
+fe80::5%utun4         (incomplete)       utun4 permanent R      
+fe80::a%utun5         (incomplete)       utun5 permanent R      
