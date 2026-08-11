@@ -614,9 +614,14 @@ class TestOneDeviceOneIdentity:
 
     def test_padded_and_unpadded_spellings_are_the_same_nic(self, red):
         """ifconfig pads an octet below 0x10, arp and ndp do not. One NIC,
-        two spellings, and keying on the spelling gave it two identities."""
-        unpadded = red.addresses("ac:de:48:0:11:22")
-        padded = red.addresses("ac:de:48:00:11:22")
+        two spellings, and keying on the spelling gave it two identities.
+
+        The capture that found this showed it on the bridge interface, which
+        is now preserved outright — so the example here is an ordinary NIC,
+        the case where the padding actually has to be reconciled.
+        """
+        unpadded = red.addresses("3c:22:fb:a:b:c")
+        padded = red.addresses("3c:22:fb:0a:0b:0c")
         assert unpadded == padded
 
     def test_a_column_truncated_address_is_not_a_second_host(self, red):
@@ -658,3 +663,31 @@ class TestTheSummaryIsReadable:
         red.prime(["fe80::abcd:1234:5678:1111%en0 fe80::abcd:1234:5678:2222%en0"])
         red.addresses("fe80::abcd:1234")
         assert any("matches several" in ln for ln in red.warnings())
+
+
+class TestAppleBridgeAddresses:
+    """The secure-enclave bridge interface carries the same literal MACs on
+    every Mac that has one. They name a model, not a machine — and redacting
+    them manufactured an ambiguity the tool then had to ask a person about."""
+
+    def test_the_fixed_bridge_macs_are_left_alone(self, red):
+        for mac in ("ac:de:48:00:11:22", "ac:de:48:33:44:55"):
+            assert red.addresses(mac) == mac
+
+    def test_the_unpadded_spelling_is_recognised_too(self, red):
+        """ndp prints it unpadded. It is the same constant, and it has to come
+        back spelled the way the tool that produced it spelled it."""
+        assert red.addresses("ac:de:48:0:11:22") == "ac:de:48:0:11:22"
+
+    def test_their_derived_link_locals_are_left_alone(self, red):
+        for addr in ("fe80::aede:48ff:fe00:1122%en5",
+                     "fe80::aede:48ff:fe33:4455%en5"):
+            assert red.addresses(addr) == addr
+
+    def test_the_shared_truncation_no_longer_needs_adjudicating(self, red):
+        """fe80::aede:48ff is a prefix of both, which is precisely why it
+        could not be resolved. Neither is substituted now, so the cut form
+        must not be either — and there is nothing left to ask about."""
+        red.prime(["fe80::aede:48ff:fe00:1122%en5 fe80::aede:48ff:fe33:4455%en5"])
+        assert red.addresses("fe80::aede:48ff") == "fe80::aede:48ff"
+        assert not red.warnings()

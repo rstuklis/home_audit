@@ -103,6 +103,18 @@ PRESERVED_DNS = {
 }
 
 
+# Apple assigns these to the secure-enclave bridge interface with the same
+# literal values on every Mac that has one, which is why they arrive as a
+# 00:11:22 / 33:44:55 pair rather than anything a vendor would allocate. They
+# name a model of Mac, not a machine, so redacting them protects nobody — and
+# it costs something, because the two are indistinguishable once truncated to
+# their shared fe80::aede:48ff prefix, and the tool then has to ask a person
+# to adjudicate an ambiguity that only exists because it substituted them.
+# tests/fixtures/lsof_udp.out already carried one of these in the clear.
+APPLE_BRIDGE_MACS = {"ac:de:48:00:11:22", "ac:de:48:33:44:55"}
+APPLE_BRIDGE_V6 = {"fe80::aede:48ff:fe00:1122", "fe80::aede:48ff:fe33:4455"}
+
+
 class Redactor:
     """Consistent substitutions: one real value maps to one fake value.
 
@@ -187,6 +199,8 @@ class Redactor:
         # which is the exact cross-table incoherence this class promises not to
         # produce. The audit has _normalise_mac for this; key on the same shape.
         key = ":".join(o.zfill(2) for o in real.split(":"))
+        if key in APPLE_BRIDGE_MACS:
+            return real          # keep the spelling the tool printed
         real = key
         if real not in self.macs:
             n = len(self.macs) + 1
@@ -222,9 +236,15 @@ class Redactor:
         # asserts the precise opposite of the behaviour that was shipped.
         if parsed.is_link_local and parsed.packed[8:] == b"\x00" * 8:
             return real
-        if parsed.compressed in PRESERVED_DNS:
+        if parsed.compressed in PRESERVED_DNS or parsed.compressed in APPLE_BRIDGE_V6:
             return real
         if real not in self.v6:
+            # A cut-off spelling of an address that was never substituted must
+            # not be substituted either, or the routing table gains a host the
+            # interface list has never heard of.
+            if (len(addr) >= self.TRUNCATION_FLOOR
+                    and any(k.startswith(addr) for k in APPLE_BRIDGE_V6)):
+                return real
             full = self._full_form_of(real)
             if full is not None:
                 # Same interface, spelled short by a narrow column. One
