@@ -718,6 +718,14 @@ def lookup_vendor(mac):
 
 
 def check_tls(host, port=443):
+    """Fingerprint the certificate rather than just noting one exists.
+
+    The DER bytes were already being fetched and thrown away — only their
+    length was kept, which detects nothing. Hashing them turns this into
+    interception detection for free: the router's admin certificate is
+    self-signed and stable, so a changed fingerprint between runs means
+    something re-issued it or something is answering in its place.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -725,9 +733,97 @@ def check_tls(host, port=443):
         with socket.create_connection((host, port), timeout=3) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ss:
                 der = ss.getpeercert(binary_form=True)
-                return {"present": True, "cert_bytes": len(der) if der else 0}
+                if not der:
+                    return {"present": True, "sha256": None, "cert_bytes": 0}
+                return {"present": True,
+                        "sha256": hashlib.sha256(der).hexdigest(),
+                        "cert_bytes": len(der)}
     except Exception:
-        return {"present": False}
+        return {"present": False, "sha256": None}
+
+
+# ---------------------------------------------------------------------------
+# Interception detection
+# ---------------------------------------------------------------------------
+
+def check_trust_store():
+    """List admin-added trust settings on macOS.
+
+    A clean Mac has none: `security dump-trust-settings -d` prints a "No Trust
+    Settings" line and nothing else. Installing a root CA is how TLS
+    interception is set up in practice, so anything here is worth reading —
+    this is one of very few endpoint signals that is both cheap and unambiguous.
+
+    Host-posture, so it is macOS-only by the same rule as the firewall and
+    sharing checks: on an observer it would describe the wrong machine.
+    """
+    if sys.platform != "darwin":
+        return {"supported": False, "entries": [], "risk": "INFO",
+                "note": "Trust-store inspection is macOS-only; skipped here."}
+
+    out = run(["security", "dump-trust-settings", "-d"], timeout=10)
+    if not out.strip():
+        return {"supported": True, "entries": [], "risk": "REVIEW",
+                "note": "Could not read the admin trust settings."}
+    if "no trust settings" in out.lower():
+        return {"supported": True, "entries": [], "risk": "OK",
+                "note": "No admin-added trust settings — the expected state."}
+
+    entries = [ln.strip() for ln in out.splitlines()
+               if ln.strip().lower().startswith("cert ")]
+    return {"supported": True, "entries": entries, "risk": "HIGH",
+            "note": f"{len(entries) or 'Some'} admin-added trust setting(s) present. "
+                    "A root certificate installed here lets whoever holds its key "
+                    "read TLS traffic from this machine without a warning. Confirm "
+                    "every one of these is yours."}
+
+
+def build_dns_query(name="example.com", qid=0x4a4a):
+    """A minimal DNS A query. Hand-built because the tool takes no dependencies."""
+    header = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(p)]) + p.encode("ascii")
+                     for p in name.split(".")) + b"\x00"
+    return header + qname + struct.pack("!HH", 1, 1)
+
+
+def probe_dns_interception(target="192.0.2.1", timeout=2):
+    """Ask a resolver that cannot exist and see whether anything answers.
+
+    192.0.2.1 is TEST-NET-1 (RFC 5737) — reserved for documentation and routed
+    nowhere. A DNS query sent there must time out. If something replies, a
+    device on the path is transparently answering port 53 regardless of what
+    the resolver configuration says, which is exactly the case reading
+    `scutil --dns` cannot reveal.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(build_dns_query(), (target, 53))
+        data, addr = sock.recvfrom(512)
+    except (socket.timeout, OSError):
+        return {"intercepted": False, "responder": None, "risk": "OK",
+                "note": f"No answer from {target}, which is the correct result — "
+                        "port 53 is not being transparently redirected."}
+    finally:
+        sock.close()
+
+    return {"intercepted": True, "responder": addr[0], "risk": "HIGH",
+            "note": f"{addr[0]} answered a DNS query addressed to {target}, an "
+                    "address reserved for documentation that routes nowhere. "
+                    "Something on the path is intercepting port 53, so the "
+                    "configured resolvers are not the ones being used."}
+
+
+def action_interception_checks():
+    hr("INTERCEPTION CHECKS")
+    trust = check_trust_store()
+    print(f"  [{trust['risk']:6}] Trust store: {trust['note']}")
+    for entry in trust["entries"]:
+        print(f"           {entry}")
+
+    dns = probe_dns_interception()
+    print(f"  [{dns['risk']:6}] DNS path  : {dns['note']}")
+    return {"trust_store": trust, "dns_interception": dns}
 
 
 # ---------------------------------------------------------------------------
@@ -1348,6 +1444,27 @@ def diff_baseline(old, new):
         notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
     if old_ports - new_ports:
         notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
+    old_bssids = set(old.get("wifi_bssids", []))
+    new_bssids = set(new.get("wifi_bssids", []))
+    if new_bssids - old_bssids:
+        notes.append(
+            f"NEW access point advertising your SSID: {sorted(new_bssids - old_bssids)}. "
+            "A second AP broadcasting your network name is an evil twin.")
+
+    old_offer = (old.get("dhcp") or {}).get("responders") or []
+    new_offer = (new.get("dhcp") or {}).get("responders") or []
+    if old_offer and new_offer:
+        notes.extend(diff_dhcp_offer(old_offer[0], new_offer[0]))
+
+    old_cert = (old.get("router_tls") or {}).get("sha256")
+    new_cert = (new.get("router_tls") or {}).get("sha256")
+    if old_cert and new_cert and old_cert != new_cert:
+        notes.append(
+            "Router TLS certificate CHANGED: "
+            f"{old_cert[:16]}… -> {new_cert[:16]}…. The admin certificate is "
+            "self-signed and stable, so this means it was re-issued or something "
+            "is answering in the router's place.")
+
     old_ra = set(old.get("ipv6_routers", []))
     new_ra = set(new.get("ipv6_routers", []))
     if new_ra - old_ra:
@@ -1532,6 +1649,90 @@ def _parse_connected_wifi_block(text):
     return None, ""
 
 
+def parse_wifi_networks(text):
+    """Return {ssid: [bssid, ...]} across every network system_profiler lists.
+
+    Covers the connected block and the 'Other Local Wi-Fi Networks' section
+    together, because an evil twin is precisely a second BSSID advertising the
+    SSID you are connected to.
+    """
+    networks = {}
+    ssid = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.endswith(":") and ":" not in stripped[:-1]:
+            candidate = stripped[:-1].strip()
+            if candidate and not candidate.endswith("Networks") \
+                    and not candidate.endswith("Information"):
+                ssid = candidate
+                networks.setdefault(ssid, [])
+            continue
+        m = re.match(r"BSSID:\s*(\S+)", stripped)
+        if m and ssid:
+            bssid = m.group(1).strip()
+            if bssid.lower() in ("<redacted>", "redacted"):
+                continue
+            raw = bssid.split(":")
+            if len(raw) == 6:
+                try:
+                    bssid = ":".join(f"{int(x, 16):02x}" for x in raw)
+                except ValueError:
+                    continue
+                if bssid not in networks[ssid]:
+                    networks[ssid].append(bssid)
+    return {k: v for k, v in networks.items() if v}
+
+
+def check_evil_twin(ssid=None, known=None):
+    """Flag a BSSID advertising your SSID that was not in the baseline.
+
+    Comparative for the same reason as rogue-RA detection: a mesh or a pair of
+    access points legitimately puts several BSSIDs behind one SSID, so a count
+    would alarm forever. What matters is a new one appearing.
+    """
+    out = run(["system_profiler", "SPAirPortDataType"], timeout=15) or ""
+    networks = parse_wifi_networks(out)
+    if ssid is None:
+        ssid, _ = _parse_connected_wifi_block(out)
+
+    if not ssid or ssid == "<redacted>":
+        return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
+                "note": "Could not read the connected SSID. system_profiler "
+                        "redacts Wi-Fi details unless the audit is run with sudo, "
+                        "so this check cannot run."}
+
+    bssids = networks.get(ssid, [])
+    if not bssids:
+        return {"ssid": ssid, "bssids": [], "unexpected": [], "risk": "REVIEW",
+                "note": f"No BSSID visible for {ssid} — run with sudo to reveal it."}
+
+    known = list(known or [])
+    unexpected = [b for b in bssids if b not in known] if known else []
+    if unexpected:
+        return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "HIGH",
+                "note": f"{ssid} is being advertised by {', '.join(unexpected)}, which "
+                        "was not in the baseline. A second access point broadcasting "
+                        "your network name is an evil twin — clients may associate "
+                        "with it instead of yours."}
+    return {"ssid": ssid, "bssids": bssids, "unexpected": [], "risk": "OK",
+            "note": f"{ssid} advertised by {len(bssids)} known BSSID(s)." if known
+                    else f"{ssid} advertised by {', '.join(bssids)}. No baseline yet — "
+                         "save one so a new access point would stand out."}
+
+
+def action_evil_twin(known=None):
+    hr("EVIL TWIN CHECK")
+    result = check_evil_twin(known=known)
+    print(f"  SSID   : {result['ssid'] or 'unknown'}")
+    for b in result["bssids"]:
+        flag = "  <-- not in baseline" if b in result["unexpected"] else ""
+        print(f"    {b}{flag}")
+    print(f"  [{result['risk']:6}] {result['note']}")
+    return result
+
+
 def check_wifi_security():
     """
     Report the connected Wi-Fi network's security mode from system_profiler.
@@ -1606,6 +1807,101 @@ def action_wifi_security():
 # NEW FEATURE 2: Rogue DHCP detector
 # ---------------------------------------------------------------------------
 
+def parse_dhcp_options(data):
+    """Split the option TLVs out of a DHCP packet into {code: bytes}.
+
+    Counting responders was never the whole story. A single, perfectly ordinary
+    DHCP server can hand out a poisoned gateway, resolver or static route, and
+    the count stays at one the entire time.
+    """
+    magic = data.find(b"\x63\x82\x53\x63")
+    if magic < 0:
+        return {}
+    options = {}
+    i = magic + 4
+    while i < len(data):
+        code = data[i]
+        if code == 255:                 # end
+            break
+        if code == 0:                   # pad
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            break
+        length = data[i + 1]
+        value = data[i + 2:i + 2 + length]
+        if len(value) < length:
+            break                       # truncated packet
+        options[code] = value
+        i += 2 + length
+    return options
+
+
+def _addresses(value):
+    return [socket.inet_ntoa(value[i:i + 4]) for i in range(0, len(value) - 3, 4)]
+
+
+def decode_classless_routes(value):
+    """RFC 3442 option 121 — the quiet traffic-redirect vector.
+
+    A static route pushed here reroutes a subnet without the attacker having to
+    win a DHCP race or touch the default gateway, so the network keeps looking
+    entirely normal. Encoding is a prefix width, that many significant octets
+    of destination, then a 4-byte gateway.
+    """
+    routes = []
+    i = 0
+    while i < len(value):
+        width = value[i]
+        i += 1
+        if width > 32:
+            break
+        octets = (width + 7) // 8
+        dest = value[i:i + octets]
+        i += octets
+        gateway = value[i:i + 4]
+        i += 4
+        if len(dest) < octets or len(gateway) < 4:
+            break
+        dest = dest + b"\x00" * (4 - octets)
+        routes.append(f"{socket.inet_ntoa(dest)}/{width} via {socket.inet_ntoa(gateway)}")
+    return routes
+
+
+def describe_dhcp_offer(data):
+    """The parts of an OFFER that decide where this machine's traffic goes."""
+    options = parse_dhcp_options(data)
+    described = {
+        "router": _addresses(options.get(3, b"")),
+        "dns": _addresses(options.get(6, b"")),
+        "static_routes": [],
+    }
+    for code in (121, 249):             # 249 is Microsoft's original of the same
+        if code in options:
+            described["static_routes"] = decode_classless_routes(options[code])
+            break
+    return described
+
+
+def diff_dhcp_offer(old, new):
+    """Compare two OFFERs. Any change here redirects traffic."""
+    notes = []
+    if not old:
+        return notes
+    for key, label in (("router", "gateway"), ("dns", "DNS servers")):
+        if old.get(key) and new.get(key) and old[key] != new[key]:
+            notes.append(f"DHCP is now handing out a different {label}: "
+                         f"{old[key]} -> {new[key]}.")
+    old_routes = set(old.get("static_routes", []))
+    new_routes = set(new.get("static_routes", []))
+    if new_routes - old_routes:
+        notes.append(
+            f"NEW DHCP static route(s): {sorted(new_routes - old_routes)}. A route "
+            "pushed this way redirects a subnet without changing the default "
+            "gateway, so nothing else about the network looks different.")
+    return notes
+
+
 def check_rogue_dhcp(timeout=4):
     """
     Send a DHCP (Dynamic Host Configuration Protocol) DISCOVER broadcast and
@@ -1672,7 +1968,8 @@ def check_rogue_dhcp(timeout=4):
                     offered_ip = "unknown"
                 # Avoid duplicates
                 if not any(r["ip"] == server_ip for r in responders):
-                    responders.append({"ip": server_ip, "offered_ip": offered_ip})
+                    responders.append({"ip": server_ip, "offered_ip": offered_ip,
+                                       **describe_dhcp_offer(data)})
             except socket.timeout:
                 break
             except OSError:
@@ -2805,7 +3102,10 @@ def audit_host(label, host, full_scan=False):
             p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
     tls = check_tls(host)
-    print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
+    if tls.get("sha256"):
+        print(f"  HTTPS (TLS) certificate: present, sha256 {tls['sha256'][:16]}…")
+    else:
+        print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
     if open_ports and 80 in open_ports and 443 not in open_ports:
         print("  Note: port 80 open without 443. App-managed mesh systems")
         print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
@@ -3057,6 +3357,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     hr("ROUTER / GATEWAY PORT SCAN")
     if gateway:
         state["router_open_ports"] = audit_host("default gateway", gateway, full_scan)
+        state["router_tls"] = check_tls(gateway)
     if upstream_ip:
         hr("UPSTREAM MODEM")
         state["upstream_open_ports"] = audit_host("upstream modem", upstream_ip, full_scan)
@@ -3123,6 +3424,12 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     arp = action_arp_spoof_check()
     state["arp_spoof"] = arp
+
+    state["interception"] = action_interception_checks()
+
+    twin = action_evil_twin((load_baseline() or {}).get("wifi_bssids"))
+    state["evil_twin"] = twin
+    state["wifi_bssids"] = twin["bssids"]
 
     ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
     state["ipv6"] = ra
