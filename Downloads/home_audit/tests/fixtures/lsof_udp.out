@@ -1,0 +1,8 @@
+COMMAND      PID           USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+mDNSRespo    228 _mdnsresponder    7u  IPv4 0x9e0a1b2c3d4e5fa0      0t0  UDP *:5353
+mDNSRespo    228 _mdnsresponder    8u  IPv6 0x9e0a1b2c3d4e5fa1      0t0  UDP *:5353
+mDNSRespo    228 _mdnsresponder   12u  IPv4 0x9e0a1b2c3d4e5fa2      0t0  UDP *:*
+rapportd     612          alice    5u  IPv4 0x9e0a1b2c3d4e5fa3      0t0  UDP *:52310
+sharingd     701          alice    9u  IPv6 0x9e0a1b2c3d4e5fa4      0t0  UDP [fe80::aede:48ff:fe00:1122%en0]:49281
+netbiosd     244       _netbios    4u  IPv4 0x9e0a1b2c3d4e5fa5      0t0  UDP *:137
+firefox     3312          alice   77u  IPv4 0x9e0a1b2c3d4e5fa6      0t0  UDP 192.168.87.24:61234->142.250.70.238:443

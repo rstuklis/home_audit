@@ -1,0 +1,8 @@
+COMMAND      PID           USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+launchd        1           root   28u  IPv6 0x9e0a1b2c3d4e5f60      0t0  TCP [::1]:22 (LISTEN)
+rapportd     612          alice    9u  IPv4 0x9e0a1b2c3d4e5f61      0t0  TCP *:52310 (LISTEN)
+rapportd     612          alice   10u  IPv6 0x9e0a1b2c3d4e5f62      0t0  TCP *:52310 (LISTEN)
+cupsd        227           root    8u  IPv4 0x9e0a1b2c3d4e5f63      0t0  TCP 127.0.0.1:631 (LISTEN)
+node       15042          alice   23u  IPv4 0x9e0a1b2c3d4e5f64      0t0  TCP 127.0.0.1:3000 (LISTEN)
+Python     16330          alice    5u  IPv6 0x9e0a1b2c3d4e5f65      0t0  TCP [::1]:8000 (LISTEN)
+ControlCe    708          alice   12u  IPv4 0x9e0a1b2c3d4e5f66      0t0  TCP *:7000 (LISTEN)

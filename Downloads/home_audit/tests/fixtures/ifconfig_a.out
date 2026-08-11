@@ -1,0 +1,52 @@
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	options=1203<RXCSUM,TXCSUM,TXSTATUS,SW_TIMESTAMP>
+	inet 127.0.0.1 netmask 0xff000000
+	inet6 ::1 prefixlen 128
+	inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+	nd6 options=201<PERFORMNUD,DAD>
+gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280
+stf0: flags=0<> mtu 1280
+anpi0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=400<CHANNEL_IO>
+	ether 6a:1f:0c:3d:88:2f
+	media: autoselect <full-duplex>
+	status: inactive
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6463<RXCSUM,TXCSUM,TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 3c:22:fb:8a:11:4e
+	inet6 fe80::14e2:8a1f:fe22:3c4d%en0 prefixlen 64 secured scopeid 0xc
+	inet 192.168.1.50 netmask 0xffffff00 broadcast 192.168.1.255
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 3c:22:fb:0d:2a:91
+	inet6 fe80::c4b:2aff:fe0d:9101%en5 prefixlen 64 secured scopeid 0x9
+	inet 169.254.113.87 netmask 0xffff0000 broadcast 169.254.255.255
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect (100baseTX <full-duplex>)
+	status: active
+en8: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6467<RXCSUM,TXCSUM,VLAN_MTU,TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 64:4b:f0:1c:77:03
+	inet 10.42.0.7 netmask 0xfffffc00 broadcast 10.42.3.255
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect (1000baseT <full-duplex>)
+	status: active
+awdl0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 6a:1f:0c:3d:88:2e
+	inet6 fe80::681f:cff:fe3d:882e%awdl0 prefixlen 64 scopeid 0xd
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	inet6 fe80::9a2e:1f4b:22c8:3d01%utun0 prefixlen 64 scopeid 0x10
+	nd6 options=201<PERFORMNUD,DAD>
+bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=63<RXCSUM,TXCSUM,TSO4,TSO6>
+	ether 3c:22:fb:0d:2a:92
+	Configuration:
+		id 0:0:0:0:0:0 priority 0 hellotime 0 fwddelay 0
+	media: <unknown type>
+	status: inactive

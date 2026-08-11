@@ -1,0 +1,10 @@
+disabled services = {
+	"com.apple.ftp-proxy" => disabled
+	"com.apple.ftpd" => disabled
+	"com.apple.telnetd" => disabled
+	"com.apple.AppleFileServer" => disabled
+	"com.apple.RemoteDesktop.PrivilegeProxy" => disabled
+	"com.apple.screensharing" => disabled
+	"com.openssh.sshd" => disabled
+	"com.apple.smbd" => enabled
+}

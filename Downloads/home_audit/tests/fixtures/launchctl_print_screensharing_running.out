@@ -1,0 +1,54 @@
+system/com.apple.screensharing = {
+	active count = 1
+	path = /System/Library/LaunchDaemons/com.apple.screensharing.plist
+	type = LaunchDaemon
+	state = running
+
+	program = /System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd
+	arguments = {
+		/System/Library/CoreServices/RemoteManagement/screensharingd.bundle/Contents/MacOS/screensharingd
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => com.apple.screensharing
+	}
+
+	domain = system
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 1187
+	immediate reason = socket event
+	forks = 0
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxies suspended = 0
+	last exit code = (never exited)
+
+	sockets = {
+		Listeners = {
+			active = 1
+			managed = 1
+			fd = 5
+			type = tcp
+			node = *
+			service = 5900
+		}
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 4
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = inetd | inferred program | system service | exception handler
+}

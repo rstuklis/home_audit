@@ -5,12 +5,20 @@ module imported, the sandbox actually blocks real system access, and the
 command-dispatching fakes route commands the way every other test assumes.
 """
 
+import importlib.util
+import re
 import socket
 import subprocess
 
 import pytest
 
-from conftest import EscapedSandbox, make_check_port, make_run, make_subprocess_run
+from conftest import (
+    PROJECT_DIR,
+    EscapedSandbox,
+    make_check_port,
+    make_run,
+    make_subprocess_run,
+)
 
 
 class TestModuleImport:
@@ -18,10 +26,29 @@ class TestModuleImport:
         assert mod.__name__ == "home_net_audit"
         assert callable(mod.run)
 
-    def test_importing_the_module_has_no_side_effects(self, mod):
-        # main() is guarded by __name__ == "__main__"; if that guard were ever
-        # removed, importing the module would start scanning the network.
-        assert mod.__name__ != "__main__"
+    def test_importing_the_module_runs_nothing(self):
+        """Re-execute the source and assert the import itself scans nothing.
+
+        Checking `mod.__name__ != "__main__"` would prove nothing: conftest
+        assigns that name via spec_from_file_location, so it can never be
+        "__main__" no matter what the source says. Execute the module instead —
+        the autouse sandbox turns any subprocess or socket call into
+        EscapedSandbox, and a missing `if __name__ == "__main__"` guard would
+        run main() and raise (argparse would SystemExit on pytest's argv).
+        """
+        spec = importlib.util.spec_from_file_location(
+            "home_net_audit_import_probe", PROJECT_DIR / "home_net_audit.py")
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        assert callable(probe.main), "module executed but exposed no main()"
+
+    def test_the_main_guard_is_present_in_the_source(self):
+        # Belt-and-braces companion to the test above, and the one that names
+        # the actual mechanism so a reader knows what protects them.
+        src = (PROJECT_DIR / "home_net_audit.py").read_text(encoding="utf-8")
+        assert re.search(
+            r'^if __name__ == ["\']__main__["\']:\s*\n\s+main\(\)\s*$',
+            src, re.MULTILINE), "the __main__ guard around main() is gone"
 
 
 class TestSandboxBlocksRealAccess:
