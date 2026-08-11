@@ -21,7 +21,7 @@ import pytest
 
 from conftest import load_fixture, make_run
 
-NDP_A = "ndp -a"
+NDP_A = "ndp -an"   # -n matters: see TestCapturedFromARealMac
 NDP_R = "ndp -r"
 IP6_NEIGH = "ip -6 neigh show"
 IP6_ROUTE = "ip -6 route show default"
@@ -81,6 +81,51 @@ class TestMacosNdpParsing:
 
     def test_garbage_is_skipped_without_raising(self, mod):
         assert mod.parse_ndp_routers("no addresses here\n\n") == []
+
+
+class TestCapturedFromARealMac:
+    """Three bugs that only a genuine capture could have surfaced.
+
+    The authored fixture had the columns as `S Flags`; real macOS prints
+    `St Flgs Prbs`. That difference mattered more than cosmetics.
+    """
+
+    def test_a_reachable_neighbour_is_not_mistaken_for_a_router(self, mod):
+        # THE bug. The state column uses R for REACHABLE and the flags column
+        # uses R for router. Checking for "an R somewhere after the netif"
+        # flagged every reachable neighbour on the LAN as an IPv6 router, which
+        # would have fired the rogue-RA alarm on a perfectly healthy network.
+        reachable_not_router = (
+            "Neighbor            Linklayer Address  Netif Expire    St Flgs Prbs\n"
+            "fe80::5%en0         a4:83:e7:1b:9c:2d  en0   23h58m12s R\n")
+        parsed = mod.parse_ndp_neighbours(reachable_not_router)
+        assert parsed["fe80::5%en0"]["router"] is False
+
+    def test_the_router_flag_is_read_from_its_own_column(self, mod):
+        router = ("Neighbor            Linklayer Address  Netif Expire    St Flgs Prbs\n"
+                  "fe80::1%en0         3c:22:fb:11:22:33  en0   23h59m58s R  R\n")
+        assert mod.parse_ndp_neighbours(router)["fe80::1%en0"]["router"] is True
+
+    def test_a_hostname_in_the_neighbor_column_is_skipped_not_crashed(self, mod):
+        # Without -n, ndp reverse-resolves and the column is a hostname. Every
+        # entry then failed to parse and was dropped in silence — the reason the
+        # command now passes -n. A hostname row is still handled defensively.
+        named = ("Neighbor            Linklayer Address  Netif Expire    St Flgs Prbs\n"
+                 "runner-host.local   ca:97:2e:f8:7e:e9  en0   permanent R  R\n")
+        assert mod.parse_ndp_neighbours(named) == {}
+
+    def test_the_neighbour_command_disables_name_resolution(self, mod, monkeypatch):
+        fake = make_run({})
+        monkeypatch.setattr(mod, "run", fake)
+        mod.get_ipv6_neighbours()
+        assert any(c.split() == ["ndp", "-an"] for c in fake.calls), \
+            "ndp must be called with -n or every neighbour parses as a hostname"
+
+    def test_an_incomplete_entry_is_dropped(self, mod):
+        # Real captures are full of these on interfaces with no neighbour.
+        incomplete = ("Neighbor            Linklayer Address  Netif Expire    St Flgs Prbs\n"
+                      "fe80::9%en0         (incomplete)       en0   expired   I\n")
+        assert mod.parse_ndp_neighbours(incomplete) == {}
 
 
 class TestLinuxIproute6Parsing:

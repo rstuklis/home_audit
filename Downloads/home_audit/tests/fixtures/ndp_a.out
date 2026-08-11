@@ -1,5 +1,5 @@
-Neighbor                             Linklayer Address  Netif Expire    S Flags
-fe80::1%en0                          3c:22:fb:11:22:33  en0   23h59m58s S R
-2001:db8:1:0:1c3c:c1ff:fe2a:3b4c%en0 a4:83:e7:1b:9c:2d  en0   23h58m12s S
-fe80::c8b:2ff:fe1a:2b3c%en0          e:8b:2:1a:2b:3c    en0   expired   R
-fe80::dead:beef%en0                  (incomplete)       en0   expired   R
+Neighbor                                Linklayer Address  Netif Expire    St Flgs Prbs
+fe80::1%en0                             3c:22:fb:11:22:33  en0   23h59m58s R  R      
+2001:db8:1:0:1c3c:c1ff:fe2a:3b4c%en0    a4:83:e7:1b:9c:2d  en0   23h58m12s S         
+fe80::c8b:2ff:fe1a:2b3c%en0             e:8b:2:1a:2b:3c    en0   expired   R  R      
+fe80::dead:beef%en0                     (incomplete)       en0   expired   I         

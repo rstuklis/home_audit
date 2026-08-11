@@ -160,10 +160,18 @@ DEFAULT_CREDS = [
 # Helpers for talking to macOS
 # ---------------------------------------------------------------------------
 
-def run(cmd, timeout=10):
-    """Run a shell command, return stdout as text (empty string on failure)."""
+def run(cmd, timeout=10, merge_stderr=False):
+    """Run a shell command, return stdout as text (empty string on failure).
+
+    merge_stderr appends stderr, for the handful of tools that print their
+    answer there — `security dump-trust-settings` prefixes its result with
+    SecTrustSettingsCopyCertificates:, which is error-style, and reading only
+    stdout would turn a clean trust store into "could not read".
+    """
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if merge_stderr:
+            return (out.stdout or "") + (out.stderr or "")
         return out.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return ""
@@ -446,12 +454,17 @@ def _normalise_mac(raw):
 
 
 def parse_ndp_neighbours(out):
-    """macOS `ndp -a`.
+    """macOS `ndp -an`. Captured from a real Mac; the columns are:
 
-        Neighbor                    Linklayer Address  Netif Expire    S Flags
-        fe80::1%en0                 3c:22:fb:11:22:33  en0   23h59m58s S R
+        Neighbor            Linklayer Address  Netif Expire    St Flgs Prbs
+        fe80::1%en0         3c:22:fb:11:22:33  en0   23h59m58s R  R
 
     The R flag marks a router — that column is the whole point of reading this.
+
+    The -n matters. Without it ndp reverse-resolves, and the Neighbor column
+    comes back as a hostname rather than an address, so every single entry
+    fails to parse and is dropped in silence. A capture from the macOS runner
+    is what surfaced that; a hostname row is still skipped defensively here.
     """
     neighbours = {}
     for line in out.splitlines():
@@ -462,10 +475,15 @@ def parse_ndp_neighbours(out):
         mac = _normalise_mac(parts[1])
         if not addr or not mac:
             continue          # (incomplete) entries carry no usable address
+        # Columns are fixed: neighbor, lladdr, netif, expire, state, flags.
+        # The state column uses R for REACHABLE and the flags column uses R for
+        # router, so "is there an R after the netif" flags every reachable
+        # neighbour as a router. Real ndp output from the macOS runner is what
+        # exposed that; the flag has to be read from its own column.
         neighbours[addr] = {
             "mac": mac,
             "iface": parts[2],
-            "router": "R" in parts[3:],
+            "router": len(parts) > 5 and "R" in parts[5],
         }
     return neighbours
 
@@ -522,7 +540,7 @@ def parse_routes6_iproute(out):
 
 
 def get_ipv6_neighbours():
-    neighbours = parse_ndp_neighbours(run(["ndp", "-a"]))
+    neighbours = parse_ndp_neighbours(run(["ndp", "-an"]))
     if neighbours:
         return neighbours
     return parse_neigh6_iproute(run(["ip", "-6", "neigh", "show"]))
@@ -761,7 +779,8 @@ def check_trust_store():
         return {"supported": False, "entries": [], "risk": "INFO",
                 "note": "Trust-store inspection is macOS-only; skipped here."}
 
-    out = run(["security", "dump-trust-settings", "-d"], timeout=10)
+    out = run(["security", "dump-trust-settings", "-d"], timeout=10,
+              merge_stderr=True)
     if not out.strip():
         return {"supported": True, "entries": [], "risk": "REVIEW",
                 "note": "Could not read the admin trust settings."}

@@ -1,0 +1,63 @@
+name: capture-fixtures
+
+# Maintenance workflow. The test fixtures are captured command output, and the
+# only real Mac this project has access to is the macOS runner — so this prints
+# genuine output for every command the parsers read, with delimiters, so the
+# fixtures can be checked against reality rather than against documentation.
+#
+# Caveat worth knowing before trusting the result: a runner is a virtualised
+# macOS instance in a datacenter. It has no Wi-Fi hardware and no home LAN, so
+# the wireless and neighbour captures will be thin or empty. Those fixtures
+# still have to come from a real machine on a real network.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/capture-fixtures.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: macos-latest
+    steps:
+      - name: Capture
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)"
+
+          cap() {
+            echo ""
+            echo "===BEGIN $1==="
+            shift
+            "$@" 2>&1 | head -60 || echo "(command failed: $?)"
+            echo "===END==="
+          }
+
+          # The audit's run() helper returns ONLY stdout. Any command whose
+          # answer arrives on stderr is read as an empty string, so these are
+          # captured with the streams kept apart.
+          split() {
+            echo ""
+            echo "===BEGIN $1==="
+            shift
+            echo "--stdout--"
+            "$@" 2>/dev/null | head -20
+            echo "--stderr--"
+            "$@" 2>&1 >/dev/null | head -20
+            echo "===END==="
+          }
+
+          split security_trust security dump-trust-settings -d
+          split systemsetup_rae systemsetup -getremoteappleevents
+          split fw_global /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+
+          cap route_get_default route -n get default
+          cap ifconfig_a ifconfig -a
+          cap scutil_dns scutil --dns
+          cap arp_a arp -a
+          cap ndp_a ndp -a
+          cap ndp_r ndp -r
+          cap netstat_rn netstat -rn
