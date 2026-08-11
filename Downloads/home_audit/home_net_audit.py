@@ -489,12 +489,35 @@ def parse_ndp_neighbours(out):
 
 
 def parse_ndp_routers(out):
-    """macOS `ndp -r` -> 'fe80::1%en0 if=en0, flags=O, pref=medium, ...'."""
+    """macOS `ndp -r` -> 'fe80::1%en0 if=en0, flags=O, pref=medium, ...'.
+
+    Entries whose interface identifier is all zeros are dropped. A Mac running
+    a VPN has a default route on each tunnel, and ndp lists one line per
+    tunnel with no router address to report:
+
+        fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never
+        fe80::%utun1 if=utun1, flags=IST, pref=medium, expire=Never
+
+    Those are not routers. RFC 4291 reserves the all-zeros interface
+    identifier as the Subnet-Router anycast address, so no host ever holds it
+    — the address is a placeholder meaning "a default route exists here", not
+    a neighbour that sent a Router Advertisement. Kept, they read as four
+    distinct routers (the zone makes each string unique), which is HIGH on a
+    first run and, once the tunnels renumber across a VPN reconnect, a fresh
+    "router not in the baseline" alarm on a network where nothing happened.
+    A check that cries wolf at every VPN user is a check they stop reading.
+
+    Captured from the macOS runner, which has four utun interfaces.
+    """
     routers = []
     for line in out.splitlines():
         token = line.split()[0] if line.split() else ""
-        addr, _ = _normalise_v6(token)
-        if addr and addr not in routers:
+        addr, bare = _normalise_v6(token)
+        if not addr:
+            continue
+        if ipaddress.ip_address(bare).packed[8:] == b"\x00" * 8:
+            continue
+        if addr not in routers:
             routers.append(addr)
     return routers
 

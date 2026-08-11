@@ -19,6 +19,7 @@ So the tests below come in two families: nothing identifying survives, and
 the parsers see the same structure before and after.
 """
 
+import ast
 import importlib.util
 import re
 import sys
@@ -40,6 +41,49 @@ def _load_capture_module():
 
 
 cap = _load_capture_module()
+
+
+def audit_commands():
+    """Every command home_net_audit actually executes, read from its source.
+
+    Read statically rather than by calling anything: the point is to compare
+    the capture tool's command list against the real one, and a test that
+    imported a hand-maintained copy would only ever prove the copy matches
+    itself.
+
+    Elements the source builds at run time (`"system/" + label`) come back as
+    "*" and match anything in that position.
+    """
+    tree = ast.parse((PROJECT_DIR / "home_net_audit.py").read_text())
+    consts = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) \
+                and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            consts[node.targets[0].id] = node.value.value
+
+    def resolve(element):
+        if isinstance(element, ast.Constant) and isinstance(element.value, str):
+            return element.value
+        if isinstance(element, ast.Name) and element.id in consts:
+            return consts[element.id]
+        return "*"
+
+    commands = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name != "run" or not isinstance(node.args[0], ast.List):
+            continue
+        commands.add(tuple(resolve(e) for e in node.args[0].elts))
+    return commands
+
+
+def matches(captured, executed):
+    return len(captured) == len(executed) and all(
+        want == "*" or want == got for want, got in zip(executed, captured))
 
 
 @pytest.fixture
@@ -295,6 +339,40 @@ class TestColumnRedaction:
         for keep in ("launchd", "rapportd", "cupsd", "127.0.0.1:631", "(LISTEN)"):
             assert keep in out
 
+    def test_arp_device_names_are_replaced(self, red):
+        """`arp -a` resolves names, so this column lists the household's
+        devices. A suffix-less name has nothing for the generic hostname
+        pattern to key off, which is why the column is redacted by position."""
+        text = ("? (192.168.1.1) at 3c:37:86:1f:a2:0b on en0 ifscope [ethernet]\n"
+                "rebeccas-iphone (192.168.1.42) at 8:0:27:9a:1c:3f on en0 [ethernet]\n"
+                "living-room-tv.lan (192.168.1.7) at a4:83:e7:1b:2c:3d on en0 [ethernet]\n")
+        out = red.apply("arp_a_typical", text)
+        assert "rebeccas-iphone" not in out
+        assert "living-room-tv" not in out
+        assert out.startswith("? (192.168.1.1)")     # unresolved rows stay
+
+    def test_a_device_name_is_replaced_once_not_twice(self, red):
+        """The suffixed name is caught by the address pass and the bare one by
+        the column pass. Running both must not remap the first pass's output,
+        or the printed mapping becomes fake-to-fake and unreadable."""
+        text = "living-room-tv.lan (192.168.1.7) at a4:83:e7:1b:2c:3d on en0\n"
+        out = red.apply("arp_a_typical", text)
+        assert len(red.hosts) == 1
+        assert out.split()[0] in red.hosts.values()
+
+    def test_multicast_names_are_kept(self, red):
+        """mdns.mcast.net is on every Mac and identifies nobody."""
+        text = "mdns.mcast.net (224.0.0.251) at 1:0:5e:0:0:fb on en0 permanent\n"
+        assert red.apply("arp_a_typical", text) == text
+
+    def test_the_arp_parser_sees_the_same_table(self, mod, red, monkeypatch):
+        raw = load_fixture("arp_a_typical.out")
+        monkeypatch.setattr(mod, "run", make_run({"arp": raw}))
+        before = mod.read_arp_table()
+        monkeypatch.setattr(mod, "run",
+                            make_run({"arp": red.apply("arp_a_typical", raw)}))
+        assert sorted(before) == sorted(mod.read_arp_table())
+
     def test_isp_search_domains_are_replaced(self, red):
         """A home Mac's search domain is often the ISP's, which narrows the
         owner to a provider and a region."""
@@ -390,6 +468,60 @@ class TestCaptureContract:
         text, note = cap.capture("systemsetup_rae", ["systemsetup"])
         assert text is None
         assert "stderr" in note
+
+    def test_every_captured_command_is_one_the_audit_runs(self):
+        """The property the whole tool rests on, and the one whose absence has
+        now cost twice.
+
+        `ndp -a` reverse-resolves, so the Neighbor column arrives as a
+        hostname and every row is dropped — the CI capture documented that
+        command for weeks while the audit ran `ndp -an`, and the fixtures
+        described output nothing produced. The same slip went the other way in
+        this tool's first version, which captured `arp -an` while the audit
+        runs `arp -a`.
+
+        Comparing against the audit's source rather than a list written here
+        is the whole point: a hand-kept copy only proves it matches itself.
+        """
+        executed = audit_commands()
+        assert executed, "found no run([...]) calls; the extractor is broken"
+        for name, cmd in cap.COMMANDS.items():
+            assert any(matches(cmd, e) for e in executed), \
+                "%s captures %r, which the audit never runs" % (name, " ".join(cmd))
+
+    def test_the_ci_capture_workflow_runs_the_same_commands(self):
+        """The workflow is what actually drifted: it captured `ndp -a` for
+        weeks while the audit ran `ndp -an`, so every run printed a neighbour
+        table the audit never sees. Same invariant, applied to the shell in
+        the YAML — its capture helpers are invoked as `cap <name> <argv...>`.
+
+        A skip here means this protection is off, and `-ra` in pytest.ini
+        prints skips, so it says so out loud rather than passing quietly.
+        """
+        for parent in [PROJECT_DIR] + list(PROJECT_DIR.parents):
+            workflow = parent / ".github" / "workflows" / "capture-fixtures.yml"
+            if workflow.exists():
+                break
+        else:
+            pytest.skip("capture-fixtures.yml not found above %s" % PROJECT_DIR)
+
+        executed = audit_commands()
+        captured = re.findall(r"^\s*(?:cap|split)\s+\w+\s+(.+)$",
+                              workflow.read_text(), re.MULTILINE)
+        assert captured, "found no cap/split lines; the extractor is broken"
+        for line in captured:
+            cmd = tuple(line.split())
+            assert any(matches(cmd, e) for e in executed), \
+                "the workflow captures %r, which the audit never runs" % line
+
+    def test_the_extractor_resolves_the_indirect_invocations(self):
+        """Two commands are not plain literals in the audit — the firewall
+        binary is a local variable and the launchctl label is concatenated.
+        If the extractor quietly missed them the test above would be weaker
+        than it looks, so pin that it finds both."""
+        executed = audit_commands()
+        assert any(e[0].endswith("socketfilterfw") for e in executed)
+        assert ("launchctl", "print", "*") in executed
 
     def test_every_command_has_a_fixture_name_shaped_like_the_existing_set(self):
         """The output filenames are meant to be diffed against tests/fixtures,
