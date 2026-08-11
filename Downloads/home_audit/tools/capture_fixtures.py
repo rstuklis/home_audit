@@ -83,7 +83,12 @@ EXIT_STATUS_ONLY = {"launchctl_print_sshd", "launchctl_print_smbd",
 # re-matched as an address. One pass with re.sub never rescans what it wrote.
 TOKEN_RE = re.compile(
     r"(?P<mac>\b(?:[0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}\b)"
-    r"|(?P<v6>\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?:%\w+)?\b)"
+    # No trailing \b on the v6 branch. It forced every match to end on a hex
+    # digit, so `fdca:...:4743::/64` — netstat's on-link prefix route — matched
+    # only as far as `fdca:...:4743`, which is four groups and not an address.
+    # It then failed to parse and was kept verbatim, which put the owner's real
+    # network ID in a public repository.
+    r"|(?P<v6>\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?:%\w+)?)"
     r"|(?P<v4>\b(?:\d{1,3}\.){3}\d{1,3}\b)"
     r"|(?P<host>\b[\w-]+\.(?:local|lan|home|internal)\b)"
 )
@@ -143,6 +148,7 @@ class Redactor:
         self.domains = {}
         self.collapsed = {}      # truncated spelling -> full spelling
         self.ambiguous = set()   # truncated-looking, but no unique full form
+        self.fragments = {}      # address-shaped, unparseable, still replaced
 
     # netstat pads its Destination and Gateway columns to a fixed width and
     # cuts anything longer, so a link-local that ifconfig prints in full comes
@@ -224,14 +230,45 @@ class Redactor:
             self.macs[real] = "%s:%02x:%02x:%02x" % (oui, n, n, n)
         return self.macs[real]
 
+    def _fragment(self, real):
+        """A token that is address-shaped but does not parse as an address.
+
+        Two unrelated things arrive here and they need opposite treatment. A
+        firmware version's "21:44:11" was never an address and editing it would
+        corrupt the fixture. Half of a real address — netstat -anp truncates
+        one to fit its column and appends the port, giving
+        `fdca:7af7:13bd:4.49276` — is the owner's network ID, and keeping it is
+        a leak. The first version of this method could not tell them apart and
+        preserved both, which is how a real ULA prefix reached a public repo.
+
+        The question that separates them is whether anything else in this
+        capture starts with the token. Nothing starts with a timestamp.
+        """
+        addr, sep, zone = real.partition("%")
+        if len(addr) < self.TRUNCATION_FLOOR:
+            return real
+        fakes = [f for k, f in self.v6.items()
+                 if k.partition("%")[0].startswith(addr)]
+        if not fakes:
+            return real
+        # Every candidate is already a substituted value, so their common
+        # prefix carries nothing real. Ambiguity is not a reason to fall back
+        # to the original: an unresolved fragment still has to be replaced,
+        # it just cannot be attributed to one host.
+        shared = fakes[0]
+        for f in fakes[1:]:
+            while not f.startswith(shared):
+                shared = shared[:-1]
+        fake = (shared or "2001:db8::") + sep + zone
+        self.fragments[real] = fake
+        return fake
+
     def _v6(self, real):
         addr, sep, zone = real.partition("%")
         try:
             parsed = ipaddress.ip_address(addr)
         except ValueError:
-            # Not an address at all. A firmware string's "21:44:11" matches the
-            # pattern and must be left exactly as it was.
-            return real
+            return self._fragment(real)
         if parsed.version != 6:
             return real
         if parsed.is_multicast or parsed.is_loopback or parsed.is_unspecified:
@@ -268,6 +305,13 @@ class Redactor:
                 self.v6[real] = self.v6[full]
                 return self.v6[real]
             n = len(self.v6) + 1
+            if parsed.packed[8:] == b"\x00" * 8:
+                # A network, not a host — netstat prints the ULA's own /64 as
+                # an on-link prefix route. Substituting it for a host address
+                # would leave `2001:db8::5/64`, a prefix with its host bits
+                # set, which macOS never prints. Give it a documentation /64.
+                self.v6[real] = "2001:db8:%x::%s%s" % (n, sep, zone)
+                return self.v6[real]
             # A link-local interface ID is derived from the MAC, so it names
             # the hardware — but the fe80:: prefix is what marks it as a
             # link-local, and check_ipv6_routers reads exactly that.
@@ -460,6 +504,9 @@ class Redactor:
         for short, full in self.collapsed.items():
             lines.append("  column-truncated %s treated as %s (now one host)"
                          % (short, full))
+        for frag, fake in self.fragments.items():
+            lines.append("  %s does not parse as an address but starts a real "
+                         "one — replaced with %s rather than kept" % (frag, fake))
         for short in sorted(self.ambiguous):
             lines.append("  %s looks truncated but matches several addresses "
                          "— left as its own host, check it is not a duplicate"

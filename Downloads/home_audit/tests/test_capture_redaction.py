@@ -771,3 +771,66 @@ class TestTheLocationServicesSentinel:
         out = red.wifi(self.WIFI.replace("<redacted>:", "Rautu-5G:"))
         assert "Rautu-5G" not in out
         assert "HomeNet:" in out
+
+
+class TestNothingRealSurvives:
+    """The family of test this file was missing.
+
+    Every existing case here checks one token in isolation, and each of them
+    passed while a real ULA prefix went into a public repository twice over.
+    Both escapes were address-shaped text that `ipaddress` rejected, so the
+    "not an address at all" branch — written for a firmware version's
+    21:44:11 — handed them back untouched. A per-token test cannot catch that,
+    because the token it would have to think of is the one nobody thought of.
+
+    So this sweeps a whole capture and asserts the absence of the real values,
+    rather than the presence of the fake ones.
+    """
+
+    REAL = {
+        "ula_prefix": "fdca:7af7:13bd:4743",
+        "ula_host": "fdca:7af7:13bd:4743:18de:7846:12ad:c6f4",
+        "mac": "38:8b:59:e0:f1:70",
+        "public_v4": "160.79.104.10",
+    }
+
+    CAPTURE = "\n".join([
+        # netstat -rn: the on-link prefix route, which matched only as far as
+        # its first four groups and then failed to parse.
+        "fdca:7af7:13bd:4743::/64          link#6      UC      en0",
+        "default                           fe80::1%en0 UGcg    en0",
+        # netstat -anp tcp: the address cut to fit the column, port appended.
+        "tcp6  0  0  fdca:7af7:13bd:4.49276  fdca:7af7:13bd:4.52224  ESTABLISHED",
+        "tcp4  0  0  192.168.1.42.51000      160.79.104.10.443       ESTABLISHED",
+        # ifconfig: the same address in full, which always redacted correctly.
+        "        inet6 fdca:7af7:13bd:4743:18de:7846:12ad:c6f4 prefixlen 64",
+        "        ether 38:8b:59:e0:f1:70",
+        # The string the unparseable branch exists to protect.
+        "        Firmware Version: wl0: Sep 12 2024 21:44:11 version 22.10.375.6",
+    ])
+
+    def test_no_real_value_survives_a_whole_capture(self, red):
+        red.prime([self.CAPTURE])
+        out = red.addresses(self.CAPTURE)
+        for label, value in self.REAL.items():
+            assert value not in out, "%s survived redaction: %s" % (label, value)
+
+    def test_the_prefix_route_stays_a_prefix(self, red):
+        """Substituting a network for a host address leaves 2001:db8::5/64 —
+        a /64 with its host bits set, which macOS never prints."""
+        red.prime([self.CAPTURE])
+        line = red.addresses(self.CAPTURE).splitlines()[0]
+        network = line.split()[0]
+        assert network.endswith("::/64"), network
+
+    def test_the_firmware_version_is_still_untouched(self, red):
+        """The reason the leaking branch looked correct. Whatever replaces it
+        must not start editing version strings."""
+        red.prime([self.CAPTURE])
+        out = red.addresses(self.CAPTURE)
+        assert "21:44:11 version 22.10.375.6" in out
+
+    def test_an_unparseable_fragment_is_declared(self, red):
+        red.prime([self.CAPTURE])
+        red.addresses(self.CAPTURE)
+        assert any("does not parse" in ln for ln in red.warnings())
