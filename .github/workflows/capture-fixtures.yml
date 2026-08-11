@@ -62,7 +62,13 @@ jobs:
           cap route_get_default route -n get default
           cap ifconfig_a ifconfig -a
           cap scutil_dns scutil --dns
+          # These must be the flags the audit itself passes, or the capture
+          # documents a command nothing runs. `ndp -a` reverse-resolves, so
+          # the Neighbor column comes back as a hostname and every row fails
+          # to parse; the audit runs `ndp -an` for exactly that reason.
+          # tests/test_capture_redaction.py pins the same property for
+          # tools/capture_fixtures.py against the audit's own source.
           cap arp_a arp -a
-          cap ndp_a ndp -a
+          cap ndp_a ndp -an
           cap ndp_r ndp -r
           cap netstat_rn netstat -rn

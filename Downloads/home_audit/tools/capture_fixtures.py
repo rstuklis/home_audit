@@ -39,7 +39,10 @@ COMMANDS = {
     "netstat_rn":               ["netstat", "-rn"],
     "ifconfig_a":               ["ifconfig", "-a"],
     "scutil_dns":               ["scutil", "--dns"],
-    "arp_a_typical":            ["arp", "-an"],
+    # `arp -a`, not `-an`: the audit resolves names here, so a capture with -n
+    # would document a command nothing runs. It costs a redaction step — the
+    # name column is then full of the LAN's device names.
+    "arp_a_typical":            ["arp", "-a"],
     "ndp_a":                    ["ndp", "-an"],
     "ndp_r":                    ["ndp", "-r"],
     "lsof_tcp_listen":          ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
@@ -263,6 +266,28 @@ class Redactor:
         return re.sub(r"^(?P<pre>\S+\s+\d+\s+)(?P<user>\S+)", sub,
                       text, flags=re.MULTILINE)
 
+    def arp(self, text):
+        """Replace the name column of `arp -a`.
+
+        "living-room-tv.lan" and "rebeccas-iphone" name the household's
+        devices, and the second has no suffix for the generic hostname pattern
+        to key off. The parser reads the address from the parentheses and
+        ignores this column entirely, so nothing is lost.
+        """
+        def sub(m):
+            name = m.group("name")
+            # `?` is an unresolved entry; the mcast names are protocol
+            # constants that appear on every Mac and identify nobody.
+            if name == "?" or name == "broadcasthost" or name.endswith(".mcast.net"):
+                return name
+            if name in self.hosts.values():
+                return name          # already replaced by the address pass
+            if name not in self.hosts:
+                _, dot, suffix = name.partition(".")
+                self.hosts[name] = "host-%d%s%s" % (len(self.hosts) + 1, dot, suffix)
+            return self.hosts[name]
+        return re.sub(r"^(?P<name>\S+)(?= \()", sub, text, flags=re.MULTILINE)
+
     def dns_domains(self, text):
         """Replace search domains in `scutil --dns`. A home Mac's search domain
         is frequently the ISP's, which narrows the owner to a provider and a
@@ -285,6 +310,8 @@ class Redactor:
             text = self.wifi(text)
         elif name.startswith("lsof_"):
             text = self.lsof(text)
+        elif name.startswith("arp_"):
+            text = self.arp(text)
         elif name == "scutil_dns":
             text = self.dns_domains(text)
         return text

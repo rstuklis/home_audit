@@ -1,0 +1,4 @@
+fe80::%utun1 if=utun1, flags=IST, pref=medium, expire=Never
+fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never
+fe80::%utun2 if=utun2, flags=IST, pref=medium, expire=Never
+fe80::%utun3 if=utun3, flags=IST, pref=medium, expire=Never

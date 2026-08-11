@@ -128,6 +128,61 @@ class TestCapturedFromARealMac:
         assert mod.parse_ndp_neighbours(incomplete) == {}
 
 
+class TestVpnTunnelsAreNotRouters:
+    """A Mac running a VPN has a default route on each tunnel, and `ndp -r`
+    prints one line per tunnel with no router address to report:
+
+        fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never
+
+    Captured from the macOS runner, which has four. Read literally that is
+    four IPv6 routers — the zone makes each string distinct — so the check
+    reported HIGH on a healthy machine, and would raise a fresh
+    "router not in the baseline" alarm every time a VPN reconnect renumbered
+    the tunnels. Anyone using a VPN would learn to skip the section.
+    """
+
+    def test_tunnel_entries_are_not_reported_as_routers(self, mod):
+        assert mod.parse_ndp_routers(load_fixture("ndp_r_vpn_tunnels.out")) == []
+
+    def test_a_mac_on_a_vpn_and_no_ipv6_router_is_quiet(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "run", make_run({
+            NDP_R: load_fixture("ndp_r_vpn_tunnels.out"),
+            NDP_A: "",
+        }))
+        result = mod.check_ipv6_routers()
+        assert result["risk"] == "INFO"
+        assert result["routers"] == []
+
+    def test_a_real_router_alongside_the_tunnels_is_still_seen(self, mod):
+        """The filter must not swallow the router it exists to watch."""
+        mixed = ("fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never\n"
+                 "fe80::1%en0 if=en0, flags=O, pref=medium, expire=29m30s\n")
+        assert mod.parse_ndp_routers(mixed) == [ROUTER]
+
+    def test_a_rogue_router_is_still_high_on_a_vpn_machine(self, mod, monkeypatch):
+        """The detection this whole module exists for, on the machine shape
+        that was producing the false positive."""
+        monkeypatch.setattr(mod, "run", make_run({
+            NDP_R: ("fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never\n"
+                    "fe80::1%en0 if=en0, flags=O, pref=medium, expire=29m30s\n"
+                    f"{ROGUE} if=en0, flags=, pref=high, expire=1m48s\n"),
+        }))
+        result = mod.check_ipv6_routers(known=[ROUTER])
+        assert result["risk"] == "HIGH"
+        assert result["unexpected"] == [ROGUE]
+
+    def test_the_rule_is_the_interface_id_not_the_interface_name(self, mod):
+        """Keying off "utun" would be a guess about naming; the address is the
+        evidence. RFC 4291 reserves the all-zeros interface identifier as the
+        Subnet-Router anycast address, so no host ever holds it — an entry
+        carrying it is ndp saying "a default route exists here", not a
+        neighbour that sent an advertisement."""
+        assert mod.parse_ndp_routers("fe80:: if=en0, flags=O, pref=medium\n") == []
+        assert mod.parse_ndp_routers("2001:db8:: if=en0, flags=O\n") == []
+        assert mod.parse_ndp_routers("fe80::1%utun0 if=utun0, flags=O\n") == \
+            ["fe80::1%utun0"]
+
+
 class TestLinuxIproute6Parsing:
     def test_neighbours_and_macs_are_read(self, mod):
         n = mod.parse_neigh6_iproute(IP6_NEIGH_OUT)
