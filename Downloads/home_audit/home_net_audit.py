@@ -96,6 +96,14 @@ KNOWN_DNS = {
     "9.9.9.9": "Quad9", "149.112.112.112": "Quad9",
     "208.67.222.222": "OpenDNS", "208.67.220.220": "OpenDNS",
     "203.12.160.35": "Internode (ISP)", "203.12.160.36": "Internode (ISP)",
+    # IPv6 counterparts, in the same normalised form get_dns_servers emits.
+    # Without these, a dual-stack Mac reports its entirely ordinary resolvers
+    # as unfamiliar on every run — the false alarm that trains a user to stop
+    # reading this section, which is worse than not checking at all.
+    "2001:4860:4860::8888": "Google", "2001:4860:4860::8844": "Google",
+    "2606:4700:4700::1111": "Cloudflare", "2606:4700:4700::1001": "Cloudflare",
+    "2620:fe::fe": "Quad9", "2620:fe::9": "Quad9",
+    "2620:119:35::35": "OpenDNS", "2620:119:53::53": "OpenDNS",
 }
 
 # Common default credentials to probe on router admin pages.
@@ -194,8 +202,20 @@ def guess_subnet(local_ip):
 def get_dns_servers():
     out = run(["scutil", "--dns"])
     servers = []
-    for m in re.finditer(r"nameserver\[\d+\]\s*:\s*([\d.]+)", out):
-        ip = m.group(1)
+    # Capture the whole address rather than [\d.]+, which stopped at the first
+    # colon: an IPv6 resolver like 2606:4700:4700::1111 was recorded as the
+    # server "2606", and a link-local one like fe80::1%en0 matched nothing and
+    # vanished. Both then read as an unrecognised resolver on every single run,
+    # which is precisely the DNS-hijacking signal this check exists to raise.
+    for m in re.finditer(r"nameserver\[\d+\]\s*:\s*(\S+)", out):
+        addr, sep, zone = m.group(1).partition("%")
+        try:
+            # Normalise so one resolver written two ways is not a baseline
+            # change. The zone is split off before parsing and re-attached
+            # after, because scoped addresses only parse on Python 3.9+.
+            ip = str(ipaddress.ip_address(addr)) + sep + zone
+        except ValueError:
+            continue
         if ip not in servers:
             servers.append(ip)
     return servers

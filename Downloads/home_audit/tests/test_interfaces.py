@@ -328,10 +328,14 @@ class TestGetDnsServers:
         dns_servers(SCUTIL_DNS)
         assert dns_servers.calls == [SCUTIL_CMD]
 
-    def test_ipv6_nameserver_starting_with_a_letter_is_ignored(self, dns_servers):
-        # fe80::1 cannot match [\d.]+ at all, so link-local resolvers drop out
-        # cleanly. This is the half of IPv6 handling that currently works, and
-        # it is what makes the truncation bug below look intermittent.
+    def test_a_link_local_resolver_is_reported_with_its_zone(self, dns_servers):
+        """fe80::1%en0 is a real resolver — the router advertising itself by RA.
+
+        The old `[\\d.]+` pattern could not match it at all, so it vanished
+        silently. That was never correct: on an IPv6-only network it made the
+        tool report no DNS configuration whatsoever. The zone suffix is part of
+        the address and must survive, since fe80::1 is only meaningful per-link.
+        """
         out = (
             "DNS configuration\n"
             "\n"
@@ -340,19 +344,51 @@ class TestGetDnsServers:
             "  nameserver[1] : 1.1.1.1\n"
             "  if_index : 12 (en0)\n"
         )
+        assert dns_servers(out) == ["fe80::1%en0", "1.1.1.1"]
+
+    def test_a_malformed_nameserver_is_dropped_rather_than_recorded(self, dns_servers):
+        # Anything that is not an address must not reach the baseline, where it
+        # would diff as a change forever. Mirrors read_arp_table's contract.
+        out = (
+            "resolver #1\n"
+            "  nameserver[0] : not-an-address\n"
+            "  nameserver[1] : 999.1.1.1\n"
+            "  nameserver[2] : 2606:4700:4700::zzzz\n"
+            "  nameserver[3] : 1.1.1.1\n"
+        )
         assert dns_servers(out) == ["1.1.1.1"]
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py line 197: the capture group is ([\\d.]+), so an IPv6 "
-        "resolver whose first hextet is all digits is truncated at the colon — "
-        "'2606:4700:4700::1111' is reported as the DNS server '2606'. That "
-        "value is then printed as '2606  <-- unfamiliar' (line 2149), written "
-        "into the baseline as state['dns'] (line 2142) so every later run "
-        "diffs against garbage, and rendered into the HTML report (line 1674). "
-        "Either capture the whole address or skip non-IPv4 resolvers; both "
-        "fixes satisfy this test."
-    ))
+    def test_an_equivalent_ipv6_form_is_normalised_so_it_is_not_a_false_change(self, dns_servers):
+        # 2606:4700:4700:0:0:0:0:1111 and 2606:4700:4700::1111 are the same
+        # resolver. Storing them verbatim would diff as a DNS change between
+        # runs — a false hijacking alarm.
+        expanded = dns_servers("  nameserver[0] : 2606:4700:4700:0:0:0:0:1111\n")
+        compact = dns_servers("  nameserver[0] : 2606:4700:4700::1111\n")
+        assert expanded == compact == ["2606:4700:4700::1111"]
+
+    def test_well_known_ipv6_resolvers_are_recognised_not_flagged_unfamiliar(self, mod, dns_servers):
+        """The half of the fix that actually stops the false alarm.
+
+        Repairing the regex alone would only change the warning from
+        '2606 <-- unfamiliar' to '2606:4700:4700::1111 <-- unfamiliar'. The
+        resolver has to be in KNOWN_DNS in the same normalised form
+        get_dns_servers emits, or a dual-stack Mac still nags on every run.
+        """
+        out = (
+            "  nameserver[0] : 2606:4700:4700::1111\n"
+            "  nameserver[1] : 2001:4860:4860::8888\n"
+            "  nameserver[2] : 2620:fe::fe\n"
+        )
+        for server in dns_servers(out):
+            assert mod.KNOWN_DNS.get(server), f"{server} would be flagged unfamiliar"
+
+    def test_every_known_dns_key_is_a_valid_normalised_address(self, mod):
+        # A typo'd or non-canonical key in KNOWN_DNS silently never matches,
+        # which reintroduces the false alarm without failing anything.
+        for key in mod.KNOWN_DNS:
+            addr, sep, zone = key.partition("%")
+            assert str(ipaddress.ip_address(addr)) + sep + zone == key, key
+
     def test_ipv6_nameserver_is_never_truncated_into_a_bogus_server(self, dns_servers):
         # Cloudflare/Google/Quad9 IPv6 resolvers all start with digits
         # (2606:, 2001:, 2620:), so any Mac on an IPv6-enabled ISP hits this.
@@ -367,7 +403,9 @@ class TestGetDnsServers:
             "  flags    : Request A records, Request AAAA records\n"
         )
         result = dns_servers(out)
-        assert "1.1.1.1" in result, "the IPv4 resolver must survive either fix"
-        for server in result:
-            # Passes whether the fix keeps the full address or drops it.
-            ipaddress.ip_address(server)
+        assert result == [
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ], "IPv6 resolvers must be kept whole, in first-seen order"
+        assert "2606" not in result, "the truncated hextet must never appear"
