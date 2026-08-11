@@ -1,0 +1,56 @@
+Wi-Fi:
+
+      Software Versions:
+          CoreWLAN: 16.0 (1657)
+          CoreWLANKit: 16.0 (1657)
+          Menu Extra: 18.0 (1815)
+          System Information: 15.0 (1500)
+          IO80211 Family: 12.0 (1200.12.2b1)
+          Diagnostics: 11.0 (1105)
+          AirPort Utility: 6.3.9 (639.14)
+      Interfaces:
+        awdl0:
+          Card Type: AirPort
+          Firmware Version:
+          MAC Address: 6a:1f:0c:3d:88:2e
+          Locale:
+          Country Code:
+          Supported PHY Modes: 802.11 a/b/g/n
+          Supported Channels:
+          Wake On Wireless: Supported
+          AirDrop: Supported
+          Auto Unlock: Supported
+          Status: Connected
+          Current Network Information:
+            PHY Mode: 802.11
+            Channel: 6 (2GHz, 20MHz)
+            Country Code:
+            Network Type: Peer-to-Peer (IBSS)
+            Security: None
+        en0:
+          Card Type: AirPort Extreme  (0x14E4, 0x4387)
+          Firmware Version: wl0: Sep 12 2024 21:44:11 version 22.10.375.6.32.7.128 FWID 01-4d95ba9d
+          MAC Address: a4:83:e7:9c:1b:40
+          Locale: FCC
+          Country Code: US
+          Supported PHY Modes: 802.11 a/b/g/n/ac/ax
+          Supported Channels: 1 (2GHz), 6 (2GHz), 11 (2GHz), 36 (5GHz), 149 (5GHz), 153 (5GHz)
+          Wake On Wireless: Supported
+          AirDrop: Supported
+          Auto Unlock: Supported
+          Status: Not Associated
+          Other Local Wi-Fi Networks:
+            Fjordbakken 5GHz:
+              PHY Mode: 802.11ax
+              Channel: 149 (5GHz, 80MHz)
+              Country Code: US
+              Network Type: Infrastructure
+              Security: WPA3 Personal
+              Signal / Noise: -47 dBm / -92 dBm
+            NETGEAR58-guest:
+              PHY Mode: 802.11n
+              Channel: 11 (2GHz, 20MHz)
+              Country Code: US
+              Network Type: Infrastructure
+              Security: None
+              Signal / Noise: -78 dBm / -92 dBm

@@ -1,0 +1,8 @@
+? (192.168.1.1) at 3c:37:86:1f:a2:0b on en0 ifscope [ethernet]
+? (192.168.1.5) at 8:0:27:9a:1c:3f on en0 ifscope [ethernet]
+living-room-tv.lan (192.168.1.42) at a4:83:e7:1b:2c:3d on en0 ifscope [ethernet]
+? (192.168.1.20) at (incomplete) on en0 [ethernet]
+? (192.168.1.77) at 0:1c:42:d3:9:f1 on en0 ifscope [ethernet]
+? (192.168.1.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]
+? (224.0.0.251) at 1:0:5e:0:0:fb on en0 ifscope permanent [ethernet]
+? (239.255.255.250) at 1:0:5e:7f:ff:fa on en0 ifscope permanent [ethernet]

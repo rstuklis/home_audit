@@ -1,0 +1,8 @@
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+udp4       0      0  *.59882                *.*
+udp6       0      0  *.5353                 *.*
+udp4       0      0  *.5353                 *.*
+udp46      0      0  *.137                  *.*
+udp4       0      0  127.0.0.1.49152        *.*
+udp4       0      0  *.*                    *.*

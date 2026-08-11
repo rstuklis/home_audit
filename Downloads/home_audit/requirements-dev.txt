@@ -1,0 +1,5 @@
+# Development dependencies. The audit tool itself deliberately has ZERO runtime
+# dependencies (standard library only, so it runs on a stock macOS Python) —
+# these are needed only to run the test suite.
+pytest>=8.0
+pytest-cov>=5.0

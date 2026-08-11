@@ -1,0 +1,54 @@
+system/com.apple.smbd = {
+	active count = 0
+	path = /System/Library/LaunchDaemons/com.apple.smbd.plist
+	type = LaunchDaemon
+	state = not running
+
+	program = /usr/sbin/smbd
+	arguments = {
+		/usr/sbin/smbd
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => com.apple.smbd
+	}
+
+	domain = system
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 0
+	pid =
+	immediate reason = speculative
+	forks = 0
+	execs = 0
+	initialized = 0
+	trampolined = 0
+	started suspended = 0
+	proxies suspended = 0
+	last exit code = (never exited)
+
+	sockets = {
+		direct = {
+			active = 0
+			managed = 1
+			fd = 7
+			type = tcp
+			node = *
+			service = 445
+		}
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 4
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = inetd | inferred program | system service | exception handler
+}

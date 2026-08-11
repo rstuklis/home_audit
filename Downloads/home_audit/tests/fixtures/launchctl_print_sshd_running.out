@@ -1,0 +1,58 @@
+system/com.openssh.sshd = {
+	active count = 1
+	path = /System/Library/LaunchDaemons/ssh.plist
+	type = LaunchDaemon
+	state = running
+
+	program = /usr/libexec/sshd-keygen-wrapper
+	arguments = {
+		/usr/libexec/sshd-keygen-wrapper
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => com.openssh.sshd
+	}
+
+	domain = system
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 3
+	pid = 4213
+	immediate reason = socket event
+	forks = 0
+	execs = 3
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxies suspended = 0
+	last exit code = 0
+
+	sockets = {
+		Listeners = {
+			active = 1
+			managed = 1
+			fd = 6
+			type = tcp
+			node = *
+			service = ssh
+		}
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 4
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	probabilistic guard malloc policy = {
+		activation rate = 1/1000
+		sample rate = 1/0
+	}
+
+	properties = inetd | keepalive | inferred program | system service | exception handler
+}
