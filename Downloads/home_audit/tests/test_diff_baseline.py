@@ -83,6 +83,21 @@ class TestDeviceAppearedOrVanished:
 
         assert mod.diff_baseline(old, new) == []
 
+    @pytest.mark.known_bug
+    @pytest.mark.xfail(strict=True, reason=(
+        "lines 420-421 build the MAC sets from the raw d['mac'] strings, so the "
+        "comparison is case-sensitive: '3C:22:FB:...' and '3c:22:fb:...' are two "
+        "different devices and one unmoved device raises BOTH a 'NEW device(s)' "
+        "and a 'Device(s) gone' note. read_arp_table normalises to lowercase "
+        "(line 218), so the two sides only agree by accident — a hand-edited or "
+        "vendor-pasted baseline (uppercase is the usual vendor rendering) breaks "
+        "the coincidence and double-alarms forever."))
+    def test_a_mac_differing_only_in_case_is_the_same_device(self, mod):
+        old = {"devices": [dev(LAPTOP.upper())]}
+        new = {"devices": [dev(LAPTOP)]}
+
+        assert mod.diff_baseline(old, new) == []
+
 
 class TestUnknownMacsAreSuppressed:
     """mac == "unknown" means the ARP cache had no entry, which flaps between

@@ -14,6 +14,7 @@ boundaries:
 
 import ipaddress
 import socket
+import subprocess
 
 import pytest
 
@@ -347,16 +348,27 @@ class TestResolveSubnets:
 
 
 class FakeSocket:
-    """Stand-in for socket.socket recording what check_port does to it."""
+    """Stand-in for socket.socket recording what check_port / get_local_ip do to it.
 
-    def __init__(self, connect_ex_result=0, connect_ex_error=None):
+    check_port drives ``connect_ex``; get_local_ip drives ``connect`` +
+    ``getsockname``. ``send``/``sendto`` fail the test outright: get_local_ip's
+    UDP connect is a pure routing lookup that must never put a packet on the
+    wire, and the failure has to survive the ``except OSError`` in the code
+    under test — pytest.fail raises a BaseException subclass, so it does.
+    """
+
+    def __init__(self, connect_ex_result=0, connect_ex_error=None,
+                 sockname=("192.168.1.50", 51234), connect_error=None):
         self.connect_ex_result = connect_ex_result
         self.connect_ex_error = connect_ex_error
+        self.sockname = sockname
+        self.connect_error = connect_error
         self.family = None
         self.type = None
         self.timeout = None
         self.connect_args = None
         self.closed = False
+        self.sent = []
 
     def settimeout(self, value):
         self.timeout = value
@@ -366,6 +378,25 @@ class FakeSocket:
         if self.connect_ex_error is not None:
             raise self.connect_ex_error
         return self.connect_ex_result
+
+    def connect(self, address):
+        self.connect_args = address
+        if self.connect_error is not None:
+            raise self.connect_error
+
+    def getsockname(self):
+        return self.sockname
+
+    def send(self, *args, **kwargs):
+        self._refuse_to_transmit("send", args)
+
+    def sendto(self, *args, **kwargs):
+        self._refuse_to_transmit("sendto", args)
+
+    def _refuse_to_transmit(self, name, args):
+        self.sent.append((name, args))
+        pytest.fail(f"the code under test called {name}{args!r}; the UDP "
+                    "connect trick must not transmit anything")
 
     def close(self):
         self.closed = True
@@ -499,3 +530,208 @@ class TestScanPorts:
         # action_port_scan passes range(1, 65536) for a full scan.
         monkeypatch.setattr(mod, "check_port", make_check_port([22, 80]))
         assert mod.scan_ports("192.168.85.1", range(20, 90)) == [22, 80]
+
+
+class TestGetLocalIp:
+    """get_local_ip() — the routing trick behind the sweep's fallback subnet.
+
+    A UDP socket is "connected" to 8.8.8.8:80 purely so the kernel picks a
+    source address; nothing is transmitted. resolve_subnets falls back to
+    guess_subnet(get_local_ip()) when no interface is detected, so whatever
+    this returns decides which /24 gets swept.
+    """
+
+    def test_returns_the_sockets_own_address_not_the_peer(self, mod, monkeypatch):
+        install_fake_socket(monkeypatch,
+                            FakeSocket(sockname=("192.168.85.24", 51234)))
+        assert mod.get_local_ip() == "192.168.85.24"
+
+    def test_returns_the_host_half_of_getsockname_not_the_port(self, mod, monkeypatch):
+        # getsockname() is an (ip, port) tuple; only element 0 is the address.
+        install_fake_socket(monkeypatch,
+                            FakeSocket(sockname=("10.0.0.7", 60123)))
+        result = mod.get_local_ip()
+        assert result == "10.0.0.7"
+        assert isinstance(result, str)
+
+    def test_uses_a_udp_socket(self, mod, monkeypatch):
+        # SOCK_DGRAM is what makes connect() a routeless address lookup; a
+        # SOCK_STREAM socket would open a real TCP session to a public host.
+        made = install_fake_socket(monkeypatch)
+        mod.get_local_ip()
+        assert (made[0].family, made[0].type) == (socket.AF_INET, socket.SOCK_DGRAM)
+
+    def test_connects_to_the_public_dns_anchor(self, mod, monkeypatch):
+        made = install_fake_socket(monkeypatch)
+        mod.get_local_ip()
+        assert made[0].connect_args == ("8.8.8.8", 80)
+
+    def test_nothing_is_ever_transmitted_to_the_anchor(self, mod, monkeypatch):
+        # The fake fails the test the moment send/sendto is touched; this
+        # assertion is the second half of that guard.
+        made = install_fake_socket(monkeypatch)
+        mod.get_local_ip()
+        assert made[0].sent == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError(51, "Network is unreachable"),
+            OSError(65, "No route to host"),
+            socket.timeout("timed out"),
+        ],
+        ids=["enetunreach_airplane_mode", "ehostunreach", "timeout"],
+    )
+    def test_no_route_yields_none_rather_than_propagating(self, mod, monkeypatch, error):
+        # None is exactly what guess_subnet is documented to tolerate, so an
+        # offline Mac degrades to "no subnet" instead of a traceback.
+        install_fake_socket(monkeypatch, FakeSocket(connect_error=error))
+        assert mod.get_local_ip() is None
+
+    def test_socket_is_closed_on_the_success_path(self, mod, monkeypatch):
+        made = install_fake_socket(monkeypatch)
+        mod.get_local_ip()
+        assert made[0].closed is True
+
+    def test_socket_is_closed_when_connect_raises(self, mod, monkeypatch):
+        # The `finally` is load-bearing: a descriptor leaked here feeds the same
+        # EMFILE failure class as the check_port regression above.
+        made = install_fake_socket(monkeypatch,
+                                   FakeSocket(connect_error=OSError(51, "Network is unreachable")))
+        assert mod.get_local_ip() is None
+        assert made[0].closed is True
+
+    def test_the_sweep_fallback_subnet_is_the_local_ips_slash24(self, mod, monkeypatch):
+        # End-to-end shape of the resolve_subnets fallback path.
+        install_fake_socket(monkeypatch,
+                            FakeSocket(sockname=("192.168.1.50", 51234)))
+        assert mod.guess_subnet(mod.get_local_ip()) == ipaddress.ip_network("192.168.1.0/24")
+
+    def test_an_unreachable_anchor_produces_no_fallback_subnet(self, mod, monkeypatch):
+        install_fake_socket(monkeypatch,
+                            FakeSocket(connect_error=OSError(51, "Network is unreachable")))
+        assert mod.guess_subnet(mod.get_local_ip()) is None
+
+
+class RecordingSubprocessRun:
+    """Stand-in for subprocess.run that records argv and kwargs, or raises.
+
+    ping() calls subprocess.run directly rather than going through mod.run,
+    so make_run/make_subprocess_run don't apply here.
+    """
+
+    def __init__(self, returncode=0, error=None):
+        self.returncode = returncode
+        self.error = error
+        self.commands = []
+        self.kwargs = []
+
+    def __call__(self, cmd, **kwargs):
+        self.commands.append(list(cmd))
+        self.kwargs.append(dict(kwargs))
+        if self.error is not None:
+            raise self.error
+        return subprocess.CompletedProcess(args=cmd, returncode=self.returncode,
+                                           stdout="", stderr="")
+
+
+def install_fake_ping(monkeypatch, returncode=0, error=None):
+    """Replace subprocess.run for the duration of one test; returns the recorder."""
+    fake = RecordingSubprocessRun(returncode=returncode, error=error)
+    monkeypatch.setattr(subprocess, "run", fake)
+    return fake
+
+
+class TestPing:
+    """ping(ip) — one ICMP probe per host in the sweep.
+
+    Its docstring names the defect it exists to prevent: on Linux `-t` sets the
+    TTL rather than a deadline, so without the hard subprocess timeout a hung
+    host would block its worker thread and stall the whole sweep.
+    """
+
+    def test_a_replying_host_returns_its_ip(self, mod, monkeypatch):
+        install_fake_ping(monkeypatch, returncode=0)
+        assert mod.ping("192.168.85.24") == "192.168.85.24"
+
+    def test_a_replying_host_returns_a_str_not_an_address_object(self, mod, monkeypatch):
+        # The type is load-bearing. discover_devices does alive.add(res), then
+        # unions that set with read_arp_table()'s string keys and looks each
+        # entry up with arp.get(ip). An IPv4Address would compare unequal to the
+        # equivalent str, so every pinged host would be counted twice — once as
+        # an object with no MAC, once as the ARP string — and the object copy
+        # would lose its MAC. subnet.hosts() yields IPv4Address objects, so this
+        # is the shape discover_devices actually passes in.
+        install_fake_ping(monkeypatch, returncode=0)
+        result = mod.ping(ipaddress.ip_address("192.168.85.24"))
+        assert result == "192.168.85.24"
+        assert isinstance(result, str)
+
+    @pytest.mark.parametrize(
+        "returncode",
+        [1, 2, 68],
+        ids=["no_reply", "ping_usage_error", "unknown_host"],
+    )
+    def test_a_non_zero_exit_means_the_host_is_not_alive(self, mod, monkeypatch, returncode):
+        install_fake_ping(monkeypatch, returncode=returncode)
+        assert mod.ping("192.168.85.24") is None
+
+    def test_a_ping_that_never_exits_is_reported_dead_not_raised(self, mod, monkeypatch):
+        # The regression pin for the docstring's hard-deadline guard: without
+        # the timeout=, this call would block its worker thread forever.
+        install_fake_ping(monkeypatch,
+                          error=subprocess.TimeoutExpired(cmd=["ping"], timeout=2))
+        assert mod.ping("192.168.85.24") is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            FileNotFoundError(2, "No such file or directory: 'ping'"),
+            PermissionError(13, "Permission denied"),
+            OSError(23, "Too many open files in system"),
+        ],
+        ids=["ping_binary_missing", "not_permitted", "enfile_under_load"],
+    )
+    def test_an_os_level_failure_is_reported_dead_not_raised(self, mod, monkeypatch, error):
+        # pool.map in discover_devices re-raises in the collecting thread, so an
+        # unguarded OSError on one host would lose the whole sweep's results.
+        install_fake_ping(monkeypatch, error=error)
+        assert mod.ping("192.168.85.24") is None
+
+    def test_a_hard_deadline_is_always_set(self, mod, monkeypatch):
+        # `-t 1` is a TTL on Linux, not a deadline — only this kwarg bounds the
+        # call. `is not None` rather than a truthiness test: timeout=0 would be
+        # a different bug, not this one.
+        fake = install_fake_ping(monkeypatch)
+        mod.ping("192.168.85.24")
+        assert fake.kwargs[0]["timeout"] is not None
+
+    def test_the_deadline_is_short_enough_to_keep_the_sweep_moving(self, mod, monkeypatch):
+        # 254 hosts / 50 workers means every second of deadline costs ~5s of sweep.
+        fake = install_fake_ping(monkeypatch)
+        mod.ping("192.168.85.24")
+        assert fake.kwargs[0]["timeout"] <= 5
+
+    def test_sends_exactly_one_probe(self, mod, monkeypatch):
+        fake = install_fake_ping(monkeypatch)
+        mod.ping("192.168.85.24")
+        assert fake.commands[0][:3] == ["ping", "-c", "1"]
+
+    def test_the_target_is_passed_as_text(self, mod, monkeypatch):
+        # subprocess would reject an IPv4Address in argv; str(ip) is what makes
+        # discover_devices' subnet.hosts() objects usable here.
+        fake = install_fake_ping(monkeypatch)
+        mod.ping(ipaddress.ip_address("192.168.85.24"))
+        assert fake.commands[0][-1] == "192.168.85.24"
+        assert all(isinstance(part, str) for part in fake.commands[0])
+
+    def test_ping_output_is_captured_rather_than_printed_over_the_report(self, mod, monkeypatch):
+        fake = install_fake_ping(monkeypatch)
+        mod.ping("192.168.85.24")
+        assert fake.kwargs[0]["capture_output"] is True
+
+    def test_one_call_per_ping_not_a_retry_loop(self, mod, monkeypatch):
+        # A retry would multiply the deadline the docstring is defending.
+        fake = install_fake_ping(monkeypatch, returncode=1)
+        mod.ping("192.168.85.24")
+        assert len(fake.commands) == 1

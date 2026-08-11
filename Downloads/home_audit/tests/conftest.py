@@ -116,6 +116,17 @@ def sandbox(monkeypatch, tmp_path):
     # Anything that still resolves ~ lands in the tmp dir rather than $HOME.
     monkeypatch.setenv("HOME", str(tmp_path))
 
+    # --- the working tree ---------------------------------------------------
+    # Pin cwd so a relative-path write lands in tmp rather than in the repo.
+    # Without this the suite is hermetic against the network and subprocesses
+    # but not against its own filesystem writes: generate_html_report builds a
+    # default path and writes it, and .gitignore's `audit_report_*.html` rule
+    # would hide any escapee from `git status`. Found by mutating BASELINE_DIR
+    # to os.getcwd(), which silently wrote a report into the working tree.
+    # PROJECT_DIR / TESTS_DIR / FIXTURE_DIR are absolute and resolved at import,
+    # so fixture loading is unaffected.
+    monkeypatch.chdir(tmp_path)
+
     yield data_dir
 
 

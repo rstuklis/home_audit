@@ -244,7 +244,6 @@ class TestSharingServicesSSH:
         ssh = _by_name(mod.check_sharing_services(), "Remote Login (SSH)")
         assert ssh["enabled"] is False
         assert ssh["risk"] == "OK"
-        assert ssh["note"] == "Disabled."
 
     def test_open_port_22_enables_ssh_when_launchd_says_off(self, mod, monkeypatch, fixture):
         # The listener half of the OR: something is answering on 22 even though
@@ -297,7 +296,6 @@ class TestSharingServicesScreenSharing:
         vnc = _by_name(mod.check_sharing_services(), "Screen Sharing / VNC")
         assert vnc["enabled"] is False
         assert vnc["risk"] == "OK"
-        assert vnc["note"] == "Disabled."
 
     def test_open_port_5900_enables_screen_sharing(self, mod, monkeypatch):
         # A third-party VNC server holds 5900 without com.apple.screensharing
@@ -331,25 +329,70 @@ class TestSharingServicesSMB:
         assert smb["enabled"] is True
         assert smb["risk"] == "REVIEW"
 
-    @pytest.mark.parametrize("disabled_fixture", [
-        "launchctl_print_disabled_smb_disabled.out",
-        "launchctl_print_disabled_legacy_bools.out",
-    ], ids=["=>disabled", "=>false"])
-    def test_non_enabled_flag_with_no_listener_reports_disabled(
-            self, mod, monkeypatch, fixture, disabled_fixture):
-        # NOTE: the legacy '"com.apple.smbd" => false' form is read the same way
-        # as '=> disabled' by home_net_audit.py:1444 (only the literal "enabled"
-        # sets the flag). See the module summary - on launchctl builds that
-        # print booleans, '=> false' means "not disabled", i.e. the opposite.
-        # Recorded here as the code's actual behaviour, not endorsed as correct.
+    def test_word_dialect_disabled_flag_with_no_listener_reports_disabled(
+            self, mod, monkeypatch, fixture):
+        # '"com.apple.smbd" => disabled' inside the *disabled services* dict
+        # means smbd really is disabled, and nothing is listening, so OFF is the
+        # truthful answer. This is the arm home_net_audit.py:1444 gets right.
         _patch_sharing(monkeypatch, mod,
                        launchd={SMBD: fixture("launchctl_print_smbd_not_running.out")},
-                       print_disabled=fixture(disabled_fixture),
+                       print_disabled=fixture("launchctl_print_disabled_smb_disabled.out"),
                        open_ports=[])
         smb = _by_name(mod.check_sharing_services(), "File Sharing (SMB)")
         assert smb["enabled"] is False
         assert smb["risk"] == "OK"
-        assert smb["note"] == "Disabled."
+
+    @pytest.mark.known_bug
+    @pytest.mark.xfail(strict=True, reason=(
+        "home_net_audit.py:1444 computes smb_cfg = (m.group(1) == 'enabled') over the "
+        "output of `launchctl print-disabled system`, which is a dict of DISABLED "
+        "services. In the boolean dialect of that dict '=> false' means 'NOT disabled', "
+        "i.e. File Sharing is ON, yet the comparison yields False. Line 1447's "
+        "`smb_on = bool(smb_cfg) or ...` cannot rescue it: smbd is launch-on-demand, so an "
+        "idle Mac that is genuinely sharing shows 'state = not running' and a closed port "
+        "445, and the audit prints a confident false OFF (risk OK, note 'Disabled.'). "
+        "The inversion is confined to the boolean dialect: '=> true' and '=> disabled' "
+        "both correctly yield off, '=> enabled' correctly yields on, and only '=> false' "
+        "-- the one token that means ON -- is read backwards. A maintainer who establishes "
+        "that '=> false' is unreachable on every supported macOS version may therefore "
+        "delete this marker with that justification rather than by changing line 1444."))
+    def test_boolean_dialect_false_means_not_disabled_so_smb_is_on(
+            self, mod, monkeypatch, fixture):
+        """`"com.apple.smbd" => false` in the disabled-services dict means SMB is ON.
+
+        The four tokens that appear across launchctl dialects map like this:
+
+            "=> true"     -> listed as disabled     -> SMB off
+            "=> disabled" -> listed as disabled     -> SMB off
+            "=> enabled"  -> listed as NOT disabled -> SMB on
+            "=> false"    -> listed as NOT disabled -> SMB on   <-- read backwards
+
+        launchd not-running and port 445 closed is the *normal* state of an
+        enabled-but-idle launch-on-demand smbd, so the config flag is the only
+        signal that can tell the truth here, and it is inverted.
+        """
+        dump = fixture("launchctl_print_disabled_legacy_bools.out")
+        assert '"com.apple.smbd" => false' in dump, "fixture must carry the boolean dialect"
+        _patch_sharing(monkeypatch, mod,
+                       launchd={SMBD: fixture("launchctl_print_smbd_not_running.out")},
+                       print_disabled=dump,
+                       open_ports=[])
+        smb = _by_name(mod.check_sharing_services(), "File Sharing (SMB)")
+        assert smb["enabled"] is True
+        assert smb["risk"] == "REVIEW"
+
+    def test_boolean_dialect_true_means_disabled_so_smb_is_off(self, mod, monkeypatch, fixture):
+        # The other half of the boolean dialect, and the guard against an
+        # over-broad repair of line 1444: rewriting the test as
+        # `m.group(1) != "disabled"` would satisfy the '=> false' case above
+        # while turning '=> true' (genuinely disabled) into a false ON.
+        _patch_sharing(monkeypatch, mod,
+                       launchd={SMBD: fixture("launchctl_print_smbd_not_running.out")},
+                       print_disabled='disabled services = {\n\t"com.apple.smbd" => true\n}\n',
+                       open_ports=[])
+        smb = _by_name(mod.check_sharing_services(), "File Sharing (SMB)")
+        assert smb["enabled"] is False
+        assert smb["risk"] == "OK"
 
     def test_open_port_445_overrides_a_disabled_flag(self, mod, monkeypatch, fixture):
         # Config says off but something is serving SMB right now - believe the
@@ -386,13 +429,20 @@ class TestSharingServicesSMB:
         smb = _by_name(mod.check_sharing_services(), "File Sharing (SMB)")
         assert smb["enabled"] is False
 
-    def test_print_disabled_timeout_does_not_abort_the_check(self, mod, monkeypatch):
-        # A wedged `launchctl print-disabled` must degrade to the live probes
-        # rather than propagate out of check_sharing_services.
-        def _timeout(cmd, *args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd, 5)
+    @pytest.mark.parametrize("failure", [
+        lambda cmd: subprocess.TimeoutExpired(cmd, 5),
+        lambda cmd: FileNotFoundError(2, "No such file or directory: 'launchctl'"),
+    ], ids=["timeout", "missing-binary"])
+    def test_print_disabled_failure_does_not_abort_the_check(self, mod, monkeypatch, failure):
+        # Both arms of the except clause at home_net_audit.py:1445: a wedged
+        # `launchctl print-disabled` (TimeoutExpired) and a launchctl that is not
+        # there at all (FileNotFoundError, an OSError - what happens off macOS).
+        # Either way the check must degrade to the live listener probe rather
+        # than propagate out of check_sharing_services.
+        def _fail(cmd, *args, **kwargs):
+            raise failure(cmd)
 
-        monkeypatch.setattr(subprocess, "run", _timeout)
+        monkeypatch.setattr(subprocess, "run", _fail)
         monkeypatch.setattr(mod, "run", make_run({SYSTEMSETUP_RAE: "Remote Apple Events: Off"}))
         monkeypatch.setattr(mod, "check_port", make_check_port([445]))
         smb = _by_name(mod.check_sharing_services(), "File Sharing (SMB)")
@@ -499,6 +549,34 @@ class TestSharingServicesReportShape:
             assert s["enabled"] in (True, False, None)
             assert s["risk"] in {"OK", "INFO", "REVIEW", "HIGH", "UNKNOWN"}
             assert s["note"].strip()
+
+    def test_an_enabled_service_never_reads_the_same_as_a_disabled_one(self, mod, monkeypatch):
+        """Each probed service must say something different when on than when off.
+
+        Replaces three `note == "Disabled."` equalities that were dropped as
+        brittle. Pinning the exact prose went red on any harmless copy edit;
+        dropping it entirely let a note swap survive. Comparing the on-state
+        against the off-state pins the behaviour — that the note actually
+        tracks the state — without pinning a single word of the copy.
+        """
+        _patch_sharing(monkeypatch, mod, **self.ALL_OFF)
+        off = {s["name"]: s["note"] for s in mod.check_sharing_services()}
+        _patch_sharing(monkeypatch, mod, **self.ALL_ON)
+        on = {s["name"]: s["note"] for s in mod.check_sharing_services()}
+
+        for name in ("Remote Login (SSH)", "Screen Sharing / VNC",
+                     "File Sharing (SMB)", "Remote Apple Events"):
+            assert off[name] != on[name], f"{name} reads identically on and off"
+
+    def test_an_undetermined_service_never_reads_as_a_confident_off(self, mod, monkeypatch):
+        # The whole point of the UNKNOWN tri-state (commit 4c349fd) is that the
+        # audit must not claim a listener is disabled when it could not look.
+        _patch_sharing(monkeypatch, mod, **self.ALL_OFF)
+        off_note = _by_name(mod.check_sharing_services(), "Remote Apple Events")["note"]
+        _patch_sharing(monkeypatch, mod, **self.BLOCKED)
+        blocked = _by_name(mod.check_sharing_services(), "Remote Apple Events")
+        assert blocked["enabled"] is None
+        assert blocked["note"] != off_note
 
     @pytest.mark.parametrize("config", [ALL_OFF, ALL_ON],
                              ids=["all-off", "all-on"])

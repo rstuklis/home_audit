@@ -9,6 +9,7 @@ import importlib.util
 import re
 import socket
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -101,6 +102,26 @@ class TestSandboxRedirectsUserData:
 
     def test_missing_baseline_reads_as_none(self, mod):
         assert mod.load_baseline() is None
+
+    def test_cwd_is_pinned_so_a_relative_write_cannot_reach_the_repo(self, tmp_path):
+        """A stray relative-path write must land in tmp, never in the checkout.
+
+        The suite blocks the network and subprocesses, but generate_html_report
+        builds a default path and writes to it. Without a pinned cwd an escapee
+        lands in the working tree, and .gitignore's `audit_report_*.html` rule
+        would hide it from `git status` — so it would go unnoticed indefinitely.
+        """
+        assert Path.cwd() == tmp_path
+        assert str(PROJECT_DIR) not in str(Path.cwd())
+
+        Path("scratch_report.html").write_text("x", encoding="utf-8")
+        assert (tmp_path / "scratch_report.html").exists()
+        assert not (PROJECT_DIR / "scratch_report.html").exists()
+
+    def test_fixture_loading_still_works_from_the_pinned_cwd(self):
+        # PROJECT_DIR/FIXTURE_DIR are absolute and resolved at import time, so
+        # pinning cwd must not break fixture lookup.
+        assert (PROJECT_DIR / "home_net_audit.py").exists()
 
     def test_labels_and_networks_default_cleanly(self, mod):
         assert mod.load_labels() == {}

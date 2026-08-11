@@ -38,6 +38,20 @@ STEALTH_OFF = load_fixture("firewall_stealth_off.out")
 BLOCKALL_ON = load_fixture("firewall_blockall_on.out")
 BLOCKALL_OFF = load_fixture("firewall_blockall_off.out")
 
+# (branch key of TestNoteBranchSelection._notes, token that identifies that
+# branch's note). Every token must be unique to its own branch — a token that
+# also occurs in a sibling note cannot detect two notes being swapped, which is
+# the whole point of the class. TestNoteBranchSelection enforces that property
+# directly, so a future edit cannot quietly reintroduce a dead-weight token.
+NOTE_BRANCH_TOKENS = [
+    ("unknown", "could not determine"),
+    ("off", "firewall is off"),
+    ("block_all", "block all"),
+    ("stealth_on", "good configuration"),
+    ("plain_on", "stealth mode off"),
+]
+NOTE_BRANCH_IDS = ["unknown", "off", "block-all", "stealth-on", "plain-on"]
+
 
 @pytest.fixture
 def fw(mod, monkeypatch):
@@ -240,19 +254,27 @@ class TestNoteBranchSelection:
         notes = self._notes(fw)
         assert len(set(notes.values())) == 5, f"branches collapsed: {notes}"
 
-    @pytest.mark.parametrize(
-        "branch, token",
-        [
-            ("unknown", "could not determine"),
-            ("off", "firewall is off"),
-            ("block_all", "block all"),
-            ("stealth_on", "stealth mode"),
-            ("plain_on", "stealth mode off"),
-        ],
-        ids=["unknown", "off", "block-all", "stealth-on", "plain-on"],
-    )
+    @pytest.mark.parametrize("branch, token", NOTE_BRANCH_TOKENS, ids=NOTE_BRANCH_IDS)
     def test_each_branch_names_its_situation(self, fw, branch, token):
         assert token in self._notes(fw)[branch].lower()
+
+    @pytest.mark.parametrize("branch, token", NOTE_BRANCH_TOKENS, ids=NOTE_BRANCH_IDS)
+    def test_each_branch_token_is_unique_to_that_branch(self, fw, branch, token):
+        # Systemic guard for the table above. A token that also appears in a
+        # sibling note makes test_each_branch_names_its_situation dead weight:
+        # it keeps passing when lines 1551-1560 hand a branch the wrong note.
+        # The stealth-on case was exactly that — "stealth mode" is also in the
+        # plain-on note ("Enabled (stealth mode off)..."), so swapping lines
+        # 1558 and 1560 left the assertion green.
+        notes = self._notes(fw)
+        intruders = sorted(
+            other for other, note in notes.items()
+            if other != branch and token in note.lower()
+        )
+        assert intruders == [], (
+            f"token {token!r} for branch {branch!r} also matches {intruders}; "
+            f"it cannot detect those notes being swapped"
+        )
 
     def test_off_note_wins_over_block_all_and_stealth(self, fw):
         # A firewall that is off makes the other two settings irrelevant; the
@@ -274,14 +296,23 @@ class TestNoteBranchSelection:
                     stealth_out=STEALTH_ON, blockall_out=BLOCKALL_ON)
         assert result["note"] == notes["unknown"]
 
-    def test_unknown_stealth_still_reads_as_off_in_the_note(self, fw):
-        # AMBIGUOUS - documenting actual behaviour, not endorsing it. stealth is
-        # None (unparseable) yet the note asserts "stealth mode off". The
-        # returned tri-state is intact, and action_firewall_check renders it as
-        # UNKNOWN, so only the prose overstates.
+    @pytest.mark.known_bug
+    @pytest.mark.xfail(strict=True, reason=(
+        "home_net_audit.py:1557-1560 picks the note with a truthiness test — "
+        "`elif result['stealth_mode']:` ... `else: 'Enabled (stealth mode off). ...'` — "
+        "so stealth_mode=None falls into the else and the note states as fact that "
+        "stealth is off. None is reachable whenever --getstealthmode output is "
+        "unparseable (see test_unparseable_stealth_output_is_unknown); the branch needs "
+        "`is True` / `is False` like the tri-state it is reading. The claim is not "
+        "terminal-only: action_firewall_check prints 'Stealth Mode : UNKNOWN' two lines "
+        "above the same note (lines 1570/1574/1576), and generate_html_report copies the "
+        "note verbatim into the shareable report at line 1712."))
+    def test_unknown_stealth_is_not_reported_as_off_in_the_note(self, fw):
         result = fw(global_out=GLOBAL_ON, stealth_out="", blockall_out=BLOCKALL_OFF)
         assert result["stealth_mode"] is None
-        assert "stealth mode off" in result["note"].lower()
+        assert "stealth mode off" not in result["note"].lower(), (
+            "note claims stealth is off for a stealth_mode that is None (unknown)"
+        )
 
 
 class TestCommandsIssued:

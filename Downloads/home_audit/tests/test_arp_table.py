@@ -13,6 +13,11 @@ to be worth pinning line by line:
     made that sort raise ValueError and took the whole audit down. The fix
     pushes every IP through ipaddress.ip_address and drops what fails; the
     tests in TestMalformedIPsAreDropped and TestSortInvariant pin exactly that.
+
+TestDiscoverDevices covers the consumer, discover_devices (lines 293-306),
+because the merge it performs is what gives read_arp_table's output meaning:
+ping and the ARP cache are two independent discovery sources, unioned, sorted
+numerically, and then filtered as a single stream by is_real_host.
 """
 
 import ipaddress
@@ -26,6 +31,17 @@ ARP_CMD = "arp -a"
 
 TYPICAL = "arp_a_typical.out"
 MALFORMED = "arp_a_malformed_ip.out"
+
+# discover_devices pings every address in subnet.hosts(), so the sweep has to be
+# small to stay fast: this /29 has six usable hosts (.97-.102), with .96 as the
+# network address and .103 as the broadcast. It is also chosen so that .97, .100
+# and .102 sort differently as strings ('.100' < '.102' < '.97') than as
+# addresses — that is what makes the ordering assertion below discriminate.
+SWEPT = ipaddress.ip_network("192.168.1.96/29")
+NEIGHBOUR_IP = "192.168.87.42"          # a host on another subnet of this Mac
+
+KNOWN_MAC = "3c:37:86:1f:a2:0b"
+OTHER_MAC = "a4:83:e7:1b:2c:3d"
 
 
 @pytest.fixture
@@ -305,3 +321,158 @@ class TestSortInvariant:
             {"ip": "192.168.1.10", "mac": "00:11:32:aa:bb:cc"},
             {"ip": "192.168.1.254", "mac": "6c:4b:90:1e:8f:22"},
         ]
+
+
+def ping_answering(alive):
+    """Build a ping stub: probing a listed address reports it, anything else None.
+
+    Shaped like the real ping (line 267), which returns `str(ip)` on a reply and
+    None otherwise — returning the IPv4Address object instead would poison the
+    `alive | set(arp.keys())` union with a second key type.
+    """
+    alive = {str(a) for a in alive}
+
+    def _ping(ip):
+        return str(ip) if str(ip) in alive else None
+
+    return _ping
+
+
+@pytest.fixture
+def discover(mod, monkeypatch):
+    """Run discover_devices with both of its discovery sources under control.
+
+    `alive` is what the ping sweep replies to; `arp` is the machine-wide ARP
+    cache. Patching read_arp_table (rather than `run`) keeps these tests about
+    the merge, not about the parser that TestRealisticCapture already pins.
+    """
+    def _discover(subnet, alive=(), arp=None, ping=None):
+        monkeypatch.setattr(mod, "ping", ping or ping_answering(alive))
+        monkeypatch.setattr(mod, "read_arp_table", lambda: dict(arp or {}))
+        return mod.discover_devices(subnet)
+
+    return _discover
+
+
+class TestDiscoverDevices:
+    """The two-source merge on lines 293-306.
+
+    ping sweeps the subnet; read_arp_table reads the machine-wide ARP cache.
+    Neither sees everything — a host with a stale/absent ARP entry only answers
+    ping, and a host that ignores ICMP is only ever known from ARP — so the
+    union is the point of the function, not an implementation detail.
+    """
+
+    def test_a_host_that_only_answers_ping_is_reported_with_an_unknown_mac(self, discover):
+        # The ping half of the union in isolation: with no ARP entry, line 303's
+        # `arp.get(ip, "unknown")` default is the MAC, and is_real_host has to
+        # accept that literal string or the host disappears from the audit.
+        assert discover(SWEPT, alive=["192.168.1.97"], arp={}) == [
+            {"ip": "192.168.1.97", "mac": "unknown"},
+        ]
+
+    def test_a_host_known_only_from_arp_is_reported_without_a_ping_reply(self, discover):
+        # The other half: a device that drops ICMP is still a device.
+        assert discover(SWEPT, alive=[], arp={"192.168.1.100": KNOWN_MAC}) == [
+            {"ip": "192.168.1.100", "mac": KNOWN_MAC},
+        ]
+
+    def test_a_host_in_both_sources_keeps_its_real_mac(self, discover):
+        # A set union of IPs, not of records: the ARP MAC must win over the
+        # "unknown" the ping side would otherwise contribute.
+        assert discover(SWEPT, alive=["192.168.1.100"],
+                        arp={"192.168.1.100": KNOWN_MAC}) == [
+            {"ip": "192.168.1.100", "mac": KNOWN_MAC},
+        ]
+
+    def test_a_host_in_both_sources_is_reported_exactly_once(self, discover):
+        # diff_baseline (line 420) builds a set of MACs, so a duplicated device
+        # would not show up there — it has to be caught here.
+        devices = discover(
+            SWEPT,
+            alive=["192.168.1.97", "192.168.1.100", "192.168.1.102"],
+            arp={"192.168.1.97": KNOWN_MAC, "192.168.1.100": OTHER_MAC},
+        )
+        ips = [d["ip"] for d in devices]
+        assert ips == ["192.168.1.97", "192.168.1.100", "192.168.1.102"]
+
+    def test_merged_devices_are_sorted_by_address_not_by_string(self, discover):
+        # Line 302 sorts with key=ipaddress.ip_address. Plain sorted() would put
+        # .100 and .102 ahead of .97 and the report would read as nonsense.
+        devices = discover(
+            SWEPT,
+            alive=["192.168.1.97", "192.168.1.102"],
+            arp={"192.168.1.100": KNOWN_MAC},
+        )
+        ips = [d["ip"] for d in devices]
+        assert ips == ["192.168.1.97", "192.168.1.100", "192.168.1.102"]
+        # Guard that the assertion above is not satisfied by either ordering.
+        assert sorted(ips) != ips
+
+    def test_ordering_holds_when_each_source_contributes_out_of_order(self, discover):
+        # The union is a set, so neither source's own order can leak through.
+        devices = discover(
+            SWEPT,
+            alive=["192.168.1.102", "192.168.1.98"],
+            arp={"192.168.1.101": KNOWN_MAC, "192.168.1.97": OTHER_MAC},
+        )
+        assert [d["ip"] for d in devices] == [
+            "192.168.1.97", "192.168.1.98", "192.168.1.101", "192.168.1.102",
+        ]
+
+    def test_a_ping_reply_from_outside_the_swept_subnet_is_dropped(self, discover):
+        # The cross-subnet boundary of commit 0a79294, on the ping side. The
+        # union is filtered as one stream (line 304), so membership is enforced
+        # no matter which source produced the address — an address tagged with
+        # the wrong network group is exactly the bug that commit fixed.
+        devices = discover(
+            SWEPT,
+            ping=lambda ip: NEIGHBOUR_IP if str(ip) == "192.168.1.97" else None,
+            arp={},
+        )
+        assert devices == []
+
+    def test_an_arp_entry_from_another_subnet_does_not_join_this_sweep(self, discover):
+        # Same boundary on the ARP side: `arp -a` is machine-wide, so entries
+        # for every other interface's subnet are in the table on every run.
+        devices = discover(
+            SWEPT,
+            alive=["192.168.1.97"],
+            arp={NEIGHBOUR_IP: KNOWN_MAC, "192.168.1.100": OTHER_MAC},
+        )
+        assert devices == [
+            {"ip": "192.168.1.97", "mac": "unknown"},
+            {"ip": "192.168.1.100", "mac": OTHER_MAC},
+        ]
+
+    def test_each_device_has_exactly_an_ip_and_a_mac(self, discover):
+        # save_baseline persists these records verbatim and diff_baseline reads
+        # d["mac"] off them, so the key set is a contract, not an accident.
+        devices = discover(
+            SWEPT,
+            alive=["192.168.1.97"],
+            arp={"192.168.1.100": KNOWN_MAC},
+        )
+        assert devices, "no devices merged; the key assertion would be vacuous"
+        for d in devices:
+            assert set(d) == {"ip", "mac"}
+
+    def test_every_usable_address_is_probed_and_none_is_probed_twice(self, mod, monkeypatch):
+        # The sweep runs over subnet.hosts() (line 294), which excludes the
+        # network and broadcast addresses — .96 and .103 must never be pinged.
+        probed = []
+
+        def counting_ping(ip):
+            probed.append(str(ip))
+            return None
+
+        monkeypatch.setattr(mod, "ping", counting_ping)
+        monkeypatch.setattr(mod, "read_arp_table", dict)
+        mod.discover_devices(SWEPT)
+        assert sorted(probed, key=ipaddress.ip_address) == [
+            "192.168.1.97", "192.168.1.98", "192.168.1.99",
+            "192.168.1.100", "192.168.1.101", "192.168.1.102",
+        ]
+
+    def test_no_replies_and_an_empty_arp_cache_yield_no_devices(self, discover):
+        assert discover(SWEPT, alive=[], arp={}) == []
