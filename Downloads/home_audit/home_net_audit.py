@@ -1966,7 +1966,11 @@ def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
                 print(f"  Skipping invalid subnet {s!r} "
                       "(expected CIDR like 192.168.1.0/24).")
     elif interfaces:
-        subnets = list({net for _, _, net in interfaces})
+        # A plain list, not a set: the de-duplication below already removes
+        # repeats and preserves order, so a set here only discarded the order
+        # interfaces were detected in — leaving the primary link (en0) liable to
+        # be swept and reported after a secondary one.
+        subnets = [net for _, _, net in interfaces]
     else:
         fb = guess_subnet(local_ip)
         subnets = [fb] if fb else []

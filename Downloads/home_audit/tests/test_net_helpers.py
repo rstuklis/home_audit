@@ -319,23 +319,29 @@ class TestResolveSubnets:
             ipaddress.ip_network("192.168.87.0/24"),
         }
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1969 collapses the auto-detected interfaces with a set "
-        "comprehension -- `subnets = list({net for _, _, net in interfaces})` -- "
-        "which discards interface order, so the primary interface (en0) is not "
-        "necessarily swept or reported first. The order-preserving de-duplication "
-        "at lines 1982-1987 cannot recover an order the set already threw away; "
-        "the set is redundant with it and should be a plain list comprehension."))
     def test_interface_order_is_preserved_so_the_primary_link_is_swept_first(self, mod):
-        ifaces = [
-            _iface("en0", "192.168.85.24", "192.168.85.0/24"),
-            _iface("en1", "192.168.87.10", "192.168.87.0/24"),
-        ]
-        assert mod.resolve_subnets(None, None, ifaces, None) == [
-            ipaddress.ip_network("192.168.85.0/24"),
-            ipaddress.ip_network("192.168.87.0/24"),
-        ]
+        """Auto-detected interfaces are swept in the order they were found.
+
+        This was a known bug: resolve_subnets used to launder the interfaces
+        through a set, so the returned order was the set's iteration order and
+        the primary link (en0) could be swept and reported after a secondary
+        one. It is now a plain list comprehension, with the order-preserving
+        de-duplication below doing the work the set was redundant with.
+
+        Ten subnets rather than two, deliberately. While the bug existed the
+        symptom was build-dependent — a two-subnet case matched insertion order
+        in 378 of the 780 pairs across 192.168.0-39.0/24, and CI showed x86_64
+        Linux and macOS arm64 disagreeing at both two and ten subnets. Ten keeps
+        the assertion strong enough that any reintroduction of set-laundering
+        shows up as a real ordering difference rather than a coin flip.
+        """
+        expected = [ipaddress.ip_network(f"192.168.{i}.0/24") for i in range(10, 20)]
+        ifaces = [_iface(f"en{n}", f"192.168.{i}.24", str(net))
+                  for n, (i, net) in enumerate(zip(range(10, 20), expected))]
+
+        got = mod.resolve_subnets(None, None, ifaces, None)
+        assert got == expected
+        assert len(got) == len(set(got)) == 10
 
     def test_a_subnet_on_two_interfaces_is_swept_once(self, mod):
         ifaces = [
