@@ -64,6 +64,11 @@ HISTORY_FILE  = os.path.join(BASELINE_DIR, "history.jsonl")
 LABELS_FILE   = os.path.join(BASELINE_DIR, "labels.json")
 NETWORKS_FILE = os.path.join(BASELINE_DIR, "networks.json")
 
+# Read only when scutil is unavailable — i.e. when the audit is running from a
+# Linux observer rather than the Mac. Named *_FILE so the test sandbox redirects
+# it automatically and no test can read the real resolver configuration.
+RESOLV_CONF_FILE = "/etc/resolv.conf"
+
 # Baseline record format. 1 = the original bare state dict with no integrity
 # data at all; 2 = the sealed, chained record written by save_baseline below.
 BASELINE_FORMAT = 2
@@ -153,13 +158,26 @@ def run(cmd, timeout=10):
         return ""
 
 
-def get_default_gateway():
-    out = run(["route", "-n", "get", "default"])
-    m = re.search(r"gateway:\s*([\d.]+)", out)
+# ---------------------------------------------------------------------------
+# Platform dialects
+#
+# The audit is designed to run from a second device — a Linux box on the same
+# LAN — so that a compromised Mac cannot hide local evidence from it. That means
+# every network reader needs a Linux dialect alongside the macOS one.
+#
+# Rather than branch on sys.platform, each reader tries its known sources in
+# order and takes the first that parses. run() returns "" for a command that
+# does not exist, so on macOS the iproute2 attempts fall through to the BSD
+# tools and on Linux the reverse — with no platform detection to get wrong, and
+# correct behaviour on a host that happens to have both.
+# ---------------------------------------------------------------------------
+
+def parse_gateway_bsd(route_out, netstat_out=""):
+    """`route -n get default`, falling back to the `netstat -rn` table."""
+    m = re.search(r"gateway:\s*([\d.]+)", route_out)
     if m:
         return m.group(1)
-    out = run(["netstat", "-rn"])
-    for line in out.splitlines():
+    for line in netstat_out.splitlines():
         if line.startswith("default"):
             parts = line.split()
             if len(parts) >= 2 and re.match(r"[\d.]+$", parts[1]):
@@ -167,8 +185,32 @@ def get_default_gateway():
     return None
 
 
-def get_all_interfaces():
-    out = run(["ifconfig", "-a"])
+def parse_gateway_iproute(out):
+    """`ip route show default` -> 'default via 192.168.1.1 dev eth0 ...'."""
+    m = re.search(r"^default\s+via\s+(\S+)", out, re.MULTILINE)
+    if not m:
+        return None
+    try:
+        return str(ipaddress.ip_address(m.group(1)))
+    except ValueError:
+        return None
+
+
+def get_default_gateway():
+    # Each source is consulted only if the previous one came up empty. Passing
+    # both run() calls as arguments would evaluate them eagerly and spawn
+    # netstat on every single call, even when route already answered.
+    gw = parse_gateway_bsd(run(["route", "-n", "get", "default"]))
+    if gw:
+        return gw
+    gw = parse_gateway_bsd("", run(["netstat", "-rn"]))
+    if gw:
+        return gw
+    return parse_gateway_iproute(run(["ip", "route", "show", "default"]))
+
+
+def parse_interfaces_ifconfig(out):
+    """macOS/BSD `ifconfig -a`."""
     results = []
     current_iface = None
     for line in out.splitlines():
@@ -196,6 +238,36 @@ def get_all_interfaces():
     return results
 
 
+def parse_interfaces_iproute(out):
+    """`ip -o -4 addr show` -> '2: eth0    inet 192.168.1.50/24 brd ... '.
+
+    The prefix length is already in the output, so there is no hex netmask to
+    convert and no OverflowError to guard — an unparseable line is simply
+    skipped, matching the BSD reader's contract.
+    """
+    results = []
+    for line in out.splitlines():
+        m = re.search(r"^\s*\d+:\s+(\S+)\s+inet\s+([\d.]+)/(\d+)", line)
+        if not m:
+            continue
+        iface, ip, prefix = m.group(1), m.group(2), m.group(3)
+        if ip.startswith("127.") or ip.startswith("169.254."):
+            continue
+        try:
+            results.append((iface, ip,
+                            ipaddress.ip_network(f"{ip}/{prefix}", strict=False)))
+        except ValueError:
+            pass
+    return results
+
+
+def get_all_interfaces():
+    results = parse_interfaces_ifconfig(run(["ifconfig", "-a"]))
+    if results:
+        return results
+    return parse_interfaces_iproute(run(["ip", "-o", "-4", "addr", "show"]))
+
+
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -213,7 +285,38 @@ def guess_subnet(local_ip):
     return ipaddress.ip_network(local_ip + "/24", strict=False)
 
 
+def parse_resolv_conf(text):
+    """/etc/resolv.conf — the Linux fallback when scutil is not present."""
+    servers = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        if not line.lower().startswith("nameserver"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        addr, sep, zone = parts[1].partition("%")
+        try:
+            ip = str(ipaddress.ip_address(addr)) + sep + zone
+        except ValueError:
+            continue
+        if ip not in servers:
+            servers.append(ip)
+    return servers
+
+
 def get_dns_servers():
+    servers = _dns_from_scutil()
+    if servers:
+        return servers
+    try:
+        with open(RESOLV_CONF_FILE) as f:
+            return parse_resolv_conf(f.read())
+    except OSError:
+        return []
+
+
+def _dns_from_scutil():
     out = run(["scutil", "--dns"])
     servers = []
     # Capture the whole address rather than [\d.]+, which stopped at the first
@@ -235,7 +338,41 @@ def get_dns_servers():
     return servers
 
 
+def parse_neigh_iproute(out):
+    """`ip neigh show` -> '192.168.1.1 dev eth0 lladdr aa:bb:.. REACHABLE'.
+
+    FAILED and INCOMPLETE entries carry no usable address and are skipped, the
+    same way `(incomplete)` is skipped in the BSD reader.
+    """
+    table = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\S+)\s+dev\s+\S+\s+lladdr\s+([0-9a-fA-F:]{11,17})", line)
+        if not m:
+            continue
+        if "FAILED" in line or "INCOMPLETE" in line:
+            continue
+        try:
+            ip = str(ipaddress.ip_address(m.group(1)))
+        except ValueError:
+            continue
+        raw = m.group(2).split(":")
+        if len(raw) != 6:
+            continue
+        try:
+            table[ip] = ":".join(f"{int(x, 16):02x}" for x in raw)
+        except ValueError:
+            continue
+    return table
+
+
 def read_arp_table():
+    table = _read_arp_bsd()
+    if table:
+        return table
+    return parse_neigh_iproute(run(["ip", "neigh", "show"]))
+
+
+def _read_arp_bsd():
     out = run(["arp", "-a"])
     table = {}
     for line in out.splitlines():
@@ -293,8 +430,14 @@ def ping(ip):
     `-t` sets the TTL rather than a deadline, so without this a hung host would
     block its worker thread and stall the whole sweep).
     """
+    # -t means a deadline on macOS but a TTL on Linux, where sending a probe
+    # with TTL 1 would make every host beyond the first hop look dead. -W is the
+    # Linux reply timeout and is not accepted on macOS. Pick the flag that
+    # actually means "give up quickly" on the host we are on; the hard
+    # subprocess timeout below stays as the backstop either way.
+    limit = ["-t", "1"] if sys.platform == "darwin" else ["-W", "1"]
     try:
-        out = subprocess.run(["ping", "-c", "1", "-t", "1", str(ip)],
+        out = subprocess.run(["ping", "-c", "1"] + limit + [str(ip)],
                              capture_output=True, text=True, timeout=2)
     except (subprocess.TimeoutExpired, OSError):
         return None

@@ -28,6 +28,7 @@ import pytest
 from conftest import load_fixture, make_run
 
 ARP_CMD = "arp -a"
+NEIGH_CMD = "ip neigh show"
 
 TYPICAL = "arp_a_typical.out"
 MALFORMED = "arp_a_malformed_ip.out"
@@ -68,9 +69,11 @@ def one_entry(read_arp, line):
 
 
 class TestCommandInvoked:
-    def test_reads_the_system_arp_cache(self, read_arp):
+    def test_reads_the_system_arp_cache_then_falls_back_to_iproute(self, read_arp):
+        # `arp -a` first; `ip neigh show` only when it yields nothing, so a
+        # Linux observer sees the same neighbour table by its own name.
         read_arp("")
-        assert read_arp.calls == [ARP_CMD]
+        assert read_arp.calls == [ARP_CMD, NEIGH_CMD]
 
     def test_missing_arp_binary_yields_an_empty_table(self, mod, monkeypatch):
         # The real run() returns "" when the binary is absent or times out;

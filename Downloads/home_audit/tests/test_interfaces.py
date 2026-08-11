@@ -26,6 +26,10 @@ ROUTE_CMD = "route -n get default"
 NETSTAT_CMD = "netstat -rn"
 IFCONFIG_CMD = "ifconfig -a"
 SCUTIL_CMD = "scutil --dns"
+# iproute2 equivalents, tried when the BSD tool is absent so the audit can
+# also run from a Linux observer watching the same LAN.
+IPROUTE_GW_CMD = "ip route show default"
+IPROUTE_ADDR_CMD = "ip -o -4 addr show"
 
 ROUTE_WITH_GATEWAY = load_fixture("route_get_default.out")
 ROUTE_NO_GATEWAY = load_fixture("route_get_default_no_gateway.out")
@@ -162,9 +166,11 @@ class TestGetDefaultGatewayNetstatFallback:
     def test_no_routing_information_at_all_yields_none(self, gateway):
         assert gateway(route_out="", netstat_out="") is None
 
-    def test_both_commands_are_tried_before_giving_up(self, gateway):
+    def test_every_source_is_tried_in_order_before_giving_up(self, gateway):
+        # Pins the fallback order itself: BSD route, then the BSD routing
+        # table, then iproute2. A Linux observer only reaches the third.
         gateway(route_out="", netstat_out="")
-        assert gateway.calls == [ROUTE_CMD, NETSTAT_CMD]
+        assert gateway.calls == [ROUTE_CMD, NETSTAT_CMD, IPROUTE_GW_CMD]
 
 
 class TestGetAllInterfacesNetmaskForms:
