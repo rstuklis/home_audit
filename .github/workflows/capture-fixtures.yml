@@ -8,7 +8,12 @@ name: capture-fixtures
 # Caveat worth knowing before trusting the result: a runner is a virtualised
 # macOS instance in a datacenter. It has no Wi-Fi hardware and no home LAN, so
 # the wireless and neighbour captures will be thin or empty. Those fixtures
-# still have to come from a real machine on a real network.
+# still have to come from a real machine on a real network — which is what
+# tools/capture_fixtures.py is for. Run it on a Mac that is actually on a
+# network; it redacts the capture before you read it, because a real one
+# carries the machine's SSID, BSSIDs, LAN MACs and account name.
+#
+#     python3 tools/capture_fixtures.py
 
 on:
   workflow_dispatch:
