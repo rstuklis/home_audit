@@ -76,6 +76,38 @@ file raises an error listing what *is* available.
 Short one-off strings belong inline in the test. Files are for realistic multi-line
 command output, where the column layout is part of what's being tested.
 
+## Testing logic that sits behind a socket or HTTP call
+
+Most of the suite feeds captured strings to a parser. A handful of checks reach the
+network directly — `check_router_hostname` (reverse DNS), `lookup_vendor`
+(macvendors.com), `get_upnp_port_mappings` (SSDP + SOAP), `check_rogue_dhcp` and
+`check_arp_spoofing` (raw UDP), `probe_default_credentials` (HTTP). Each still has a
+worthwhile parser or classifier underneath the I/O — a regex over vendor XML, a
+cloud-provider substring match, a "is this an admin page or a login form" decision —
+which is the same bug surface the rest of the suite guards.
+
+The sandbox forbids the real I/O, so these tests fake only the boundary and let the
+logic run:
+
+- **`urllib.request.urlopen`** — patch it to return a tiny response object with the
+  `read()` / `getcode()` / context-manager methods the code calls, or raise
+  `urllib.error.HTTPError` / `URLError` to drive an error branch. `test_receipts.py`
+  and `test_vendor_lookup.py` show the shape.
+- **`urllib.request.build_opener`** — `probe_default_credentials` fetches through an
+  opener, not `urlopen`, so patch `build_opener` to return a fake whose `.open(req)`
+  dispatches on `req.get_method()` and `req.get_header("Authorization")`. See
+  `test_default_creds.py`.
+- **`mod.socket.socket`** — for SSDP/DHCP, return a fake socket that replays a
+  scripted list of datagrams from `recvfrom` and then raises `socket.timeout` to end
+  the collection loop (`test_upnp.py`, `test_rogue_dhcp.py`).
+- **`mod.time.sleep`** and **`mod.ssl.create_default_context`** — stub these to keep a
+  many-request sweep instant; the credential probe drops from ~18 s to well under one
+  when the TLS-context build is stubbed out.
+
+What's left uncovered in these functions is the physical I/O itself (the `except
+OSError` around a real `sendto`, a `recvfrom` that genuinely blocks) — deliberately,
+since faking that tests the mock, not the tool.
+
 > **Provenance:** these fixtures were written from knowledge of the real output
 > formats, not captured from a live Mac — this repo's CI has no macOS host to capture
 > from. They're faithful to the documented layouts and to the output shapes described
