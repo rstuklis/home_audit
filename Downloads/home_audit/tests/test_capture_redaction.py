@@ -834,3 +834,60 @@ class TestNothingRealSurvives:
         red.prime([self.CAPTURE])
         red.addresses(self.CAPTURE)
         assert any("does not parse" in ln for ln in red.warnings())
+
+
+class TestResidueScan:
+    """The check that reads the written files back and disbelieves the pass
+    that produced them.
+
+    Both values that reached a public repository were tokens the redactor had
+    inspected and chosen to keep, so any check built on its own bookkeeping
+    would have returned its own answer. This one asks whether anything in the
+    output falls outside the ranges a fixture may contain, which a ULA does by
+    definition however the tool feels about it.
+    """
+
+    def test_a_ula_prefix_is_caught(self):
+        line = "fdca:7af7:13bd:4743::/64   link#6   UC   en0"
+        assert any("documentation range" in why
+                   for _, why in cap.residue(line))
+
+    def test_a_column_cut_fragment_is_caught(self):
+        """The netstat -anp shape: address truncated, port appended, and too
+        short to parse as an address at all."""
+        line = "tcp6  0  0  fdca:7af7:13bd:4.49276  fdca:7af7:13bd:4.52224  ESTABLISHED"
+        assert any("half a real one" in why for _, why in cap.residue(line))
+
+    def test_a_real_link_local_is_caught(self):
+        """Substituted link-locals are numbered from 1, so a 64-bit interface
+        identifier means the hardware's own."""
+        assert any("real interface ID" in why
+                   for _, why in cap.residue("fe80::1465:426a:443:4ac2%en0"))
+
+    def test_a_clean_capture_is_silent(self):
+        clean = "\n".join([
+            "2001:db8:2::/64   link#6   UC   en0",
+            "default   fe80::1%en0   UGcg   en0",
+            "        inet6 2001:db8::1 prefixlen 64",
+            "        inet6 fe80::e%en0 prefixlen 64 scopeid 0x6",
+            "        ether a4:83:e7:01:01:01",
+            "? (192.168.1.1) at 02:00:00:02:02:02 on en0",
+            "tcp4  0  0  192.168.1.42.51000  198.51.100.1.443  ESTABLISHED",
+            "nameserver[0] : 8.8.8.8",
+            "        Firmware Version: wl0: Sep 12 2024 21:44:11 version 22.10.375.6",
+        ])
+        assert cap.residue(clean) == []
+
+    def test_the_preserved_constants_are_not_false_alarms(self):
+        """These are kept on purpose, and a check that cried wolf 117 times
+        over the bridge interface would bury the two findings that matter."""
+        kept = "\n".join([
+            "ff02::1 ff02::fb ::1 ::",
+            "fe80::%utun0 if=utun0, flags=IST",
+            "fe80::1%lo0 prefixlen 64",
+            "ac:de:48:00:11:22 ac:de:48:0:11:22 ff:ff:ff:ff:ff:ff 01:00:5e:00:00:fb",
+            "0:0:0:0:0:0",
+            "fe80::aede:48ff:fe00:1122%en5",
+            "tcp6  0  0  fe80::aede:48ff:.49152  fe80::aede:48ff:.0  ESTABLISHED",
+        ])
+        assert cap.residue(kept) == []

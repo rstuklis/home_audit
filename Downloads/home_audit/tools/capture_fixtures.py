@@ -514,6 +514,70 @@ class Redactor:
         return lines
 
 
+def residue(text):
+    """Anything in already-redacted output that a fixture may not contain.
+
+    Deliberately independent of the Redactor's own bookkeeping. Both values
+    that reached a public repository were tokens the redactor had looked at
+    and decided to keep, so asking it what it kept would have got its own
+    answer back. This asks a question it cannot beg: never mind what was
+    substituted, is there anything here outside the ranges a fixture is
+    allowed to contain at all? A ULA in the output is residue by definition,
+    whatever the tool believes about it.
+
+    Returns a list of (token, why).
+    """
+    findings = []
+    for m in TOKEN_RE.finditer(text):
+        kind, tok = m.lastgroup, m.group(0)
+        if kind == "mac":
+            octets = ":".join(o.zfill(2) for o in tok.lower().split(":"))
+            if not octets.startswith(("a4:83:e7:", "02:00:00:", "ff:ff:ff",
+                                      "01:00:5e:", "33:33:")) \
+                    and octets not in APPLE_BRIDGE_MACS \
+                    and set(octets.split(":")) != {"00"}:
+                findings.append((tok, "MAC outside the substitution ranges"))
+        elif kind == "v4":
+            try:
+                ip = ipaddress.ip_address(tok)
+            except ValueError:
+                continue
+            if ip in ipaddress.ip_network("198.51.100.0/24") or tok in PRESERVED_DNS:
+                continue
+            if not (ip.is_private or ip.is_loopback or ip.is_multicast
+                    or ip.is_link_local or ip.is_unspecified or ip.is_reserved
+                    or str(ip) == "255.255.255.255"):
+                findings.append((tok, "routable IPv4 that is not TEST-NET-2"))
+        elif kind == "v6":
+            addr = tok.partition("%")[0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                # The shape both leaks took. Three groups is enough to carry a
+                # /48; the firmware version's 21:44:11 has two and is not it.
+                stem = addr.rstrip(":")
+                if any(k.startswith(stem) for k in APPLE_BRIDGE_V6):
+                    continue     # a cut spelling of a constant, not of a host
+                if addr.count(":") >= 3:
+                    findings.append((tok, "address-shaped, unparseable, and "
+                                          "long enough to be half a real one"))
+                continue
+            if ip.is_multicast or ip.is_loopback or ip.is_unspecified:
+                continue
+            if ip.compressed in PRESERVED_DNS or ip.compressed in APPLE_BRIDGE_V6:
+                continue
+            if ip.is_link_local:
+                # Substituted link-locals are numbered from 1, so their
+                # interface identifier is tiny. A real one carries 64 bits
+                # derived from the hardware.
+                if int.from_bytes(ip.packed[8:], "big") > 0xFFFF:
+                    findings.append((tok, "link-local with a real interface ID"))
+                continue
+            if ip not in ipaddress.ip_network("2001:db8::/32"):
+                findings.append((tok, "IPv6 outside the documentation range"))
+    return findings
+
+
 def capture(name, cmd):
     """Run one command; return (text_for_fixture, note_or_None)."""
     try:
@@ -600,6 +664,32 @@ def main(argv=None):
               "hardware models, country codes.")
     else:
         print("\nNOT REDACTED — this contains real identifying values.")
+
+    if redactor:
+        # Read back what was written rather than what we believe was written.
+        # The point of this pass is to disbelieve the one above it.
+        leaks = []
+        for name, _ in captured:
+            path = os.path.join(args.out, name + ".out")
+            with open(path, encoding="utf-8") as fh:
+                for tok, why in residue(fh.read()):
+                    leaks.append((name, tok, why))
+        if leaks:
+            print("\nDO NOT COMMIT — %d value(s) that should not be here:"
+                  % len(leaks), file=sys.stderr)
+            seen = set()
+            for name, tok, why in leaks:
+                if (name, tok) in seen:
+                    continue
+                seen.add((name, tok))
+                print("  %-24s %-26s %s" % (name + ".out", tok, why),
+                      file=sys.stderr)
+            print("\nThis is a redaction bug, not something to edit by hand: "
+                  "the same value is likely cut the same way somewhere else.",
+                  file=sys.stderr)
+            return 1
+        print("\nChecked the written files for anything outside the allowed "
+              "ranges: nothing found.")
 
     print("\nRead the files before committing. Then compare with the current set:")
     print("  diff -ru tests/fixtures %s | head -60" % args.out)
