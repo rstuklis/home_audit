@@ -387,3 +387,65 @@ class TestKnownBugs:
         assert len(notes) == 1
         assert LAPTOP in notes[0]
         assert "192.168.87.0/24" in notes[0], "note must say which subnet it moved to"
+
+
+# iOS and macOS rotate their private Wi-Fi address, so these are the same
+# phone on three different days — and nothing about that is an event.
+PHONE_MON = "52:29:4f:ce:4a:d7"
+PHONE_TUE = "7e:f2:c6:51:17:99"
+PHONE_WED = "d2:9c:f8:3e:4e:41"
+
+
+class TestRotatingPrivateAddresses:
+    """A household of phones re-randomises constantly, and compared as a set
+    every rotation is one device arriving and another leaving.
+
+    This came out of a real run: five of the seven MACs in a NEW device(s)
+    alarm were rotating private addresses, so that line was going to fire on
+    every future run for ever, with nothing wrong and while burying the two
+    findings beside it that meant something.
+    """
+
+    def test_a_phone_that_re_randomised_is_not_a_new_device(self, mod):
+        old = {"devices": [dev(LAPTOP), dev(PHONE_MON)]}
+        new = {"devices": [dev(LAPTOP), dev(PHONE_TUE)]}
+        assert not [n for n in mod.diff_baseline(old, new) if "NEW device" in n]
+
+    def test_nor_a_departed_one(self, mod):
+        old = {"devices": [dev(LAPTOP), dev(PHONE_MON)]}
+        new = {"devices": [dev(LAPTOP), dev(PHONE_TUE)]}
+        assert not [n for n in mod.diff_baseline(old, new) if "gone since" in n]
+
+    def test_a_real_device_still_alarms_beside_them(self, mod):
+        """The property that makes the suppression safe rather than merely
+        quiet: rotation is filtered, a new stable MAC is not."""
+        old = {"devices": [dev(PHONE_MON)]}
+        new = {"devices": [dev(PHONE_TUE), dev(INTRUDER)]}
+        notes = [n for n in mod.diff_baseline(old, new) if "NEW device" in n]
+        assert len(notes) == 1
+        assert INTRUDER in notes[0]
+        assert PHONE_TUE not in notes[0]
+
+    def test_a_growing_population_is_still_reported(self, mod):
+        """Not tracked is not ignored. Most new devices on a home network are
+        phones and every one of them arrives with a private address, so the
+        count is the one claim a rotating identifier still supports."""
+        old = {"devices": [dev(PHONE_MON)]}
+        new = {"devices": [dev(PHONE_MON), dev(PHONE_TUE), dev(PHONE_WED)]}
+        notes = [n for n in mod.diff_baseline(old, new) if "rotating private" in n]
+        assert len(notes) == 1
+        assert "3" in notes[0] and "1" in notes[0]
+
+    def test_a_shrinking_population_is_not_an_alarm(self, mod):
+        """Phones sleep and drop off the table constantly. A count that fell
+        is the most ordinary thing on a home network."""
+        old = {"devices": [dev(PHONE_MON), dev(PHONE_TUE), dev(PHONE_WED)]}
+        new = {"devices": [dev(PHONE_MON)]}
+        assert not [n for n in mod.diff_baseline(old, new) if "rotating private" in n]
+
+    def test_a_steady_household_is_silent(self, mod):
+        """The nearest-neighbour non-event: three phones, all re-randomised,
+        same count. Nothing happened and nothing should be said."""
+        old = {"devices": [dev(LAPTOP), dev(PHONE_MON), dev(PHONE_TUE)]}
+        new = {"devices": [dev(LAPTOP), dev(PHONE_WED), dev("6a:11:22:33:44:55")]}
+        assert mod.diff_baseline(old, new) == []

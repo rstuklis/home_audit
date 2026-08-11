@@ -347,10 +347,23 @@ class TestParseFailureIsNotAnOpenNetwork:
         assert result["risk"] != "HIGH"
         assert result["risk"] == "REVIEW"
 
-    def test_review_note_suggests_sudo_rather_than_alarming(self, mod, monkeypatch):
+    def test_review_note_explains_rather_than_alarming(self, mod, monkeypatch):
+        """Unreadable is not open, and the note has to say so without inventing
+        a remedy.
+
+        This previously required the word "sudo", which pinned a belief that a
+        real Mac disproved: under sudo the Security field reads exactly as it
+        does unprivileged — only the SSID and BSSID are withheld, and by
+        Location Services rather than by privilege. An empty Security field
+        means there was no network block to read, so root changes nothing and
+        recommending it sends someone to run a network audit as root for a
+        benefit that does not exist.
+        """
         result = _wifi(mod, monkeypatch, "")
-        assert "sudo" in result["note"].lower()
+        assert result["risk"] == "REVIEW"
         assert "OPEN network" not in result["note"]
+        assert "sudo" not in result["note"].lower()
+        assert "Wi-Fi" in result["note"]
 
 
 class TestNeighbourValuesNeverDecideTheVerdict:
@@ -382,11 +395,41 @@ class TestNeighbourValuesNeverDecideTheVerdict:
 
 class TestRedactedSsid:
     def test_redacted_ssid_is_reported_as_unknown(self, mod, monkeypatch, fixture):
-        # system_profiler prints "<redacted>" unless run with sudo; passing that
-        # placeholder through would print a literal "<redacted>" as the network
-        # name instead of the "run with sudo" hint.
+        # system_profiler prints "<redacted>" for a process without Location
+        # Services access. Passing the placeholder through would print a literal
+        # "<redacted>" as the network name instead of the hint.
         result = _wifi(mod, monkeypatch, fixture("wifi_sp_airport_redacted.out"))
         assert result["ssid"] is None
+
+    def test_the_hint_does_not_send_anyone_to_sudo(self, mod, monkeypatch,
+                                                   fixture, capsys):
+        """Root does not lift this. Verified on a real Mac: under sudo the same
+        report still says <redacted> for the SSID and the BSSIDs, while the
+        firmware, channel, country code and security mode all come back either
+        way. The two withheld fields are the two a wardriving database can turn
+        into an address, and they sit behind Location Services rather than
+        behind privilege — so telling someone to re-run a network audit as root
+        costs them the elevation and gets them nothing.
+        """
+        monkeypatch.setattr(mod, "run", make_run({
+            "system_profiler SPAirPortDataType":
+                fixture("wifi_sp_airport_redacted.out")}))
+        mod.action_wifi_security()
+        printed = capsys.readouterr().out
+        assert "Location Services" in printed
+        assert "sudo" not in printed.lower()
+
+    def test_the_evil_twin_note_names_the_permission_and_rules_out_sudo(
+            self, mod, monkeypatch, fixture):
+        """The terse SSID field states the requirement; this is where someone
+        goes for detail, so it is where the misconception is worth correcting
+        rather than left to be rediscovered."""
+        monkeypatch.setattr(mod, "run", make_run({
+            "system_profiler SPAirPortDataType":
+                fixture("wifi_sp_airport_redacted.out")}))
+        note = mod.check_evil_twin()["note"]
+        assert "Location Services" in note
+        assert "sudo does not help" in note.lower()
 
     def test_redaction_does_not_stop_the_security_classification(
             self, mod, monkeypatch, fixture):
