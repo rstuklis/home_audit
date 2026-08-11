@@ -84,6 +84,12 @@ PASSPHRASE_ENV = "HOME_NET_AUDIT_PASSPHRASE"
 SINK_ENV = "HOME_NET_AUDIT_SINK"
 SINK_TOKEN_ENV = "HOME_NET_AUDIT_SINK_TOKEN"
 
+# Where monitor-mode alerts go. Separate from the receipt sink on purpose: a
+# receipt is routine bookkeeping, an alert is something a person needs to see,
+# and they usually belong on different channels.
+ALERT_ENV = "HOME_NET_AUDIT_ALERT"
+MONITOR_INTERVAL = 60
+
 # Default named networks. Stored/overridden in ~/.home_net_audit/networks.json.
 # Format: {"192.168.1.0/24": "loveshack", "192.168.87.0/24": "pearl"}
 DEFAULT_NETWORKS = {
@@ -1122,6 +1128,141 @@ def compare_with_receipts(record, receipts):
 
     return {"status": "ok",
             "detail": f"Local baseline agrees with {len(receipts)} off-host receipt(s)."}
+
+
+# ---------------------------------------------------------------------------
+# Monitor mode
+#
+# Two of the detections in this tool can only see an attack that is still
+# happening when you look. A rogue Router Advertisement sent and withdrawn
+# between scans leaves no trace; so does a brief ARP poisoning window. Against
+# an adversary who keeps that window short, point-in-time scanning structurally
+# cannot help — which makes continuous observation a security requirement here
+# rather than a convenience.
+#
+# The full audit is far too heavy to loop: port scans, vendor lookups and a
+# speed test take a minute and move real traffic. What runs continuously is the
+# cheap, high-signal subset below — all of it local command output, no probes,
+# no network round trips — so it is safe to poll every minute on a Pi.
+# ---------------------------------------------------------------------------
+
+def monitor_snapshot():
+    """The cheap half of the audit: what an attacker has to change to redirect you."""
+    gateway = get_default_gateway()
+    arp = read_arp_table()
+    return {
+        "gateway": gateway,
+        "gateway_mac": arp.get(gateway) if gateway else None,
+        "ipv6_routers": get_ipv6_routers(),
+        "dns": get_dns_servers(),
+        "neighbours": sorted(arp),
+    }
+
+
+def diff_snapshots(old, new):
+    """Compare two snapshots into a list of {severity, kind, detail}.
+
+    Ordered by how directly the change redirects traffic. A changed gateway MAC
+    and a new IPv6 router are the two that mean someone is already in the path.
+    """
+    events = []
+    if not old:
+        return events
+
+    if old.get("gateway") != new.get("gateway"):
+        events.append({
+            "severity": "HIGH", "kind": "gateway_changed",
+            "detail": f"Default gateway changed from {old.get('gateway')} to "
+                      f"{new.get('gateway')}."})
+
+    old_mac, new_mac = old.get("gateway_mac"), new.get("gateway_mac")
+    if old_mac and new_mac and old_mac != new_mac:
+        events.append({
+            "severity": "HIGH", "kind": "gateway_mac_changed",
+            "detail": f"The gateway's MAC changed from {old_mac} to {new_mac} while "
+                      "its IP stayed the same. That is what ARP poisoning looks "
+                      "like — someone may now be between this machine and the router."})
+
+    appeared = [r for r in new.get("ipv6_routers", []) if r not in old.get("ipv6_routers", [])]
+    if appeared:
+        events.append({
+            "severity": "HIGH", "kind": "ipv6_router_appeared",
+            "detail": f"New IPv6 router advertising: {', '.join(appeared)}. A rogue "
+                      "Router Advertisement reroutes traffic with no IPv4 sign."})
+
+    if set(old.get("dns", [])) != set(new.get("dns", [])):
+        events.append({
+            "severity": "HIGH", "kind": "dns_changed",
+            "detail": f"DNS resolvers changed from {old.get('dns')} to {new.get('dns')}."})
+
+    new_neighbours = [n for n in new.get("neighbours", []) if n not in old.get("neighbours", [])]
+    if new_neighbours:
+        events.append({
+            "severity": "REVIEW", "kind": "neighbour_appeared",
+            "detail": f"New device(s) on the LAN: {', '.join(new_neighbours)}."})
+
+    return events
+
+
+def resolve_alert_sink(explicit=None):
+    return explicit or os.environ.get(ALERT_ENV) or None
+
+
+def send_alert(event, destination=None, token=None):
+    """Deliver one event off the machine.
+
+    Printing to a terminal on the host under suspicion delivers the alert
+    straight to the adversary and nowhere else, so monitor mode is only worth
+    running with somewhere for these to go. Returns the same {published, detail}
+    shape as publish_receipt and likewise never raises.
+    """
+    destination = resolve_alert_sink(destination)
+    if not destination:
+        return {"published": False,
+                "detail": "No alert destination configured; the event stayed on "
+                          "this machine."}
+    payload = dict(event, at=datetime.now(timezone.utc).isoformat())
+    try:
+        if destination.startswith(("http://", "https://")):
+            return _publish_https(payload, destination,
+                                  token or os.environ.get(SINK_TOKEN_ENV), "alert")
+        return _publish_path(payload, destination, "alert")
+    except Exception as e:                      # noqa: BLE001 - reported, not raised
+        return {"published": False,
+                "detail": f"Could not deliver the alert to {destination}: {e}"}
+
+
+def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
+                sleeper=time.sleep, printer=print):
+    """Poll the cheap checks and alert on change.
+
+    `iterations=None` runs until interrupted; a number bounds it, which is what
+    makes this testable without waiting. Returns every event raised.
+    """
+    previous = None
+    raised = []
+    count = 0
+    printer(f"Monitoring every {interval}s. Watching the gateway, its MAC, IPv6 "
+            "routers, DNS and the neighbour table.")
+    if not resolve_alert_sink(alert_to):
+        printer("  Note: no alert destination set. Findings will print here only — "
+                f"set {ALERT_ENV} so they leave this machine.")
+    try:
+        while iterations is None or count < iterations:
+            snapshot = monitor_snapshot()
+            for event in diff_snapshots(previous, snapshot):
+                raised.append(event)
+                printer(f"  [{event['severity']:6}] {event['detail']}")
+                result = send_alert(event, alert_to)
+                if not result["published"]:
+                    printer(f"           (not delivered: {result['detail']})")
+            previous = snapshot
+            count += 1
+            if iterations is None or count < iterations:
+                sleeper(interval)
+    except KeyboardInterrupt:
+        printer("\nStopped.")
+    return raised
 
 
 def describe_receipt_status(report):
@@ -3248,6 +3389,15 @@ def main():
                          "NOT read-only and can trigger router lockout; off by default.")
     ap.add_argument("--html-report", action="store_true",
                     help="Save an HTML report after the audit")
+    ap.add_argument("--monitor", action="store_true",
+                    help="Run continuously, polling the cheap high-signal checks and "
+                         "alerting on change. This is the only mode that can catch a "
+                         "rogue RA or ARP poisoning that is withdrawn between scans.")
+    ap.add_argument("--interval", type=int, default=MONITOR_INTERVAL, metavar="SECONDS",
+                    help=f"Seconds between monitor polls (default {MONITOR_INTERVAL}).")
+    ap.add_argument("--alert-to", metavar="DEST",
+                    help="Where monitor alerts go — a path or https:// URL off this "
+                         f"machine. Or set {ALERT_ENV}.")
     ap.add_argument("--publish-to", metavar="DEST",
                     help="Append a receipt for each run to a path or https:// URL the "
                          "audited host cannot rewrite, so a wiped local history is "
@@ -3264,8 +3414,12 @@ def main():
         args.full, args.no_vendors, args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
-        args.seal_baseline, args.publish_to,
+        args.seal_baseline, args.publish_to, args.monitor,
     ])
+
+    if args.monitor:
+        run_monitor(interval=args.interval, alert_to=args.alert_to)
+        return
 
     if not cli_args_given or args.menu:
         interactive_menu()
