@@ -718,6 +718,14 @@ def lookup_vendor(mac):
 
 
 def check_tls(host, port=443):
+    """Fingerprint the certificate rather than just noting one exists.
+
+    The DER bytes were already being fetched and thrown away — only their
+    length was kept, which detects nothing. Hashing them turns this into
+    interception detection for free: the router's admin certificate is
+    self-signed and stable, so a changed fingerprint between runs means
+    something re-issued it or something is answering in its place.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -725,9 +733,97 @@ def check_tls(host, port=443):
         with socket.create_connection((host, port), timeout=3) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as ss:
                 der = ss.getpeercert(binary_form=True)
-                return {"present": True, "cert_bytes": len(der) if der else 0}
+                if not der:
+                    return {"present": True, "sha256": None, "cert_bytes": 0}
+                return {"present": True,
+                        "sha256": hashlib.sha256(der).hexdigest(),
+                        "cert_bytes": len(der)}
     except Exception:
-        return {"present": False}
+        return {"present": False, "sha256": None}
+
+
+# ---------------------------------------------------------------------------
+# Interception detection
+# ---------------------------------------------------------------------------
+
+def check_trust_store():
+    """List admin-added trust settings on macOS.
+
+    A clean Mac has none: `security dump-trust-settings -d` prints a "No Trust
+    Settings" line and nothing else. Installing a root CA is how TLS
+    interception is set up in practice, so anything here is worth reading —
+    this is one of very few endpoint signals that is both cheap and unambiguous.
+
+    Host-posture, so it is macOS-only by the same rule as the firewall and
+    sharing checks: on an observer it would describe the wrong machine.
+    """
+    if sys.platform != "darwin":
+        return {"supported": False, "entries": [], "risk": "INFO",
+                "note": "Trust-store inspection is macOS-only; skipped here."}
+
+    out = run(["security", "dump-trust-settings", "-d"], timeout=10)
+    if not out.strip():
+        return {"supported": True, "entries": [], "risk": "REVIEW",
+                "note": "Could not read the admin trust settings."}
+    if "no trust settings" in out.lower():
+        return {"supported": True, "entries": [], "risk": "OK",
+                "note": "No admin-added trust settings — the expected state."}
+
+    entries = [ln.strip() for ln in out.splitlines()
+               if ln.strip().lower().startswith("cert ")]
+    return {"supported": True, "entries": entries, "risk": "HIGH",
+            "note": f"{len(entries) or 'Some'} admin-added trust setting(s) present. "
+                    "A root certificate installed here lets whoever holds its key "
+                    "read TLS traffic from this machine without a warning. Confirm "
+                    "every one of these is yours."}
+
+
+def build_dns_query(name="example.com", qid=0x4a4a):
+    """A minimal DNS A query. Hand-built because the tool takes no dependencies."""
+    header = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(p)]) + p.encode("ascii")
+                     for p in name.split(".")) + b"\x00"
+    return header + qname + struct.pack("!HH", 1, 1)
+
+
+def probe_dns_interception(target="192.0.2.1", timeout=2):
+    """Ask a resolver that cannot exist and see whether anything answers.
+
+    192.0.2.1 is TEST-NET-1 (RFC 5737) — reserved for documentation and routed
+    nowhere. A DNS query sent there must time out. If something replies, a
+    device on the path is transparently answering port 53 regardless of what
+    the resolver configuration says, which is exactly the case reading
+    `scutil --dns` cannot reveal.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(build_dns_query(), (target, 53))
+        data, addr = sock.recvfrom(512)
+    except (socket.timeout, OSError):
+        return {"intercepted": False, "responder": None, "risk": "OK",
+                "note": f"No answer from {target}, which is the correct result — "
+                        "port 53 is not being transparently redirected."}
+    finally:
+        sock.close()
+
+    return {"intercepted": True, "responder": addr[0], "risk": "HIGH",
+            "note": f"{addr[0]} answered a DNS query addressed to {target}, an "
+                    "address reserved for documentation that routes nowhere. "
+                    "Something on the path is intercepting port 53, so the "
+                    "configured resolvers are not the ones being used."}
+
+
+def action_interception_checks():
+    hr("INTERCEPTION CHECKS")
+    trust = check_trust_store()
+    print(f"  [{trust['risk']:6}] Trust store: {trust['note']}")
+    for entry in trust["entries"]:
+        print(f"           {entry}")
+
+    dns = probe_dns_interception()
+    print(f"  [{dns['risk']:6}] DNS path  : {dns['note']}")
+    return {"trust_store": trust, "dns_interception": dns}
 
 
 # ---------------------------------------------------------------------------
@@ -1348,6 +1444,15 @@ def diff_baseline(old, new):
         notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
     if old_ports - new_ports:
         notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
+    old_cert = (old.get("router_tls") or {}).get("sha256")
+    new_cert = (new.get("router_tls") or {}).get("sha256")
+    if old_cert and new_cert and old_cert != new_cert:
+        notes.append(
+            "Router TLS certificate CHANGED: "
+            f"{old_cert[:16]}… -> {new_cert[:16]}…. The admin certificate is "
+            "self-signed and stable, so this means it was re-issued or something "
+            "is answering in the router's place.")
+
     old_ra = set(old.get("ipv6_routers", []))
     new_ra = set(new.get("ipv6_routers", []))
     if new_ra - old_ra:
@@ -2805,7 +2910,10 @@ def audit_host(label, host, full_scan=False):
             p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
     tls = check_tls(host)
-    print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
+    if tls.get("sha256"):
+        print(f"  HTTPS (TLS) certificate: present, sha256 {tls['sha256'][:16]}…")
+    else:
+        print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
     if open_ports and 80 in open_ports and 443 not in open_ports:
         print("  Note: port 80 open without 443. App-managed mesh systems")
         print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
@@ -3057,6 +3165,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     hr("ROUTER / GATEWAY PORT SCAN")
     if gateway:
         state["router_open_ports"] = audit_host("default gateway", gateway, full_scan)
+        state["router_tls"] = check_tls(gateway)
     if upstream_ip:
         hr("UPSTREAM MODEM")
         state["upstream_open_ports"] = audit_host("upstream modem", upstream_ip, full_scan)
@@ -3123,6 +3232,8 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     arp = action_arp_spoof_check()
     state["arp_spoof"] = arp
+
+    state["interception"] = action_interception_checks()
 
     ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
     state["ipv6"] = ra
