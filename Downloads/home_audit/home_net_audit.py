@@ -36,6 +36,8 @@ Acronyms used below:
 
 import argparse
 import concurrent.futures as futures
+import hashlib
+import hmac
 import html
 import ipaddress
 import json
@@ -46,6 +48,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -57,8 +60,19 @@ from datetime import datetime, timezone
 
 BASELINE_DIR = os.path.expanduser("~/.home_net_audit")
 BASELINE_FILE = os.path.join(BASELINE_DIR, "baseline.json")
+HISTORY_FILE  = os.path.join(BASELINE_DIR, "history.jsonl")
 LABELS_FILE   = os.path.join(BASELINE_DIR, "labels.json")
 NETWORKS_FILE = os.path.join(BASELINE_DIR, "networks.json")
+
+# Baseline record format. 1 = the original bare state dict with no integrity
+# data at all; 2 = the sealed, chained record written by save_baseline below.
+BASELINE_FORMAT = 2
+KDF_ITERATIONS = 200_000
+
+# Environment variable holding the baseline passphrase for unattended runs.
+# Less safe than being prompted — it is readable by anything in the process's
+# environment — but far better than leaving the baseline unauthenticated.
+PASSPHRASE_ENV = "HOME_NET_AUDIT_PASSPHRASE"
 
 # Default named networks. Stored/overridden in ~/.home_net_audit/networks.json.
 # Format: {"192.168.1.0/24": "loveshack", "192.168.87.0/24": "pearl"}
@@ -378,18 +392,261 @@ def check_tls(host, port=443):
 # Baseline
 # ---------------------------------------------------------------------------
 
-def load_baseline():
+def canonical_json(obj):
+    """Deterministic serialisation, so a digest over the same state is stable.
+
+    Sorted keys and fixed separators: without this, two runs producing an
+    identical state could serialise differently and the seal would appear
+    broken for no reason.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
+
+
+def derive_baseline_key(passphrase, salt, iterations=KDF_ITERATIONS):
+    """Stretch a passphrase into a MAC key. PBKDF2 is in the standard library,
+    which is the binding constraint here — the tool takes no dependencies."""
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iterations)
+
+
+def seal_payload(payload, key=None):
+    """Return the hex digest that authenticates `payload`.
+
+    With a key this is an HMAC and cannot be recomputed by someone who does not
+    hold the passphrase. Without a key it is a bare SHA-256: enough to catch a
+    truncated write, accidental corruption or a careless edit, but NOT a
+    deliberate attacker, who can simply recompute it after changing the state.
+
+    Those two cases are labelled differently everywhere they surface. An
+    unkeyed baseline that silently claimed to be "verified" would be worse than
+    no integrity checking at all, because it would be believed.
+    """
+    blob = canonical_json(payload)
+    if key is None:
+        return hashlib.sha256(blob).hexdigest()
+    return hmac.new(key, blob, hashlib.sha256).hexdigest()
+
+
+def _secure_dir():
+    os.makedirs(BASELINE_DIR, exist_ok=True)
+    try:
+        # The baseline holds MAC addresses, topology and, if the probe was run,
+        # which credentials were accepted. Other local accounts have no business
+        # reading it.
+        os.chmod(BASELINE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _write_json_atomic(path, obj, mode=0o600):
+    """Write via a temp file and rename, so a crash cannot truncate the file.
+
+    The previous implementation opened the real path with "w", which empties it
+    before writing. A crash mid-write left an empty baseline — indistinguishable
+    from never having had one.
+    """
+    _secure_dir()
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_history():
+    """Return the append-only chain of past baseline seals, oldest first."""
+    entries = []
+    try:
+        with open(HISTORY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        return []
+    return entries
+
+
+def _append_history(entry):
+    _secure_dir()
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(HISTORY_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def resolve_passphrase(prompt=False):
+    """Find the baseline passphrase, or None if the user has not set one up.
+
+    Checked in order: the environment variable, then an interactive prompt when
+    the caller asks for one. Never read from disk — a key stored beside the
+    thing it authenticates protects nothing.
+    """
+    env = os.environ.get(PASSPHRASE_ENV)
+    if env:
+        return env
+    if prompt and sys.stdin.isatty():
+        import getpass
+        entered = getpass.getpass(
+            "Baseline passphrase (blank to leave the baseline unauthenticated): ")
+        return entered or None
+    return None
+
+
+def save_baseline(state, passphrase=None):
+    """Seal `state` into the baseline and extend the tamper-evidence chain.
+
+    Returns the record that was written. Passing no passphrase still chains and
+    seals, but with a bare hash rather than an HMAC — see seal_payload.
+    """
+    history = read_history()
+    prev = history[-1]["seal"] if history else None
+    seq = (history[-1]["seq"] + 1) if history else 1
+
+    record = {
+        "format": BASELINE_FORMAT,
+        "seq": seq,
+        "prev": prev,
+        "keyed": passphrase is not None,
+        "state": state,
+    }
+    key = None
+    if passphrase is not None:
+        salt = os.urandom(16)
+        record["kdf"] = {"salt": salt.hex(), "iterations": KDF_ITERATIONS}
+        key = derive_baseline_key(passphrase, salt)
+
+    record["seal"] = seal_payload({k: v for k, v in record.items() if k != "seal"}, key)
+
+    _write_json_atomic(BASELINE_FILE, record)
+    _append_history({
+        "seq": seq,
+        "seal": record["seal"],
+        "keyed": record["keyed"],
+        "ts": state.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+    })
+    return record
+
+
+def load_baseline_record():
+    """Return the raw baseline record, whatever format it is in, or None."""
     try:
         with open(BASELINE_FILE) as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 
 
-def save_baseline(state):
-    os.makedirs(BASELINE_DIR, exist_ok=True)
-    with open(BASELINE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def load_baseline(passphrase=None):
+    """Return the saved audit state, or None.
+
+    Kept returning the bare state dict so every existing caller is unaffected;
+    integrity is reported separately by verify_baseline. A record that fails
+    verification is still returned — refusing to diff would hand an attacker a
+    denial of service, and the caller is expected to surface the warning.
+    """
+    record = load_baseline_record()
+    if record is None:
+        return None
+    if isinstance(record, dict) and record.get("format") == BASELINE_FORMAT:
+        return record.get("state")
+    return record  # legacy format 1: the bare state dict
+
+
+def verify_baseline(passphrase=None):
+    """Check the baseline's seal and its position in the chain.
+
+    Returns {status, keyed, detail}. Statuses:
+      absent        no baseline saved yet
+      legacy        pre-integrity baseline; nothing to verify
+      ok            seal recomputes and the chain agrees
+      unverifiable  sealed with a passphrase that was not supplied
+      modified      the seal does not match the contents
+      rolled_back   valid record, but older than the chain has already recorded
+      chain_missing the record claims history that is not there
+    """
+    record = load_baseline_record()
+    if record is None:
+        return {"status": "absent", "keyed": False,
+                "detail": "No baseline saved yet."}
+    if not isinstance(record, dict) or record.get("format") != BASELINE_FORMAT:
+        return {"status": "legacy", "keyed": False,
+                "detail": "Baseline predates integrity checking and is unauthenticated. "
+                          "Re-save it to start a verifiable chain."}
+
+    keyed = bool(record.get("keyed"))
+    if keyed and passphrase is None:
+        return {"status": "unverifiable", "keyed": True,
+                "detail": "Baseline is sealed with a passphrase; supply it to verify."}
+
+    key = None
+    if keyed:
+        kdf = record.get("kdf") or {}
+        try:
+            salt = bytes.fromhex(kdf.get("salt", ""))
+        except ValueError:
+            return {"status": "modified", "keyed": True,
+                    "detail": "Key derivation parameters are malformed."}
+        key = derive_baseline_key(passphrase, salt,
+                                  kdf.get("iterations", KDF_ITERATIONS))
+
+    expected = seal_payload({k: v for k, v in record.items() if k != "seal"}, key)
+    if not hmac.compare_digest(expected, str(record.get("seal", ""))):
+        return {"status": "modified", "keyed": keyed,
+                "detail": "The baseline's contents do not match its seal. It has been "
+                          "altered since it was written."}
+
+    history = read_history()
+    if not history:
+        if record.get("seq", 1) > 1:
+            return {"status": "chain_missing", "keyed": keyed,
+                    "detail": "The baseline references earlier runs but the history "
+                              "file is gone. It may have been removed to hide a change."}
+    else:
+        last = history[-1]
+        if record.get("seq") != last.get("seq") or record.get("seal") != last.get("seal"):
+            return {"status": "rolled_back", "keyed": keyed,
+                    "detail": f"The baseline is at run {record.get('seq')} but the chain "
+                              f"has reached run {last.get('seq')}. An older baseline may "
+                              "have been put back in place."}
+
+    detail = ("Seal verified with your passphrase." if keyed else
+              "Hash chain intact. Note this is unkeyed: it catches corruption and "
+              "careless edits, not an attacker who can recompute it. Set a "
+              "passphrase to make the baseline forgery-resistant.")
+    return {"status": "ok", "keyed": keyed, "detail": detail}
+
+
+def describe_baseline_integrity(report):
+    """One risk-tagged line for the terminal, matching the audit's own style."""
+    risk = {
+        "ok": "OK" if report.get("keyed") else "REVIEW",
+        "absent": "INFO",
+        "legacy": "REVIEW",
+        "unverifiable": "REVIEW",
+        "modified": "HIGH",
+        "rolled_back": "HIGH",
+        "chain_missing": "HIGH",
+    }.get(report.get("status"), "REVIEW")
+    return f"  [{risk:6}] Baseline integrity: {report.get('detail', '')}"
 
 
 def load_labels():
@@ -2097,8 +2354,12 @@ def action_save_baseline(state):
         print("No data collected in this session yet.")
         print("Run a Full Audit or individual checks first, then save.")
         return
-    save_baseline(state)
+    passphrase = resolve_passphrase(prompt=True)
+    save_baseline(state, passphrase=passphrase)
     print(f"Baseline saved to {BASELINE_FILE}")
+    if passphrase is None:
+        print("  Note: saved unsealed. Set a passphrase (or "
+              f"{PASSPHRASE_ENV}) so the baseline cannot be silently rewritten.")
     print(f"Timestamp: {state.get('timestamp', '?')}")
     keys = [k for k in state if k != "timestamp"]
     print(f"Saved sections: {', '.join(keys)}")
@@ -2106,6 +2367,7 @@ def action_save_baseline(state):
 
 def action_compare_baseline(state):
     hr("CHANGE DETECTION (vs saved baseline)")
+    print(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
     old = load_baseline()
     if not old:
         print("No baseline saved yet.")
@@ -2236,6 +2498,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     # Baseline comparison
     hr("CHANGE DETECTION (vs saved baseline)")
+    print(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
     old = load_baseline()
     if old:
         changes = diff_baseline(old, state)
@@ -2465,6 +2728,9 @@ def main():
                          "NOT read-only and can trigger router lockout; off by default.")
     ap.add_argument("--html-report", action="store_true",
                     help="Save an HTML report after the audit")
+    ap.add_argument("--seal-baseline", action="store_true",
+                    help="Prompt for a passphrase and seal the baseline with it, so "
+                         f"it cannot be rewritten unnoticed. Or set {PASSPHRASE_ENV}.")
     ap.add_argument("--menu", action="store_true",
                     help="Force interactive menu")
     args = ap.parse_args()
@@ -2474,6 +2740,7 @@ def main():
         args.full, args.no_vendors, args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
+        args.seal_baseline,
     ])
 
     if not cli_args_given or args.menu:
@@ -2525,8 +2792,12 @@ def main():
         print("\nSkipping baseline save: gateway could not be determined, so this "
               "scan is incomplete and would corrupt change detection.")
     else:
-        save_baseline(state)
+        passphrase = resolve_passphrase(prompt=args.seal_baseline)
+        save_baseline(state, passphrase=passphrase)
         print(f"\nBaseline saved to {BASELINE_FILE}")
+        if passphrase is None:
+            print(f"Note: saved unsealed. Use --seal-baseline or set "
+                  f"{PASSPHRASE_ENV} to make it tamper-evident.")
 
     if args.html_report:
         path = generate_html_report(state)

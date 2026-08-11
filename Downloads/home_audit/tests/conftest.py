@@ -109,9 +109,16 @@ def sandbox(monkeypatch, tmp_path):
     # attributes is enough to redirect every load_*/save_* helper.
     data_dir = tmp_path / "home_net_audit_data"
     monkeypatch.setattr(hna, "BASELINE_DIR", str(data_dir))
-    monkeypatch.setattr(hna, "BASELINE_FILE", str(data_dir / "baseline.json"))
-    monkeypatch.setattr(hna, "LABELS_FILE", str(data_dir / "labels.json"))
-    monkeypatch.setattr(hna, "NETWORKS_FILE", str(data_dir / "networks.json"))
+
+    # Redirect every *_FILE path constant by name rather than listing them.
+    # Listing them meant that adding HISTORY_FILE to the module left it pointing
+    # at the real ~/.home_net_audit while every test looked like it passed; the
+    # write only failed because that directory happened not to exist.
+    # test_scaffold asserts this covers the module completely.
+    for attr in dir(hna):
+        if attr.endswith("_FILE") and isinstance(getattr(hna, attr), str):
+            basename = os.path.basename(getattr(hna, attr))
+            monkeypatch.setattr(hna, attr, str(data_dir / basename))
 
     # Anything that still resolves ~ lands in the tmp dir rather than $HOME.
     monkeypatch.setenv("HOME", str(tmp_path))
