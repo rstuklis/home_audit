@@ -1,0 +1,1 @@
+fe80::1%en0 if=en0, flags=O, pref=medium, expire=29m30s
