@@ -44,7 +44,7 @@ COMMANDS = {
     # name column is then full of the LAN's device names.
     "arp_a_typical":            ["arp", "-a"],
     "ndp_a":                    ["ndp", "-an"],
-    "ndp_r":                    ["ndp", "-r"],
+    "ndp_r":                    ["ndp", "-rn"],
     "lsof_tcp_listen":          ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
     "lsof_udp":                 ["lsof", "-nP", "-iUDP"],
     "netstat_anp_tcp":          ["netstat", "-anp", "tcp"],
@@ -119,6 +119,53 @@ class Redactor:
         self.ssids = {}
         self.users = {}
         self.domains = {}
+        self.collapsed = {}      # truncated spelling -> full spelling
+        self.ambiguous = set()   # truncated-looking, but no unique full form
+
+    # netstat pads its Destination and Gateway columns to a fixed width and
+    # cuts anything longer, so a link-local that ifconfig prints in full comes
+    # back from the routing table with its tail missing. Below this many
+    # characters a token is far more likely to be a genuinely short address
+    # than a cut one, and guessing there would collapse real distinct hosts.
+    TRUNCATION_FLOOR = 12
+
+    def _full_form_of(self, real):
+        """The one known address `real` looks like a truncation of, or None.
+
+        Ambiguity is not resolved by picking: 'fe80::1' is a string prefix of
+        'fe80::1465:426a:443:4ac2%en0' without being a truncation of it, and
+        collapsing those would merge two hosts into one. A unique match is
+        treated as truncation; anything else is left alone and reported.
+        """
+        addr, _, zone = real.partition("%")
+        if zone or len(addr) < self.TRUNCATION_FLOOR:
+            return None
+        hits = [k for k in self.v6
+                if k.partition("%")[0].startswith(addr)
+                and len(k.partition("%")[0]) > len(addr)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            self.ambiguous.add(real)
+        return None
+
+    def prime(self, texts):
+        """Learn every address's longest spelling before substituting any.
+
+        Order decides correlation. Met in file order, the full spelling and the
+        truncated one are two unrelated strings and become two unrelated fake
+        hosts, so the routing table can no longer be lined up against the
+        interface list — and cross-table agreement is most of what these
+        fixtures are for. Registering longest-first means the truncated form
+        arrives to find its own full form already known.
+        """
+        seen = set()
+        for text in texts:
+            for m in TOKEN_RE.finditer(text):
+                if m.lastgroup == "v6":
+                    seen.add(m.group(0))
+        for token in sorted(seen, key=len, reverse=True):
+            self._v6(token)
 
     # -- address-shaped tokens ------------------------------------------
 
@@ -128,6 +175,19 @@ class Redactor:
         # and parsers key off them (arp lists ff:ff:... for the broadcast row).
         if real.startswith(("ff:ff", "01:00:5e", "1:0:5e", "33:33")):
             return real
+        # The all-zeros link-layer address is a sentinel, not a device: arp and
+        # ndp print it for a neighbour that never answered. Substituting it
+        # invents a resolved host where the machine reported an unresolved one,
+        # and the parsers' "skip the incomplete rows" arms stop being reached.
+        if set(real.split(":")) == {"0"} or set(real.split(":")) == {"00"}:
+            return real
+        # arp and ndp print an octet under 0x10 unpadded ("ac:de:48:0:11:22")
+        # where ifconfig pads it ("ac:de:48:00:11:22"). Same NIC, two spellings
+        # — and keying on the spelling gave one interface two fake identities,
+        # which is the exact cross-table incoherence this class promises not to
+        # produce. The audit has _normalise_mac for this; key on the same shape.
+        key = ":".join(o.zfill(2) for o in real.split(":"))
+        real = key
         if real not in self.macs:
             n = len(self.macs) + 1
             # Keep the locally-administered bit: a randomised MAC looks
@@ -152,9 +212,26 @@ class Redactor:
             return real
         if parsed.is_multicast or parsed.is_loopback or parsed.is_unspecified:
             return real          # ff02::1, ::1, :: are constants the checks read
+        # fe80:: with an all-zeros interface identifier is RFC 4291's
+        # Subnet-Router anycast placeholder — no host holds it. It is how ndp
+        # reports "a default route exists on this tunnel" and how netstat
+        # prints an on-link prefix route, and parse_ndp_routers drops exactly
+        # these so a VPN's utun entries are not read as phantom routers.
+        # Giving it a host part converts every placeholder into a router the
+        # parser is then obliged to keep, so a fixture redacted this way
+        # asserts the precise opposite of the behaviour that was shipped.
+        if parsed.is_link_local and parsed.packed[8:] == b"\x00" * 8:
+            return real
         if parsed.compressed in PRESERVED_DNS:
             return real
         if real not in self.v6:
+            full = self._full_form_of(real)
+            if full is not None:
+                # Same interface, spelled short by a narrow column. One
+                # identity, so the tables still agree with each other.
+                self.collapsed[real] = full
+                self.v6[real] = self.v6[full]
+                return self.v6[real]
             n = len(self.v6) + 1
             # A link-local interface ID is derived from the MAC, so it names
             # the hardware — but the fe80:: prefix is what marks it as a
@@ -325,7 +402,25 @@ class Redactor:
         lines = []
         for label, mapping in groups:
             for real, fake in mapping.items():
+                if real == fake:
+                    continue     # a value mapped to itself was not substituted
                 lines.append("  %-14s %s -> %s" % (label, real, fake))
+        return lines
+
+    def warnings(self):
+        """Things the reader has to adjudicate, because the tool cannot.
+
+        Kept apart from the substitution list: that list is checked for wrong
+        entries, this one is where the tool says which entries it is unsure of.
+        """
+        lines = []
+        for short, full in self.collapsed.items():
+            lines.append("  column-truncated %s treated as %s (now one host)"
+                         % (short, full))
+        for short in sorted(self.ambiguous):
+            lines.append("  %s looks truncated but matches several addresses "
+                         "— left as its own host, check it is not a duplicate"
+                         % short)
         return lines
 
 
@@ -367,11 +462,23 @@ def main(argv=None):
     redactor = None if args.raw else Redactor()
     written, notes = 0, []
 
+    captured = []
     for name, cmd in COMMANDS.items():
         text, note = capture(name, cmd)
         if text is None:
             notes.append("  %-28s %s" % (name, note))
             continue
+        captured.append((name, text))
+
+    if redactor:
+        # Read every file before rewriting any of them. An address's full
+        # spelling can live in a file captured after the one that truncates
+        # it, and whichever spelling is met first is the one that gets an
+        # identity — so substituting as we go makes correlation depend on the
+        # order this dict happens to be written in.
+        redactor.prime(t for _, t in captured)
+
+    for name, text in captured:
         if redactor:
             text = redactor.apply(name, text)
         path = os.path.join(args.out, name + ".out")
@@ -391,6 +498,10 @@ def main(argv=None):
             print("\nsubstitutions made (check these — a wrong one means a "
                   "corrupted fixture, a missing one means a leak):")
             print("\n".join(mapping))
+        flags = redactor.warnings()
+        if flags:
+            print("\njudgement calls (the tool could not decide these alone):")
+            print("\n".join(flags))
         print("\nStill real, on purpose: RFC1918 addresses, process names, "
               "hardware models, country codes.")
     else:

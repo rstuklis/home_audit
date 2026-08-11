@@ -561,3 +561,100 @@ class TestCaptureContract:
         monkeypatch.setattr(cap.sys, "platform", "linux")
         assert cap.main([]) == 1
         assert "Mac" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Sentinels, spellings and truncation
+#
+# Every case below came out of the first capture on a real Mac. The summary
+# the tool printed was the only thing that surfaced them: each one produces a
+# fixture that parses cleanly, looks like plausible macOS output, and asserts
+# something the machine never said.
+# ---------------------------------------------------------------------------
+
+class TestSentinelsSurvive:
+    """Some address-shaped strings are protocol constants, and the parsers
+    read them as constants. Redacting those does not protect anybody — it
+    edits the meaning of the row."""
+
+    def test_the_vpn_placeholder_keeps_its_empty_interface_id(self, red):
+        """The one that would have reverted a shipped fix.
+
+        `ndp -rn` prints `fe80::%utun0` for a tunnel that carries a default
+        route but has no router to name, and parse_ndp_routers drops exactly
+        those — that is what stops every VPN user being told they have four
+        routers. Redacted to `fe80::1%utun0` the placeholder becomes a host
+        the parser must keep, so a fixture built this way would have tested
+        for the behaviour that was just removed.
+        """
+        assert red.addresses("fe80::%utun0") == "fe80::%utun0"
+
+    def test_tunnel_placeholders_still_drop_after_redaction(self, mod, red):
+        raw = ("fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never\n"
+               "fe80::%utun1 if=utun1, flags=IST, pref=medium, expire=Never\n"
+               "fe80::1465:426a:443:4ac2%en0 if=en0, flags=O, pref=medium\n")
+        before = mod.parse_ndp_routers(raw)
+        after = mod.parse_ndp_routers(red.addresses(raw))
+        assert len(before) == 1, "fixture wrong; the comparison would be vacuous"
+        assert len(after) == len(before)
+
+    def test_the_unresolved_neighbour_marker_is_not_given_a_vendor(self, red):
+        """arp and ndp print an all-zero link-layer address for a neighbour
+        that never answered. Turned into an Apple-OUI MAC it reads as a host
+        that resolved, and the parsers' skip-the-incomplete-row arms — some of
+        the least covered code in the project — stop being reached at all."""
+        assert red.addresses("0:0:0:0:0:0") == "0:0:0:0:0:0"
+        assert red.addresses("00:00:00:00:00:00") == "00:00:00:00:00:00"
+
+
+class TestOneDeviceOneIdentity:
+    """The Redactor's docstring promises that a MAC seen in two tables becomes
+    one fake MAC, because the cross-table checks have nothing to find
+    otherwise. These are the two ways the first version broke that promise."""
+
+    def test_padded_and_unpadded_spellings_are_the_same_nic(self, red):
+        """ifconfig pads an octet below 0x10, arp and ndp do not. One NIC,
+        two spellings, and keying on the spelling gave it two identities."""
+        unpadded = red.addresses("ac:de:48:0:11:22")
+        padded = red.addresses("ac:de:48:00:11:22")
+        assert unpadded == padded
+
+    def test_a_column_truncated_address_is_not_a_second_host(self, red):
+        """netstat cuts an address to fit its column, so the link-local that
+        ifconfig prints in full arrives from the routing table with its tail
+        missing. Substituted independently the two spellings became two
+        unrelated hosts and the routing table could no longer be lined up
+        against the interface list."""
+        full = "fe80::1465:426a:443:4ac2%en0"
+        red.prime([full + "\n" + "fe80::1465:426a\n"])
+        assert red.addresses("fe80::1465:426a") == red.addresses(full)
+
+    def test_an_ambiguous_prefix_is_left_alone_rather_than_guessed(self, red):
+        """`fe80::1` is a string prefix of a dozen link-locals without being a
+        truncation of any of them, and collapsing it would merge real distinct
+        hosts. Below the column width the tool does not guess."""
+        red.prime(["fe80::1465:426a:443:4ac2%en0 fe80::1449:180f:e408:8ac7%en0"])
+        assert red.addresses("fe80::1") != red.addresses(
+            "fe80::1465:426a:443:4ac2%en0")
+
+
+class TestTheSummaryIsReadable:
+    """The mapping is the only thing standing between a real capture and a
+    public repository, so it is read by a person. What it says has to be
+    worth reading."""
+
+    def test_a_value_mapped_to_itself_is_not_called_a_substitution(self, red):
+        red.addresses("ff:ff:ff:ff:ff:ff")
+        assert not [ln for ln in red.report() if "ff:ff:ff:ff:ff:ff" in ln]
+
+    def test_a_collapsed_truncation_is_declared(self, red):
+        red.prime(["fe80::1465:426a:443:4ac2%en0\nfe80::1465:426a\n"])
+        assert any("truncated" in ln for ln in red.warnings())
+
+    def test_a_truncation_it_cannot_resolve_is_declared_too(self, red):
+        """Two hosts sharing a long prefix: the cut form could be either, so
+        the tool keeps it separate and says so, rather than picking one and
+        silently merging two devices into one."""
+        red.prime(["fe80::abcd:1234:5678:1111%en0 fe80::abcd:1234:5678:2222%en0"])
+        red.addresses("fe80::abcd:1234")
+        assert any("matches several" in ln for ln in red.warnings())

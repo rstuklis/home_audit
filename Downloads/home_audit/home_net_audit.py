@@ -489,7 +489,15 @@ def parse_ndp_neighbours(out):
 
 
 def parse_ndp_routers(out):
-    """macOS `ndp -r` -> 'fe80::1%en0 if=en0, flags=O, pref=medium, ...'.
+    """macOS `ndp -rn` -> 'fe80::1%en0 if=en0, flags=O, pref=medium, ...'.
+
+    The -n matters here for the same reason it matters for -a, and it was
+    missed when -a was fixed: without it ndp reverse-resolves every router
+    address it prints. On a Mac with six utun interfaces up, a real capture
+    took over 30 seconds and never finished. run() gives this call 10, so the
+    lookup does not merely slow the audit down — it returns "" every time, and
+    the router check silently falls through to its last-resort source on any
+    machine where the reverse lookups do not answer promptly.
 
     Entries whose interface identifier is all zeros are dropped. A Mac running
     a VPN has a default route on each tunnel, and ndp lists one line per
@@ -571,7 +579,7 @@ def get_ipv6_neighbours():
 
 def get_ipv6_routers():
     """Every address currently advertising itself as an IPv6 default router."""
-    routers = parse_ndp_routers(run(["ndp", "-r"]))
+    routers = parse_ndp_routers(run(["ndp", "-rn"]))
     if routers:
         return routers
     routers = parse_routes6_iproute(run(["ip", "-6", "route", "show", "default"]))
