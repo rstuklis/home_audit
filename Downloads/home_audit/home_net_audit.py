@@ -1444,6 +1444,18 @@ def diff_baseline(old, new):
         notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
     if old_ports - new_ports:
         notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
+    old_bssids = set(old.get("wifi_bssids", []))
+    new_bssids = set(new.get("wifi_bssids", []))
+    if new_bssids - old_bssids:
+        notes.append(
+            f"NEW access point advertising your SSID: {sorted(new_bssids - old_bssids)}. "
+            "A second AP broadcasting your network name is an evil twin.")
+
+    old_offer = (old.get("dhcp") or {}).get("responders") or []
+    new_offer = (new.get("dhcp") or {}).get("responders") or []
+    if old_offer and new_offer:
+        notes.extend(diff_dhcp_offer(old_offer[0], new_offer[0]))
+
     old_cert = (old.get("router_tls") or {}).get("sha256")
     new_cert = (new.get("router_tls") or {}).get("sha256")
     if old_cert and new_cert and old_cert != new_cert:
@@ -1637,6 +1649,90 @@ def _parse_connected_wifi_block(text):
     return None, ""
 
 
+def parse_wifi_networks(text):
+    """Return {ssid: [bssid, ...]} across every network system_profiler lists.
+
+    Covers the connected block and the 'Other Local Wi-Fi Networks' section
+    together, because an evil twin is precisely a second BSSID advertising the
+    SSID you are connected to.
+    """
+    networks = {}
+    ssid = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.endswith(":") and ":" not in stripped[:-1]:
+            candidate = stripped[:-1].strip()
+            if candidate and not candidate.endswith("Networks") \
+                    and not candidate.endswith("Information"):
+                ssid = candidate
+                networks.setdefault(ssid, [])
+            continue
+        m = re.match(r"BSSID:\s*(\S+)", stripped)
+        if m and ssid:
+            bssid = m.group(1).strip()
+            if bssid.lower() in ("<redacted>", "redacted"):
+                continue
+            raw = bssid.split(":")
+            if len(raw) == 6:
+                try:
+                    bssid = ":".join(f"{int(x, 16):02x}" for x in raw)
+                except ValueError:
+                    continue
+                if bssid not in networks[ssid]:
+                    networks[ssid].append(bssid)
+    return {k: v for k, v in networks.items() if v}
+
+
+def check_evil_twin(ssid=None, known=None):
+    """Flag a BSSID advertising your SSID that was not in the baseline.
+
+    Comparative for the same reason as rogue-RA detection: a mesh or a pair of
+    access points legitimately puts several BSSIDs behind one SSID, so a count
+    would alarm forever. What matters is a new one appearing.
+    """
+    out = run(["system_profiler", "SPAirPortDataType"], timeout=15) or ""
+    networks = parse_wifi_networks(out)
+    if ssid is None:
+        ssid, _ = _parse_connected_wifi_block(out)
+
+    if not ssid or ssid == "<redacted>":
+        return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
+                "note": "Could not read the connected SSID. system_profiler "
+                        "redacts Wi-Fi details unless the audit is run with sudo, "
+                        "so this check cannot run."}
+
+    bssids = networks.get(ssid, [])
+    if not bssids:
+        return {"ssid": ssid, "bssids": [], "unexpected": [], "risk": "REVIEW",
+                "note": f"No BSSID visible for {ssid} — run with sudo to reveal it."}
+
+    known = list(known or [])
+    unexpected = [b for b in bssids if b not in known] if known else []
+    if unexpected:
+        return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "HIGH",
+                "note": f"{ssid} is being advertised by {', '.join(unexpected)}, which "
+                        "was not in the baseline. A second access point broadcasting "
+                        "your network name is an evil twin — clients may associate "
+                        "with it instead of yours."}
+    return {"ssid": ssid, "bssids": bssids, "unexpected": [], "risk": "OK",
+            "note": f"{ssid} advertised by {len(bssids)} known BSSID(s)." if known
+                    else f"{ssid} advertised by {', '.join(bssids)}. No baseline yet — "
+                         "save one so a new access point would stand out."}
+
+
+def action_evil_twin(known=None):
+    hr("EVIL TWIN CHECK")
+    result = check_evil_twin(known=known)
+    print(f"  SSID   : {result['ssid'] or 'unknown'}")
+    for b in result["bssids"]:
+        flag = "  <-- not in baseline" if b in result["unexpected"] else ""
+        print(f"    {b}{flag}")
+    print(f"  [{result['risk']:6}] {result['note']}")
+    return result
+
+
 def check_wifi_security():
     """
     Report the connected Wi-Fi network's security mode from system_profiler.
@@ -1711,6 +1807,101 @@ def action_wifi_security():
 # NEW FEATURE 2: Rogue DHCP detector
 # ---------------------------------------------------------------------------
 
+def parse_dhcp_options(data):
+    """Split the option TLVs out of a DHCP packet into {code: bytes}.
+
+    Counting responders was never the whole story. A single, perfectly ordinary
+    DHCP server can hand out a poisoned gateway, resolver or static route, and
+    the count stays at one the entire time.
+    """
+    magic = data.find(b"\x63\x82\x53\x63")
+    if magic < 0:
+        return {}
+    options = {}
+    i = magic + 4
+    while i < len(data):
+        code = data[i]
+        if code == 255:                 # end
+            break
+        if code == 0:                   # pad
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            break
+        length = data[i + 1]
+        value = data[i + 2:i + 2 + length]
+        if len(value) < length:
+            break                       # truncated packet
+        options[code] = value
+        i += 2 + length
+    return options
+
+
+def _addresses(value):
+    return [socket.inet_ntoa(value[i:i + 4]) for i in range(0, len(value) - 3, 4)]
+
+
+def decode_classless_routes(value):
+    """RFC 3442 option 121 — the quiet traffic-redirect vector.
+
+    A static route pushed here reroutes a subnet without the attacker having to
+    win a DHCP race or touch the default gateway, so the network keeps looking
+    entirely normal. Encoding is a prefix width, that many significant octets
+    of destination, then a 4-byte gateway.
+    """
+    routes = []
+    i = 0
+    while i < len(value):
+        width = value[i]
+        i += 1
+        if width > 32:
+            break
+        octets = (width + 7) // 8
+        dest = value[i:i + octets]
+        i += octets
+        gateway = value[i:i + 4]
+        i += 4
+        if len(dest) < octets or len(gateway) < 4:
+            break
+        dest = dest + b"\x00" * (4 - octets)
+        routes.append(f"{socket.inet_ntoa(dest)}/{width} via {socket.inet_ntoa(gateway)}")
+    return routes
+
+
+def describe_dhcp_offer(data):
+    """The parts of an OFFER that decide where this machine's traffic goes."""
+    options = parse_dhcp_options(data)
+    described = {
+        "router": _addresses(options.get(3, b"")),
+        "dns": _addresses(options.get(6, b"")),
+        "static_routes": [],
+    }
+    for code in (121, 249):             # 249 is Microsoft's original of the same
+        if code in options:
+            described["static_routes"] = decode_classless_routes(options[code])
+            break
+    return described
+
+
+def diff_dhcp_offer(old, new):
+    """Compare two OFFERs. Any change here redirects traffic."""
+    notes = []
+    if not old:
+        return notes
+    for key, label in (("router", "gateway"), ("dns", "DNS servers")):
+        if old.get(key) and new.get(key) and old[key] != new[key]:
+            notes.append(f"DHCP is now handing out a different {label}: "
+                         f"{old[key]} -> {new[key]}.")
+    old_routes = set(old.get("static_routes", []))
+    new_routes = set(new.get("static_routes", []))
+    if new_routes - old_routes:
+        notes.append(
+            f"NEW DHCP static route(s): {sorted(new_routes - old_routes)}. A route "
+            "pushed this way redirects a subnet without changing the default "
+            "gateway, so nothing else about the network looks different.")
+    return notes
+
+
 def check_rogue_dhcp(timeout=4):
     """
     Send a DHCP (Dynamic Host Configuration Protocol) DISCOVER broadcast and
@@ -1777,7 +1968,8 @@ def check_rogue_dhcp(timeout=4):
                     offered_ip = "unknown"
                 # Avoid duplicates
                 if not any(r["ip"] == server_ip for r in responders):
-                    responders.append({"ip": server_ip, "offered_ip": offered_ip})
+                    responders.append({"ip": server_ip, "offered_ip": offered_ip,
+                                       **describe_dhcp_offer(data)})
             except socket.timeout:
                 break
             except OSError:
@@ -3234,6 +3426,10 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     state["arp_spoof"] = arp
 
     state["interception"] = action_interception_checks()
+
+    twin = action_evil_twin((load_baseline() or {}).get("wifi_bssids"))
+    state["evil_twin"] = twin
+    state["wifi_bssids"] = twin["bssids"]
 
     ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
     state["ipv6"] = ra
