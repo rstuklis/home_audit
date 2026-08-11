@@ -79,6 +79,11 @@ KDF_ITERATIONS = 200_000
 # environment — but far better than leaving the baseline unauthenticated.
 PASSPHRASE_ENV = "HOME_NET_AUDIT_PASSPHRASE"
 
+# Where to copy each sealed baseline so the audited host cannot rewrite its own
+# history. A path (local, mounted share, external disk) or an https:// URL.
+SINK_ENV = "HOME_NET_AUDIT_SINK"
+SINK_TOKEN_ENV = "HOME_NET_AUDIT_SINK_TOKEN"
+
 # Default named networks. Stored/overridden in ~/.home_net_audit/networks.json.
 # Format: {"192.168.1.0/24": "loveshack", "192.168.87.0/24": "pearl"}
 DEFAULT_NETWORKS = {
@@ -678,8 +683,11 @@ def save_baseline(state, passphrase=None):
         key = derive_baseline_key(passphrase, salt)
 
     record["seal"] = seal_payload({k: v for k, v in record.items() if k != "seal"}, key)
+    # Anything added after this line is runtime status, not sealed content, and
+    # must never be written to disk or it would break its own seal.
 
     _write_json_atomic(BASELINE_FILE, record)
+    record["_receipt"] = publish_receipt(record)
     _append_history({
         "seq": seq,
         "seal": record["seal"],
@@ -776,6 +784,166 @@ def verify_baseline(passphrase=None):
               "careless edits, not an attacker who can recompute it. Set a "
               "passphrase to make the baseline forgery-resistant.")
     return {"status": "ok", "keyed": keyed, "detail": detail}
+
+
+# ---------------------------------------------------------------------------
+# Off-host receipts
+#
+# Sealing stops the baseline being rewritten, but not deleted: an attacker who
+# removes ~/.home_net_audit entirely leaves the next run looking like a first
+# run, and nothing on the machine can tell those apart. The only fix is a copy
+# somewhere the audited host cannot reach back into.
+#
+# What the script can do is send a receipt for every run and fail loudly if it
+# cannot. What it CANNOT do is make the destination append-only — that is a
+# property of how the sink is configured, and it is the property the whole
+# scheme rests on. If the host holds credentials that can also delete or
+# overwrite remote history, an attacker on that host holds them too.
+# ---------------------------------------------------------------------------
+
+def baseline_receipt(record):
+    """The minimum that proves a run happened, and nothing more.
+
+    Deliberately excludes the audit state. A receipt is enough to detect a
+    rollback or a wiped history later, and shipping MAC addresses, network
+    topology and any accepted credentials to a remote endpoint would create a
+    fresh disclosure risk for exactly the users this is meant to protect.
+    Publishing the full record is available but has to be asked for.
+    """
+    return {
+        "seq": record.get("seq"),
+        "seal": record.get("seal"),
+        "prev": record.get("prev"),
+        "keyed": record.get("keyed"),
+    }
+
+
+def resolve_sink(explicit=None):
+    return explicit or os.environ.get(SINK_ENV) or None
+
+
+def publish_receipt(record, destination=None, mode="digest", token=None):
+    """Copy a receipt (or the whole record) to the off-host sink.
+
+    Returns {published, detail, mode}. Never raises: a failed publish must be
+    reported, not fatal, or an unreachable sink would stop the audit running at
+    all. The caller is expected to surface `published` — a receipt that silently
+    failed to leave the machine is the same as never having sent one.
+    """
+    destination = resolve_sink(destination)
+    if not destination:
+        return {"published": False, "mode": mode,
+                "detail": "No off-host sink configured. The baseline exists only on "
+                          "this machine, so deleting it wholesale would leave no trace."}
+
+    payload = record if mode == "full" else baseline_receipt(record)
+    payload = dict(payload, published_at=datetime.now(timezone.utc).isoformat())
+
+    try:
+        if destination.startswith(("http://", "https://")):
+            return _publish_https(payload, destination,
+                                  token or os.environ.get(SINK_TOKEN_ENV), mode)
+        return _publish_path(payload, destination, mode)
+    except Exception as e:                      # noqa: BLE001 - reported, not raised
+        return {"published": False, "mode": mode,
+                "detail": f"Could not publish the receipt to {destination}: {e}"}
+
+
+def _publish_path(payload, destination, mode):
+    """Append to a file the host can add to but should not be able to rewrite.
+
+    A mounted share, an external disk, or a directory owned by another account.
+    Append mode is the client half of the contract; the sink has to enforce the
+    other half.
+    """
+    if os.path.isdir(destination):
+        destination = os.path.join(destination, "receipts.jsonl")
+    parent = os.path.dirname(destination)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(destination, "a") as f:
+        f.write(json.dumps(payload, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return {"published": True, "mode": mode,
+            "detail": f"Receipt appended to {destination}."}
+
+
+def _publish_https(payload, url, token, mode):
+    headers = {"Content-Type": "application/json", "User-Agent": "home_net_audit"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=canonical_json(payload), headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        code = r.getcode()
+    return {"published": True, "mode": mode,
+            "detail": f"Receipt accepted by {url} (HTTP {code})."}
+
+
+def read_receipts(source):
+    """Read back a receipt log to compare against. Returns [] if unreadable."""
+    if os.path.isdir(source):
+        source = os.path.join(source, "receipts.jsonl")
+    entries = []
+    try:
+        with open(source) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return entries
+
+
+def compare_with_receipts(record, receipts):
+    """Check the local baseline against the off-host record of what ran.
+
+    This is what catches the attack local sealing cannot: wiping
+    ~/.home_net_audit and letting the next run start clean. Locally that is
+    indistinguishable from a genuine first run — but the receipt log still shows
+    run 7, and a local baseline claiming run 1 gives it away.
+
+    Returns {status, detail}. Statuses: ok, no_receipts, history_truncated,
+    seal_mismatch.
+    """
+    if not receipts:
+        return {"status": "no_receipts",
+                "detail": "No off-host receipts to compare against."}
+
+    highest = max((r.get("seq") or 0) for r in receipts)
+    local_seq = (record or {}).get("seq") or 0
+
+    if local_seq < highest:
+        return {"status": "history_truncated",
+                "detail": f"Off-host receipts record {highest} runs but this machine's "
+                          f"baseline is at run {local_seq}. Local history has been "
+                          "truncated or deleted — the strongest single indicator "
+                          "available that something removed the evidence."}
+
+    match = [r for r in receipts if r.get("seq") == local_seq]
+    if match and record and match[-1].get("seal") != record.get("seal"):
+        return {"status": "seal_mismatch",
+                "detail": f"Run {local_seq} was recorded off-host with a different "
+                          "seal than the copy on this machine. The local baseline "
+                          "has been replaced since it was published."}
+
+    return {"status": "ok",
+            "detail": f"Local baseline agrees with {len(receipts)} off-host receipt(s)."}
+
+
+def describe_receipt_status(report):
+    risk = {
+        "ok": "OK",
+        "no_receipts": "REVIEW",
+        "history_truncated": "HIGH",
+        "seal_mismatch": "HIGH",
+    }.get(report.get("status"), "REVIEW")
+    return f"  [{risk:6}] Off-host receipts: {report.get('detail', '')}"
 
 
 def describe_baseline_integrity(report):
@@ -2511,6 +2679,10 @@ def action_save_baseline(state):
 def action_compare_baseline(state):
     hr("CHANGE DETECTION (vs saved baseline)")
     print(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
+    _sink = resolve_sink()
+    if _sink:
+        print(describe_receipt_status(compare_with_receipts(
+            load_baseline_record(), read_receipts(_sink))))
     old = load_baseline()
     if not old:
         print("No baseline saved yet.")
@@ -2642,6 +2814,10 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     # Baseline comparison
     hr("CHANGE DETECTION (vs saved baseline)")
     print(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
+    _sink = resolve_sink()
+    if _sink:
+        print(describe_receipt_status(compare_with_receipts(
+            load_baseline_record(), read_receipts(_sink))))
     old = load_baseline()
     if old:
         changes = diff_baseline(old, state)
@@ -2871,6 +3047,10 @@ def main():
                          "NOT read-only and can trigger router lockout; off by default.")
     ap.add_argument("--html-report", action="store_true",
                     help="Save an HTML report after the audit")
+    ap.add_argument("--publish-to", metavar="DEST",
+                    help="Append a receipt for each run to a path or https:// URL the "
+                         "audited host cannot rewrite, so a wiped local history is "
+                         f"still detectable. Or set {SINK_ENV}.")
     ap.add_argument("--seal-baseline", action="store_true",
                     help="Prompt for a passphrase and seal the baseline with it, so "
                          f"it cannot be rewritten unnoticed. Or set {PASSPHRASE_ENV}.")
@@ -2883,7 +3063,7 @@ def main():
         args.full, args.no_vendors, args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
-        args.seal_baseline,
+        args.seal_baseline, args.publish_to,
     ])
 
     if not cli_args_given or args.menu:
@@ -2935,6 +3115,8 @@ def main():
         print("\nSkipping baseline save: gateway could not be determined, so this "
               "scan is incomplete and would corrupt change detection.")
     else:
+        if args.publish_to:
+            os.environ[SINK_ENV] = args.publish_to
         passphrase = resolve_passphrase(prompt=args.seal_baseline)
         save_baseline(state, passphrase=passphrase)
         print(f"\nBaseline saved to {BASELINE_FILE}")
