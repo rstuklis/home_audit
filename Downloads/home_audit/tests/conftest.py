@@ -193,7 +193,7 @@ def make_run(mapping, default=""):
     """
     calls = []
 
-    def _run(cmd, timeout=10):
+    def _run(cmd, timeout=10, merge_stderr=False):
         joined = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
         calls.append(joined)
         value, found = _match(mapping, joined)
