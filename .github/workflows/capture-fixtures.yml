@@ -36,23 +36,28 @@ jobs:
             echo "===END==="
           }
 
+          # The audit's run() helper returns ONLY stdout. Any command whose
+          # answer arrives on stderr is read as an empty string, so these are
+          # captured with the streams kept apart.
+          split() {
+            echo ""
+            echo "===BEGIN $1==="
+            shift
+            echo "--stdout--"
+            "$@" 2>/dev/null | head -20
+            echo "--stderr--"
+            "$@" 2>&1 >/dev/null | head -20
+            echo "===END==="
+          }
+
+          split security_trust security dump-trust-settings -d
+          split systemsetup_rae systemsetup -getremoteappleevents
+          split fw_global /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+
           cap route_get_default route -n get default
-          cap netstat_rn netstat -rn
           cap ifconfig_a ifconfig -a
           cap scutil_dns scutil --dns
           cap arp_a arp -a
           cap ndp_a ndp -a
           cap ndp_r ndp -r
-          cap netstat_rn6 netstat -rn -f inet6
-          cap lsof_tcp_listen lsof -nP -iTCP -sTCP:LISTEN
-          cap lsof_udp lsof -nP -iUDP
-          cap netstat_anp_tcp netstat -anp tcp
-          cap netstat_anp_udp netstat -anp udp
-          cap fw_global /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
-          cap fw_stealth /usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode
-          cap fw_blockall /usr/libexec/ApplicationFirewall/socketfilterfw --getblockall
-          cap launchctl_print_disabled launchctl print-disabled system
-          cap launchctl_print_sshd launchctl print system/com.openssh.sshd
-          cap systemsetup_rae systemsetup -getremoteappleevents
-          cap security_trust security dump-trust-settings -d
-          cap system_profiler_airport system_profiler SPAirPortDataType
+          cap netstat_rn netstat -rn
