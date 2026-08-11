@@ -2,6 +2,13 @@
 ~/.home_net_audit/
 .home_net_audit/
 
+# Raw output from tools/capture_fixtures.py. It holds the capturing machine's
+# SSID, BSSIDs, LAN MACs and account name — and holds them unredacted whenever
+# --raw was used. The workflow is deliberately two-step: capture here, read it,
+# then copy the files you have checked into tests/fixtures/. Ignoring this
+# directory is what stops step two being skipped by accident.
+captured/
+
 # Local scan output files
 *.json
 *.log
