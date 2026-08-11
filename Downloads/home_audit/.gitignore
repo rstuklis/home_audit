@@ -8,9 +8,22 @@
 *.txt
 audit_report_*.html
 
+# Test-suite files that the broad *.txt / *.json rules above would otherwise
+# swallow. Captured command-output fixtures use .out precisely to stay clear of
+# those rules; these negations cover the two tracked files that cannot.
+!requirements-dev.txt
+!tests/fixtures/*.json
+
 # Python
 __pycache__/
 *.py[cod]
+
+# Test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # macOS
 .DS_Store
