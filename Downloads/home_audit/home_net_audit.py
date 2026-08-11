@@ -1480,14 +1480,39 @@ def network_name_for_subnet(subnet_str, networks):
 
 def diff_baseline(old, new):
     notes = []
-    old_macs = {d["mac"] for d in old.get("devices", []) if d["mac"] != "unknown"}
-    new_macs = {d["mac"] for d in new.get("devices", []) if d["mac"] != "unknown"}
+    # Randomised addresses are compared as a population, not as identities.
+    #
+    # iOS and macOS rotate their private Wi-Fi address, so the same phone is a
+    # different MAC on Tuesday than it was on Monday. Compared as a set, every
+    # rotation reads as a device arriving and another leaving, and a household
+    # of phones produces that alarm on every single run — for ever, and with
+    # nothing wrong. An alarm that is always firing is one nobody reads, and it
+    # buries the two lines here that mean something.
+    #
+    # Dropping them entirely is not the answer either: most new devices on a
+    # home network are phones, and they all arrive with a private address. So
+    # the population is still watched, just by count rather than by name — the
+    # only claim a rotating identifier supports. Six becoming twelve is worth
+    # saying; naming which six is not, because the names are already stale.
+    def _split(entry):
+        macs = {d["mac"] for d in entry.get("devices", []) if d["mac"] != "unknown"}
+        stable = {m for m in macs if not is_randomized_mac(m)}
+        return stable, macs - stable
+
+    old_macs, old_private = _split(old)
+    new_macs, new_private = _split(new)
     appeared = new_macs - old_macs
     vanished = old_macs - new_macs
     if appeared:
         notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
     if vanished:
         notes.append(f"Device(s) gone since baseline: {', '.join(sorted(vanished))}")
+    if len(new_private) > len(old_private):
+        notes.append(
+            f"{len(new_private)} device(s) using rotating private addresses, up "
+            f"from {len(old_private)}. These cannot be identified across runs, so "
+            "they are counted rather than named; a rise can be new devices or the "
+            "same ones having re-randomised.")
     old_ports = set(old.get("router_open_ports", []))
     new_ports = set(new.get("router_open_ports", []))
     if new_ports - old_ports:
@@ -1749,14 +1774,19 @@ def check_evil_twin(ssid=None, known=None):
 
     if not ssid or ssid == "<redacted>":
         return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                "note": "Could not read the connected SSID. system_profiler "
-                        "redacts Wi-Fi details unless the audit is run with sudo, "
-                        "so this check cannot run."}
+                "note": "Could not read the connected SSID. macOS withholds it "
+                        "from a process without Location Services access — grant "
+                        "it to this terminal in System Settings > Privacy & "
+                        "Security > Location Services. Running with sudo does "
+                        "not help; the gate is the permission, not the user."}
 
     bssids = networks.get(ssid, [])
     if not bssids:
         return {"ssid": ssid, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                "note": f"No BSSID visible for {ssid} — run with sudo to reveal it."}
+                "note": f"No BSSID visible for {ssid}. BSSIDs are withheld from a "
+                        "process without Location Services access — grant it in "
+                        "System Settings > Privacy & Security > Location Services. "
+                        "sudo does not reveal them."}
 
     known = list(known or [])
     unexpected = [b for b in bssids if b not in known] if known else []
@@ -1789,8 +1819,13 @@ def check_wifi_security():
     (The legacy `airport` utility was removed on current macOS.) WEP is broken;
     open networks have no encryption at all.
 
-    Returns a dict: ssid, auth, cipher, risk, note. ssid is None when
-    system_profiler redacts it (it does unless the audit is run with sudo).
+    Returns a dict: ssid, auth, cipher, risk, note. ssid is None when macOS
+    withholds it, which it does from any process without Location Services
+    access — the default for a terminal, and unaffected by sudo. An SSID and a
+    BSSID can be looked up in a wardriving database to place a house on a map,
+    so those two fields sit behind that permission while everything else in the
+    same report — firmware, channel, country code, the security mode this
+    function actually needs — comes back either way.
     """
     out = run(["system_profiler", "SPAirPortDataType"], timeout=15) or ""
     result = {"ssid": None, "auth": None, "cipher": None, "risk": "UNKNOWN", "note": ""}
@@ -1812,8 +1847,14 @@ def check_wifi_security():
     elif not a:
         # No Security value parsed — a failure to read, NOT a confirmed open net.
         result["risk"] = "REVIEW"
-        result["note"] = ("Could not read the Wi-Fi security mode (are you on Wi-Fi? "
-                          "some details need the audit to be run with sudo).")
+        # Deliberately not "try sudo". The Security field comes back to an
+        # unprivileged process — only the SSID and BSSID are withheld, and by
+        # Location Services rather than by privilege. Suggesting root here
+        # sends someone to run a network audit as root for no benefit.
+        result["note"] = ("Could not read the Wi-Fi security mode. Are you on "
+                          "Wi-Fi? This field does not need elevated privileges, "
+                          "so an empty one means the report had no network block "
+                          "to read, not that permission was missing.")
     elif "wep" in a:
         result["risk"] = "HIGH"
         result["note"] = "WEP is cryptographically broken. Upgrade to WPA2 or WPA3 immediately."
@@ -1844,7 +1885,8 @@ def check_wifi_security():
 def action_wifi_security():
     hr("WI-FI SECURITY MODE")
     r = check_wifi_security()
-    print(f"  SSID (network name) : {r['ssid'] or 'unknown (run with sudo to reveal SSID)'}")
+    print(f"  SSID (network name) : "
+          f"{r['ssid'] or 'unknown (needs Location Services access)'}")
     print(f"  Auth / encryption   : {r['auth'] or 'unknown'}")
     if r["cipher"]:
         print(f"  Cipher              : {r['cipher']}")
