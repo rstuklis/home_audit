@@ -103,6 +103,22 @@ class TestSandboxRedirectsUserData:
     def test_missing_baseline_reads_as_none(self, mod):
         assert mod.load_baseline() is None
 
+    def test_every_path_constant_is_redirected(self, mod, tmp_path):
+        """No module-level path may point outside the sandbox.
+
+        Guards the whole class of leak rather than one instance: adding
+        HISTORY_FILE to the module once left it aimed at the real
+        ~/.home_net_audit, and the only reason nothing was written there was
+        that the directory did not happen to exist. This fails the moment a new
+        *_DIR or *_FILE constant is added without extending the sandbox.
+        """
+        paths = {a: getattr(mod, a) for a in dir(mod)
+                 if (a.endswith("_FILE") or a.endswith("_DIR"))
+                 and isinstance(getattr(mod, a), str)}
+        assert paths, "no path constants found — has the naming convention changed?"
+        for name, value in paths.items():
+            assert str(tmp_path) in value, f"{name} escapes the sandbox: {value}"
+
     def test_cwd_is_pinned_so_a_relative_write_cannot_reach_the_repo(self, tmp_path):
         """A stray relative-path write must land in tmp, never in the checkout.
 
