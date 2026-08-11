@@ -67,6 +67,16 @@ COMMANDS = {
 # exists to find. Output that lands only on stderr is reported, not merged.
 MERGE_STDERR = {"security_trust"}
 
+# Commands the audit does not read through run() at all. _launchd_running
+# calls subprocess directly and decides on the exit status, so a label that is
+# not loaded answering on stderr is read correctly as absent — the generic
+# "answers on stderr" note is a false alarm for these three, and a tool that
+# reports a finding where there is none teaches people to skip its output.
+# What they cannot do is produce a fixture: there is nothing on stdout to keep
+# unless the service is switched on.
+EXIT_STATUS_ONLY = {"launchctl_print_sshd", "launchctl_print_smbd",
+                    "launchctl_print_screensharing"}
+
 # Ordered alternation, matched in one pass. Order is the whole point: a MAC
 # also satisfies the IPv6 pattern, so substituting separately turned
 # "at a4:83:e7:01:01:01" into "at 2001:db8::1" — the MAC replacement was itself
@@ -235,6 +245,11 @@ class Redactor:
         # parser is then obliged to keep, so a fixture redacted this way
         # asserts the precise opposite of the behaviour that was shipped.
         if parsed.is_link_local and parsed.packed[8:] == b"\x00" * 8:
+            return real
+        # Every Mac's loopback carries fe80::1%lo0, the same on all of them.
+        # Substituting it costs the fixture a line of realism and buys no
+        # privacy, and ifconfig_a.out is meant to read like a real ifconfig.
+        if zone == "lo0" and parsed.compressed == "fe80::1":
             return real
         if parsed.compressed in PRESERVED_DNS or parsed.compressed in APPLE_BRIDGE_V6:
             return real
@@ -457,6 +472,10 @@ def capture(name, cmd):
         return (text, None) if text.strip() else (None, "no output")
 
     if not text.strip():
+        if name in EXIT_STATUS_ONLY:
+            return None, ("service is not loaded, so there is no output to "
+                          "capture — the audit reads the exit status here and "
+                          "gets this right. Needs a Mac with it switched on.")
         if proc.stderr.strip():
             # Worth saying out loud: run() returns stdout, so a command that
             # answers on stderr is read by the audit as the empty string.

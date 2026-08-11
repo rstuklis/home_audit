@@ -691,3 +691,52 @@ class TestAppleBridgeAddresses:
         red.prime(["fe80::aede:48ff:fe00:1122%en5 fe80::aede:48ff:fe33:4455%en5"])
         assert red.addresses("fe80::aede:48ff") == "fe80::aede:48ff"
         assert not red.warnings()
+
+
+class TestUniversalConstantsStayLiteral:
+
+    def test_the_loopback_link_local_is_kept(self, red):
+        """fe80::1%lo0 is on every Mac. Redacting it costs ifconfig_a.out a
+        line of realism and buys no privacy."""
+        assert red.addresses("fe80::1%lo0") == "fe80::1%lo0"
+
+    def test_the_same_address_elsewhere_is_still_treated_as_a_host(self, red):
+        """Only the loopback spelling is a constant. fe80::1 on a real
+        interface is a host, and a common router address at that.
+
+        Asserted on the mapping rather than the output: the first link-local
+        substituted is itself numbered fe80::1, so a genuine fe80::1%en0 can
+        come back unchanged by coincidence. That is harmless — it is still a
+        consistent identity for one host — but comparing the strings would be
+        testing the counter, not the rule.
+        """
+        red.addresses("fe80::1%en0")
+        assert "fe80::1%en0" in red.v6
+        red.addresses("fe80::1%lo0")
+        assert "fe80::1%lo0" not in red.v6
+
+
+class TestExitStatusCommandsAreNotFalseAlarms:
+    """The audit reads three launchctl labels by exit status, not stdout, so
+    the generic stderr note accused it of a bug it does not have. A tool that
+    reports a finding where there is none gets its output skipped."""
+
+    def _empty(self, monkeypatch, stderr):
+        import subprocess as sp
+        monkeypatch.setattr(cap.subprocess, "run",
+                            lambda *a, **k: sp.CompletedProcess(
+                                args=[], returncode=1, stdout="", stderr=stderr))
+
+    def test_an_unloaded_label_is_not_called_a_finding(self, monkeypatch):
+        self._empty(monkeypatch, "Could not find service\n")
+        text, note = cap.capture("launchctl_print_sshd",
+                                 ["launchctl", "print", "system/x"])
+        assert text is None
+        assert "exit status" in note and "gets this right" in note
+
+    def test_other_commands_still_report_the_mismatch(self, monkeypatch):
+        """The note is still correct where the audit does read stdout."""
+        self._empty(monkeypatch, "Remote Apple Events: On\n")
+        text, note = cap.capture("systemsetup_rae", ["systemsetup"])
+        assert text is None
+        assert "stderr" in note
