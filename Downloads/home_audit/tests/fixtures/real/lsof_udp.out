@@ -1,0 +1,14 @@
+COMMAND    PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+rapportd   570 alice   24u  IPv6 0xc90be05f9ca0f651      0t0  UDP *:3722
+rapportd   570 alice   27u  IPv4 0x30b10ec4d95e2dd1      0t0  UDP *:3722
+homed      587 alice   47u  IPv6 0xaf83730d5eb70779      0t0  UDP *:63620
+homed      587 alice   48u  IPv4 0xfd07ec595b95d1aa      0t0  UDP *:63875
+identitys  588 alice   10u  IPv4 0x5c40e5eed01615b0      0t0  UDP *:*
+identitys  588 alice   18u  IPv4 0x432be19046ce69b1      0t0  UDP *:*
+identitys  588 alice   23u  IPv4 0x2f78a2d259702729      0t0  UDP *:*
+identitys  588 alice   44u  IPv4  0x2b138487d4d45d0      0t0  UDP *:*
+identitys  588 alice   46u  IPv4 0xe06caabbc724da36      0t0  UDP *:*
+sharingd   589 alice    4u  IPv4 0x5fc2c3539753e785      0t0  UDP *:*
+replicato  635 alice    8u  IPv6 0xa5dce3602de5950a      0t0  UDP *:62201
+Claude    2842 alice   25u  IPv4 0x99282f241a374b3a      0t0  UDP 192.168.87.249:62599->198.51.100.1:443
+Claude    2842 alice   31u  IPv4 0x8e52b55f26582cc0      0t0  UDP 192.168.87.249:50419->198.51.100.1:443

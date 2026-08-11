@@ -59,6 +59,22 @@ def mod():
     return hna
 
 
+@pytest.fixture
+def capture_module():
+    """tools/capture_fixtures.py, for tests that need its residue() check.
+
+    A maintenance script rather than part of the audit, so it is loaded the
+    same way and on demand rather than imported at collection time.
+    """
+    import importlib.util
+    path = PROJECT_DIR / "tools" / "capture_fixtures.py"
+    spec = importlib.util.spec_from_file_location("capture_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["capture_fixtures"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 # ---------------------------------------------------------------------------
 # Hermeticity guards
 # ---------------------------------------------------------------------------

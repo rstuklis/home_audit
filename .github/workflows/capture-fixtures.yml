@@ -65,10 +65,14 @@ jobs:
           # These must be the flags the audit itself passes, or the capture
           # documents a command nothing runs. `ndp -a` reverse-resolves, so
           # the Neighbor column comes back as a hostname and every row fails
-          # to parse; the audit runs `ndp -an` for exactly that reason.
+          # to parse; the audit runs `ndp -an` for exactly that reason. `-r`
+          # resolves the same way and was left behind when `-a` was fixed: on
+          # a Mac with six tunnels up it ran past 30 seconds without
+          # answering, which inside the audit's 10-second budget is not a slow
+          # check but an empty one. Both take -n.
           # tests/test_capture_redaction.py pins the same property for
           # tools/capture_fixtures.py against the audit's own source.
           cap arp_a arp -a
           cap ndp_a ndp -an
-          cap ndp_r ndp -r
+          cap ndp_r ndp -rn
           cap netstat_rn netstat -rn

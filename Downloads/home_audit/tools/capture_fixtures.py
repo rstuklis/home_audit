@@ -44,7 +44,7 @@ COMMANDS = {
     # name column is then full of the LAN's device names.
     "arp_a_typical":            ["arp", "-a"],
     "ndp_a":                    ["ndp", "-an"],
-    "ndp_r":                    ["ndp", "-r"],
+    "ndp_r":                    ["ndp", "-rn"],
     "lsof_tcp_listen":          ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
     "lsof_udp":                 ["lsof", "-nP", "-iUDP"],
     "netstat_anp_tcp":          ["netstat", "-anp", "tcp"],
@@ -67,13 +67,28 @@ COMMANDS = {
 # exists to find. Output that lands only on stderr is reported, not merged.
 MERGE_STDERR = {"security_trust"}
 
+# Commands the audit does not read through run() at all. _launchd_running
+# calls subprocess directly and decides on the exit status, so a label that is
+# not loaded answering on stderr is read correctly as absent — the generic
+# "answers on stderr" note is a false alarm for these three, and a tool that
+# reports a finding where there is none teaches people to skip its output.
+# What they cannot do is produce a fixture: there is nothing on stdout to keep
+# unless the service is switched on.
+EXIT_STATUS_ONLY = {"launchctl_print_sshd", "launchctl_print_smbd",
+                    "launchctl_print_screensharing"}
+
 # Ordered alternation, matched in one pass. Order is the whole point: a MAC
 # also satisfies the IPv6 pattern, so substituting separately turned
 # "at a4:83:e7:01:01:01" into "at 2001:db8::1" — the MAC replacement was itself
 # re-matched as an address. One pass with re.sub never rescans what it wrote.
 TOKEN_RE = re.compile(
     r"(?P<mac>\b(?:[0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}\b)"
-    r"|(?P<v6>\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?:%\w+)?\b)"
+    # No trailing \b on the v6 branch. It forced every match to end on a hex
+    # digit, so `fdca:...:4743::/64` — netstat's on-link prefix route — matched
+    # only as far as `fdca:...:4743`, which is four groups and not an address.
+    # It then failed to parse and was kept verbatim, which put the owner's real
+    # network ID in a public repository.
+    r"|(?P<v6>\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(?:%\w+)?)"
     r"|(?P<v4>\b(?:\d{1,3}\.){3}\d{1,3}\b)"
     r"|(?P<host>\b[\w-]+\.(?:local|lan|home|internal)\b)"
 )
@@ -103,6 +118,18 @@ PRESERVED_DNS = {
 }
 
 
+# Apple assigns these to the secure-enclave bridge interface with the same
+# literal values on every Mac that has one, which is why they arrive as a
+# 00:11:22 / 33:44:55 pair rather than anything a vendor would allocate. They
+# name a model of Mac, not a machine, so redacting them protects nobody — and
+# it costs something, because the two are indistinguishable once truncated to
+# their shared fe80::aede:48ff prefix, and the tool then has to ask a person
+# to adjudicate an ambiguity that only exists because it substituted them.
+# tests/fixtures/lsof_udp.out already carried one of these in the clear.
+APPLE_BRIDGE_MACS = {"ac:de:48:00:11:22", "ac:de:48:33:44:55"}
+APPLE_BRIDGE_V6 = {"fe80::aede:48ff:fe00:1122", "fe80::aede:48ff:fe33:4455"}
+
+
 class Redactor:
     """Consistent substitutions: one real value maps to one fake value.
 
@@ -119,6 +146,54 @@ class Redactor:
         self.ssids = {}
         self.users = {}
         self.domains = {}
+        self.collapsed = {}      # truncated spelling -> full spelling
+        self.ambiguous = set()   # truncated-looking, but no unique full form
+        self.fragments = {}      # address-shaped, unparseable, still replaced
+
+    # netstat pads its Destination and Gateway columns to a fixed width and
+    # cuts anything longer, so a link-local that ifconfig prints in full comes
+    # back from the routing table with its tail missing. Below this many
+    # characters a token is far more likely to be a genuinely short address
+    # than a cut one, and guessing there would collapse real distinct hosts.
+    TRUNCATION_FLOOR = 12
+
+    def _full_form_of(self, real):
+        """The one known address `real` looks like a truncation of, or None.
+
+        Ambiguity is not resolved by picking: 'fe80::1' is a string prefix of
+        'fe80::1465:426a:443:4ac2%en0' without being a truncation of it, and
+        collapsing those would merge two hosts into one. A unique match is
+        treated as truncation; anything else is left alone and reported.
+        """
+        addr, _, zone = real.partition("%")
+        if zone or len(addr) < self.TRUNCATION_FLOOR:
+            return None
+        hits = [k for k in self.v6
+                if k.partition("%")[0].startswith(addr)
+                and len(k.partition("%")[0]) > len(addr)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            self.ambiguous.add(real)
+        return None
+
+    def prime(self, texts):
+        """Learn every address's longest spelling before substituting any.
+
+        Order decides correlation. Met in file order, the full spelling and the
+        truncated one are two unrelated strings and become two unrelated fake
+        hosts, so the routing table can no longer be lined up against the
+        interface list — and cross-table agreement is most of what these
+        fixtures are for. Registering longest-first means the truncated form
+        arrives to find its own full form already known.
+        """
+        seen = set()
+        for text in texts:
+            for m in TOKEN_RE.finditer(text):
+                if m.lastgroup == "v6":
+                    seen.add(m.group(0))
+        for token in sorted(seen, key=len, reverse=True):
+            self._v6(token)
 
     # -- address-shaped tokens ------------------------------------------
 
@@ -128,6 +203,21 @@ class Redactor:
         # and parsers key off them (arp lists ff:ff:... for the broadcast row).
         if real.startswith(("ff:ff", "01:00:5e", "1:0:5e", "33:33")):
             return real
+        # The all-zeros link-layer address is a sentinel, not a device: arp and
+        # ndp print it for a neighbour that never answered. Substituting it
+        # invents a resolved host where the machine reported an unresolved one,
+        # and the parsers' "skip the incomplete rows" arms stop being reached.
+        if set(real.split(":")) == {"0"} or set(real.split(":")) == {"00"}:
+            return real
+        # arp and ndp print an octet under 0x10 unpadded ("ac:de:48:0:11:22")
+        # where ifconfig pads it ("ac:de:48:00:11:22"). Same NIC, two spellings
+        # — and keying on the spelling gave one interface two fake identities,
+        # which is the exact cross-table incoherence this class promises not to
+        # produce. The audit has _normalise_mac for this; key on the same shape.
+        key = ":".join(o.zfill(2) for o in real.split(":"))
+        if key in APPLE_BRIDGE_MACS:
+            return real          # keep the spelling the tool printed
+        real = key
         if real not in self.macs:
             n = len(self.macs) + 1
             # Keep the locally-administered bit: a randomised MAC looks
@@ -140,22 +230,88 @@ class Redactor:
             self.macs[real] = "%s:%02x:%02x:%02x" % (oui, n, n, n)
         return self.macs[real]
 
+    def _fragment(self, real):
+        """A token that is address-shaped but does not parse as an address.
+
+        Two unrelated things arrive here and they need opposite treatment. A
+        firmware version's "21:44:11" was never an address and editing it would
+        corrupt the fixture. Half of a real address — netstat -anp truncates
+        one to fit its column and appends the port, giving
+        `fdca:7af7:13bd:4.49276` — is the owner's network ID, and keeping it is
+        a leak. The first version of this method could not tell them apart and
+        preserved both, which is how a real ULA prefix reached a public repo.
+
+        The question that separates them is whether anything else in this
+        capture starts with the token. Nothing starts with a timestamp.
+        """
+        addr, sep, zone = real.partition("%")
+        if len(addr) < self.TRUNCATION_FLOOR:
+            return real
+        fakes = [f for k, f in self.v6.items()
+                 if k.partition("%")[0].startswith(addr)]
+        if not fakes:
+            return real
+        # Every candidate is already a substituted value, so their common
+        # prefix carries nothing real. Ambiguity is not a reason to fall back
+        # to the original: an unresolved fragment still has to be replaced,
+        # it just cannot be attributed to one host.
+        shared = fakes[0]
+        for f in fakes[1:]:
+            while not f.startswith(shared):
+                shared = shared[:-1]
+        fake = (shared or "2001:db8::") + sep + zone
+        self.fragments[real] = fake
+        return fake
+
     def _v6(self, real):
         addr, sep, zone = real.partition("%")
         try:
             parsed = ipaddress.ip_address(addr)
         except ValueError:
-            # Not an address at all. A firmware string's "21:44:11" matches the
-            # pattern and must be left exactly as it was.
-            return real
+            return self._fragment(real)
         if parsed.version != 6:
             return real
         if parsed.is_multicast or parsed.is_loopback or parsed.is_unspecified:
             return real          # ff02::1, ::1, :: are constants the checks read
-        if parsed.compressed in PRESERVED_DNS:
+        # fe80:: with an all-zeros interface identifier is RFC 4291's
+        # Subnet-Router anycast placeholder — no host holds it. It is how ndp
+        # reports "a default route exists on this tunnel" and how netstat
+        # prints an on-link prefix route, and parse_ndp_routers drops exactly
+        # these so a VPN's utun entries are not read as phantom routers.
+        # Giving it a host part converts every placeholder into a router the
+        # parser is then obliged to keep, so a fixture redacted this way
+        # asserts the precise opposite of the behaviour that was shipped.
+        if parsed.is_link_local and parsed.packed[8:] == b"\x00" * 8:
+            return real
+        # Every Mac's loopback carries fe80::1%lo0, the same on all of them.
+        # Substituting it costs the fixture a line of realism and buys no
+        # privacy, and ifconfig_a.out is meant to read like a real ifconfig.
+        if zone == "lo0" and parsed.compressed == "fe80::1":
+            return real
+        if parsed.compressed in PRESERVED_DNS or parsed.compressed in APPLE_BRIDGE_V6:
             return real
         if real not in self.v6:
+            # A cut-off spelling of an address that was never substituted must
+            # not be substituted either, or the routing table gains a host the
+            # interface list has never heard of.
+            if (len(addr) >= self.TRUNCATION_FLOOR
+                    and any(k.startswith(addr) for k in APPLE_BRIDGE_V6)):
+                return real
+            full = self._full_form_of(real)
+            if full is not None:
+                # Same interface, spelled short by a narrow column. One
+                # identity, so the tables still agree with each other.
+                self.collapsed[real] = full
+                self.v6[real] = self.v6[full]
+                return self.v6[real]
             n = len(self.v6) + 1
+            if parsed.packed[8:] == b"\x00" * 8:
+                # A network, not a host — netstat prints the ULA's own /64 as
+                # an on-link prefix route. Substituting it for a host address
+                # would leave `2001:db8::5/64`, a prefix with its host bits
+                # set, which macOS never prints. Give it a documentation /64.
+                self.v6[real] = "2001:db8:%x::%s%s" % (n, sep, zone)
+                return self.v6[real]
             # A link-local interface ID is derived from the MAC, so it names
             # the hardware — but the fe80:: prefix is what marks it as a
             # link-local, and check_ipv6_routers reads exactly that.
@@ -202,6 +358,14 @@ class Redactor:
     # -- per-command redaction ------------------------------------------
 
     def _ssid(self, real):
+        # macOS writes the literal "<redacted>" where an SSID would go when the
+        # calling process has no Location Services authorisation — which is the
+        # default for anything run from a terminal, so it is what most people
+        # running this audit actually get. check_evil_twin tests for that exact
+        # string and reports REVIEW; renaming it to a plausible SSID produces a
+        # fixture claiming the Mac read a network name it was refused.
+        if real.lower() in ("<redacted>", "redacted"):
+            return real
         if real not in self.ssids:
             # The connected network is listed first and keeps a stable name, so
             # an evil-twin fixture still reads as "two BSSIDs, one SSID".
@@ -325,8 +489,93 @@ class Redactor:
         lines = []
         for label, mapping in groups:
             for real, fake in mapping.items():
+                if real == fake:
+                    continue     # a value mapped to itself was not substituted
                 lines.append("  %-14s %s -> %s" % (label, real, fake))
         return lines
+
+    def warnings(self):
+        """Things the reader has to adjudicate, because the tool cannot.
+
+        Kept apart from the substitution list: that list is checked for wrong
+        entries, this one is where the tool says which entries it is unsure of.
+        """
+        lines = []
+        for short, full in self.collapsed.items():
+            lines.append("  column-truncated %s treated as %s (now one host)"
+                         % (short, full))
+        for frag, fake in self.fragments.items():
+            lines.append("  %s does not parse as an address but starts a real "
+                         "one — replaced with %s rather than kept" % (frag, fake))
+        for short in sorted(self.ambiguous):
+            lines.append("  %s looks truncated but matches several addresses "
+                         "— left as its own host, check it is not a duplicate"
+                         % short)
+        return lines
+
+
+def residue(text):
+    """Anything in already-redacted output that a fixture may not contain.
+
+    Deliberately independent of the Redactor's own bookkeeping. Both values
+    that reached a public repository were tokens the redactor had looked at
+    and decided to keep, so asking it what it kept would have got its own
+    answer back. This asks a question it cannot beg: never mind what was
+    substituted, is there anything here outside the ranges a fixture is
+    allowed to contain at all? A ULA in the output is residue by definition,
+    whatever the tool believes about it.
+
+    Returns a list of (token, why).
+    """
+    findings = []
+    for m in TOKEN_RE.finditer(text):
+        kind, tok = m.lastgroup, m.group(0)
+        if kind == "mac":
+            octets = ":".join(o.zfill(2) for o in tok.lower().split(":"))
+            if not octets.startswith(("a4:83:e7:", "02:00:00:", "ff:ff:ff",
+                                      "01:00:5e:", "33:33:")) \
+                    and octets not in APPLE_BRIDGE_MACS \
+                    and set(octets.split(":")) != {"00"}:
+                findings.append((tok, "MAC outside the substitution ranges"))
+        elif kind == "v4":
+            try:
+                ip = ipaddress.ip_address(tok)
+            except ValueError:
+                continue
+            if ip in ipaddress.ip_network("198.51.100.0/24") or tok in PRESERVED_DNS:
+                continue
+            if not (ip.is_private or ip.is_loopback or ip.is_multicast
+                    or ip.is_link_local or ip.is_unspecified or ip.is_reserved
+                    or str(ip) == "255.255.255.255"):
+                findings.append((tok, "routable IPv4 that is not TEST-NET-2"))
+        elif kind == "v6":
+            addr = tok.partition("%")[0]
+            try:
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                # The shape both leaks took. Three groups is enough to carry a
+                # /48; the firmware version's 21:44:11 has two and is not it.
+                stem = addr.rstrip(":")
+                if any(k.startswith(stem) for k in APPLE_BRIDGE_V6):
+                    continue     # a cut spelling of a constant, not of a host
+                if addr.count(":") >= 3:
+                    findings.append((tok, "address-shaped, unparseable, and "
+                                          "long enough to be half a real one"))
+                continue
+            if ip.is_multicast or ip.is_loopback or ip.is_unspecified:
+                continue
+            if ip.compressed in PRESERVED_DNS or ip.compressed in APPLE_BRIDGE_V6:
+                continue
+            if ip.is_link_local:
+                # Substituted link-locals are numbered from 1, so their
+                # interface identifier is tiny. A real one carries 64 bits
+                # derived from the hardware.
+                if int.from_bytes(ip.packed[8:], "big") > 0xFFFF:
+                    findings.append((tok, "link-local with a real interface ID"))
+                continue
+            if ip not in ipaddress.ip_network("2001:db8::/32"):
+                findings.append((tok, "IPv6 outside the documentation range"))
+    return findings
 
 
 def capture(name, cmd):
@@ -342,6 +591,10 @@ def capture(name, cmd):
         return (text, None) if text.strip() else (None, "no output")
 
     if not text.strip():
+        if name in EXIT_STATUS_ONLY:
+            return None, ("service is not loaded, so there is no output to "
+                          "capture — the audit reads the exit status here and "
+                          "gets this right. Needs a Mac with it switched on.")
         if proc.stderr.strip():
             # Worth saying out loud: run() returns stdout, so a command that
             # answers on stderr is read by the audit as the empty string.
@@ -367,11 +620,23 @@ def main(argv=None):
     redactor = None if args.raw else Redactor()
     written, notes = 0, []
 
+    captured = []
     for name, cmd in COMMANDS.items():
         text, note = capture(name, cmd)
         if text is None:
             notes.append("  %-28s %s" % (name, note))
             continue
+        captured.append((name, text))
+
+    if redactor:
+        # Read every file before rewriting any of them. An address's full
+        # spelling can live in a file captured after the one that truncates
+        # it, and whichever spelling is met first is the one that gets an
+        # identity — so substituting as we go makes correlation depend on the
+        # order this dict happens to be written in.
+        redactor.prime(t for _, t in captured)
+
+    for name, text in captured:
         if redactor:
             text = redactor.apply(name, text)
         path = os.path.join(args.out, name + ".out")
@@ -391,10 +656,40 @@ def main(argv=None):
             print("\nsubstitutions made (check these — a wrong one means a "
                   "corrupted fixture, a missing one means a leak):")
             print("\n".join(mapping))
+        flags = redactor.warnings()
+        if flags:
+            print("\njudgement calls (the tool could not decide these alone):")
+            print("\n".join(flags))
         print("\nStill real, on purpose: RFC1918 addresses, process names, "
               "hardware models, country codes.")
     else:
         print("\nNOT REDACTED — this contains real identifying values.")
+
+    if redactor:
+        # Read back what was written rather than what we believe was written.
+        # The point of this pass is to disbelieve the one above it.
+        leaks = []
+        for name, _ in captured:
+            path = os.path.join(args.out, name + ".out")
+            with open(path, encoding="utf-8") as fh:
+                for tok, why in residue(fh.read()):
+                    leaks.append((name, tok, why))
+        if leaks:
+            print("\nDO NOT COMMIT — %d value(s) that should not be here:"
+                  % len(leaks), file=sys.stderr)
+            seen = set()
+            for name, tok, why in leaks:
+                if (name, tok) in seen:
+                    continue
+                seen.add((name, tok))
+                print("  %-24s %-26s %s" % (name + ".out", tok, why),
+                      file=sys.stderr)
+            print("\nThis is a redaction bug, not something to edit by hand: "
+                  "the same value is likely cut the same way somewhere else.",
+                  file=sys.stderr)
+            return 1
+        print("\nChecked the written files for anything outside the allowed "
+              "ranges: nothing found.")
 
     print("\nRead the files before committing. Then compare with the current set:")
     print("  diff -ru tests/fixtures %s | head -60" % args.out)

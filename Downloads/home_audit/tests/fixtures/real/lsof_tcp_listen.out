@@ -1,0 +1,4 @@
+COMMAND    PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+rapportd   570 alice   17u  IPv4 0xae00513928511027      0t0  TCP *:49276 (LISTEN)
+rapportd   570 alice   20u  IPv6 0xb0815c5f1fb7725d      0t0  TCP *:49276 (LISTEN)
+AdobeReso 1401 alice   10u  IPv4 0xe3b3c8972483beee      0t0  TCP 127.0.0.1:19292 (LISTEN)

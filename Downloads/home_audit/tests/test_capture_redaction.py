@@ -561,3 +561,333 @@ class TestCaptureContract:
         monkeypatch.setattr(cap.sys, "platform", "linux")
         assert cap.main([]) == 1
         assert "Mac" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Sentinels, spellings and truncation
+#
+# Every case below came out of the first capture on a real Mac. The summary
+# the tool printed was the only thing that surfaced them: each one produces a
+# fixture that parses cleanly, looks like plausible macOS output, and asserts
+# something the machine never said.
+# ---------------------------------------------------------------------------
+
+class TestSentinelsSurvive:
+    """Some address-shaped strings are protocol constants, and the parsers
+    read them as constants. Redacting those does not protect anybody — it
+    edits the meaning of the row."""
+
+    def test_the_vpn_placeholder_keeps_its_empty_interface_id(self, red):
+        """The one that would have reverted a shipped fix.
+
+        `ndp -rn` prints `fe80::%utun0` for a tunnel that carries a default
+        route but has no router to name, and parse_ndp_routers drops exactly
+        those — that is what stops every VPN user being told they have four
+        routers. Redacted to `fe80::1%utun0` the placeholder becomes a host
+        the parser must keep, so a fixture built this way would have tested
+        for the behaviour that was just removed.
+        """
+        assert red.addresses("fe80::%utun0") == "fe80::%utun0"
+
+    def test_tunnel_placeholders_still_drop_after_redaction(self, mod, red):
+        raw = ("fe80::%utun0 if=utun0, flags=IST, pref=medium, expire=Never\n"
+               "fe80::%utun1 if=utun1, flags=IST, pref=medium, expire=Never\n"
+               "fe80::1465:426a:443:4ac2%en0 if=en0, flags=O, pref=medium\n")
+        before = mod.parse_ndp_routers(raw)
+        after = mod.parse_ndp_routers(red.addresses(raw))
+        assert len(before) == 1, "fixture wrong; the comparison would be vacuous"
+        assert len(after) == len(before)
+
+    def test_the_unresolved_neighbour_marker_is_not_given_a_vendor(self, red):
+        """arp and ndp print an all-zero link-layer address for a neighbour
+        that never answered. Turned into an Apple-OUI MAC it reads as a host
+        that resolved, and the parsers' skip-the-incomplete-row arms — some of
+        the least covered code in the project — stop being reached at all."""
+        assert red.addresses("0:0:0:0:0:0") == "0:0:0:0:0:0"
+        assert red.addresses("00:00:00:00:00:00") == "00:00:00:00:00:00"
+
+
+class TestOneDeviceOneIdentity:
+    """The Redactor's docstring promises that a MAC seen in two tables becomes
+    one fake MAC, because the cross-table checks have nothing to find
+    otherwise. These are the two ways the first version broke that promise."""
+
+    def test_padded_and_unpadded_spellings_are_the_same_nic(self, red):
+        """ifconfig pads an octet below 0x10, arp and ndp do not. One NIC,
+        two spellings, and keying on the spelling gave it two identities.
+
+        The capture that found this showed it on the bridge interface, which
+        is now preserved outright — so the example here is an ordinary NIC,
+        the case where the padding actually has to be reconciled.
+        """
+        unpadded = red.addresses("3c:22:fb:a:b:c")
+        padded = red.addresses("3c:22:fb:0a:0b:0c")
+        assert unpadded == padded
+
+    def test_a_column_truncated_address_is_not_a_second_host(self, red):
+        """netstat cuts an address to fit its column, so the link-local that
+        ifconfig prints in full arrives from the routing table with its tail
+        missing. Substituted independently the two spellings became two
+        unrelated hosts and the routing table could no longer be lined up
+        against the interface list."""
+        full = "fe80::1465:426a:443:4ac2%en0"
+        red.prime([full + "\n" + "fe80::1465:426a\n"])
+        assert red.addresses("fe80::1465:426a") == red.addresses(full)
+
+    def test_an_ambiguous_prefix_is_left_alone_rather_than_guessed(self, red):
+        """`fe80::1` is a string prefix of a dozen link-locals without being a
+        truncation of any of them, and collapsing it would merge real distinct
+        hosts. Below the column width the tool does not guess."""
+        red.prime(["fe80::1465:426a:443:4ac2%en0 fe80::1449:180f:e408:8ac7%en0"])
+        assert red.addresses("fe80::1") != red.addresses(
+            "fe80::1465:426a:443:4ac2%en0")
+
+
+class TestTheSummaryIsReadable:
+    """The mapping is the only thing standing between a real capture and a
+    public repository, so it is read by a person. What it says has to be
+    worth reading."""
+
+    def test_a_value_mapped_to_itself_is_not_called_a_substitution(self, red):
+        red.addresses("ff:ff:ff:ff:ff:ff")
+        assert not [ln for ln in red.report() if "ff:ff:ff:ff:ff:ff" in ln]
+
+    def test_a_collapsed_truncation_is_declared(self, red):
+        red.prime(["fe80::1465:426a:443:4ac2%en0\nfe80::1465:426a\n"])
+        assert any("truncated" in ln for ln in red.warnings())
+
+    def test_a_truncation_it_cannot_resolve_is_declared_too(self, red):
+        """Two hosts sharing a long prefix: the cut form could be either, so
+        the tool keeps it separate and says so, rather than picking one and
+        silently merging two devices into one."""
+        red.prime(["fe80::abcd:1234:5678:1111%en0 fe80::abcd:1234:5678:2222%en0"])
+        red.addresses("fe80::abcd:1234")
+        assert any("matches several" in ln for ln in red.warnings())
+
+
+class TestAppleBridgeAddresses:
+    """The secure-enclave bridge interface carries the same literal MACs on
+    every Mac that has one. They name a model, not a machine — and redacting
+    them manufactured an ambiguity the tool then had to ask a person about."""
+
+    def test_the_fixed_bridge_macs_are_left_alone(self, red):
+        for mac in ("ac:de:48:00:11:22", "ac:de:48:33:44:55"):
+            assert red.addresses(mac) == mac
+
+    def test_the_unpadded_spelling_is_recognised_too(self, red):
+        """ndp prints it unpadded. It is the same constant, and it has to come
+        back spelled the way the tool that produced it spelled it."""
+        assert red.addresses("ac:de:48:0:11:22") == "ac:de:48:0:11:22"
+
+    def test_their_derived_link_locals_are_left_alone(self, red):
+        for addr in ("fe80::aede:48ff:fe00:1122%en5",
+                     "fe80::aede:48ff:fe33:4455%en5"):
+            assert red.addresses(addr) == addr
+
+    def test_the_shared_truncation_no_longer_needs_adjudicating(self, red):
+        """fe80::aede:48ff is a prefix of both, which is precisely why it
+        could not be resolved. Neither is substituted now, so the cut form
+        must not be either — and there is nothing left to ask about."""
+        red.prime(["fe80::aede:48ff:fe00:1122%en5 fe80::aede:48ff:fe33:4455%en5"])
+        assert red.addresses("fe80::aede:48ff") == "fe80::aede:48ff"
+        assert not red.warnings()
+
+
+class TestUniversalConstantsStayLiteral:
+
+    def test_the_loopback_link_local_is_kept(self, red):
+        """fe80::1%lo0 is on every Mac. Redacting it costs ifconfig_a.out a
+        line of realism and buys no privacy."""
+        assert red.addresses("fe80::1%lo0") == "fe80::1%lo0"
+
+    def test_the_same_address_elsewhere_is_still_treated_as_a_host(self, red):
+        """Only the loopback spelling is a constant. fe80::1 on a real
+        interface is a host, and a common router address at that.
+
+        Asserted on the mapping rather than the output: the first link-local
+        substituted is itself numbered fe80::1, so a genuine fe80::1%en0 can
+        come back unchanged by coincidence. That is harmless — it is still a
+        consistent identity for one host — but comparing the strings would be
+        testing the counter, not the rule.
+        """
+        red.addresses("fe80::1%en0")
+        assert "fe80::1%en0" in red.v6
+        red.addresses("fe80::1%lo0")
+        assert "fe80::1%lo0" not in red.v6
+
+
+class TestExitStatusCommandsAreNotFalseAlarms:
+    """The audit reads three launchctl labels by exit status, not stdout, so
+    the generic stderr note accused it of a bug it does not have. A tool that
+    reports a finding where there is none gets its output skipped."""
+
+    def _empty(self, monkeypatch, stderr):
+        import subprocess as sp
+        monkeypatch.setattr(cap.subprocess, "run",
+                            lambda *a, **k: sp.CompletedProcess(
+                                args=[], returncode=1, stdout="", stderr=stderr))
+
+    def test_an_unloaded_label_is_not_called_a_finding(self, monkeypatch):
+        self._empty(monkeypatch, "Could not find service\n")
+        text, note = cap.capture("launchctl_print_sshd",
+                                 ["launchctl", "print", "system/x"])
+        assert text is None
+        assert "exit status" in note and "gets this right" in note
+
+    def test_other_commands_still_report_the_mismatch(self, monkeypatch):
+        """The note is still correct where the audit does read stdout."""
+        self._empty(monkeypatch, "Remote Apple Events: On\n")
+        text, note = cap.capture("systemsetup_rae", ["systemsetup"])
+        assert text is None
+        assert "stderr" in note
+
+
+class TestTheLocationServicesSentinel:
+    """macOS withholds SSIDs from a process without Location Services, writing
+    the literal "<redacted>" in their place. That is the output most people
+    running this audit from a terminal actually get, and the audit tests for
+    the string by name."""
+
+    WIFI = ("      Current Network Information:\n"
+            "        <redacted>:\n"
+            "          PHY Mode: 802.11ax\n"
+            "          BSSID: <redacted>\n"
+            "          Channel: 44\n")
+
+    def test_the_sentinel_is_not_renamed_to_a_network(self, red):
+        assert "<redacted>:" in red.wifi(self.WIFI)
+        assert "HomeNet" not in red.wifi(self.WIFI)
+
+    def test_the_audit_still_reports_review_after_redaction(self, mod, red):
+        """The property that matters: a capture taken without Location
+        Services has to keep producing the 'could not read the SSID' answer,
+        not a confident reading of a network that was never named."""
+        redacted = red.wifi(self.WIFI)
+        ssid, _ = mod._parse_connected_wifi_block(redacted)
+        assert ssid == "<redacted>"
+
+    def test_a_real_ssid_is_still_renamed(self, red):
+        """The sentinel is the exception, not a licence to keep SSIDs."""
+        out = red.wifi(self.WIFI.replace("<redacted>:", "Rautu-5G:"))
+        assert "Rautu-5G" not in out
+        assert "HomeNet:" in out
+
+
+class TestNothingRealSurvives:
+    """The family of test this file was missing.
+
+    Every existing case here checks one token in isolation, and each of them
+    passed while a real ULA prefix went into a public repository twice over.
+    Both escapes were address-shaped text that `ipaddress` rejected, so the
+    "not an address at all" branch — written for a firmware version's
+    21:44:11 — handed them back untouched. A per-token test cannot catch that,
+    because the token it would have to think of is the one nobody thought of.
+
+    So this sweeps a whole capture and asserts the absence of the real values,
+    rather than the presence of the fake ones.
+    """
+
+    REAL = {
+        "ula_prefix": "fdca:7af7:13bd:4743",
+        "ula_host": "fdca:7af7:13bd:4743:18de:7846:12ad:c6f4",
+        "mac": "38:8b:59:e0:f1:70",
+        "public_v4": "160.79.104.10",
+    }
+
+    CAPTURE = "\n".join([
+        # netstat -rn: the on-link prefix route, which matched only as far as
+        # its first four groups and then failed to parse.
+        "fdca:7af7:13bd:4743::/64          link#6      UC      en0",
+        "default                           fe80::1%en0 UGcg    en0",
+        # netstat -anp tcp: the address cut to fit the column, port appended.
+        "tcp6  0  0  fdca:7af7:13bd:4.49276  fdca:7af7:13bd:4.52224  ESTABLISHED",
+        "tcp4  0  0  192.168.1.42.51000      160.79.104.10.443       ESTABLISHED",
+        # ifconfig: the same address in full, which always redacted correctly.
+        "        inet6 fdca:7af7:13bd:4743:18de:7846:12ad:c6f4 prefixlen 64",
+        "        ether 38:8b:59:e0:f1:70",
+        # The string the unparseable branch exists to protect.
+        "        Firmware Version: wl0: Sep 12 2024 21:44:11 version 22.10.375.6",
+    ])
+
+    def test_no_real_value_survives_a_whole_capture(self, red):
+        red.prime([self.CAPTURE])
+        out = red.addresses(self.CAPTURE)
+        for label, value in self.REAL.items():
+            assert value not in out, "%s survived redaction: %s" % (label, value)
+
+    def test_the_prefix_route_stays_a_prefix(self, red):
+        """Substituting a network for a host address leaves 2001:db8::5/64 —
+        a /64 with its host bits set, which macOS never prints."""
+        red.prime([self.CAPTURE])
+        line = red.addresses(self.CAPTURE).splitlines()[0]
+        network = line.split()[0]
+        assert network.endswith("::/64"), network
+
+    def test_the_firmware_version_is_still_untouched(self, red):
+        """The reason the leaking branch looked correct. Whatever replaces it
+        must not start editing version strings."""
+        red.prime([self.CAPTURE])
+        out = red.addresses(self.CAPTURE)
+        assert "21:44:11 version 22.10.375.6" in out
+
+    def test_an_unparseable_fragment_is_declared(self, red):
+        red.prime([self.CAPTURE])
+        red.addresses(self.CAPTURE)
+        assert any("does not parse" in ln for ln in red.warnings())
+
+
+class TestResidueScan:
+    """The check that reads the written files back and disbelieves the pass
+    that produced them.
+
+    Both values that reached a public repository were tokens the redactor had
+    inspected and chosen to keep, so any check built on its own bookkeeping
+    would have returned its own answer. This one asks whether anything in the
+    output falls outside the ranges a fixture may contain, which a ULA does by
+    definition however the tool feels about it.
+    """
+
+    def test_a_ula_prefix_is_caught(self):
+        line = "fdca:7af7:13bd:4743::/64   link#6   UC   en0"
+        assert any("documentation range" in why
+                   for _, why in cap.residue(line))
+
+    def test_a_column_cut_fragment_is_caught(self):
+        """The netstat -anp shape: address truncated, port appended, and too
+        short to parse as an address at all."""
+        line = "tcp6  0  0  fdca:7af7:13bd:4.49276  fdca:7af7:13bd:4.52224  ESTABLISHED"
+        assert any("half a real one" in why for _, why in cap.residue(line))
+
+    def test_a_real_link_local_is_caught(self):
+        """Substituted link-locals are numbered from 1, so a 64-bit interface
+        identifier means the hardware's own."""
+        assert any("real interface ID" in why
+                   for _, why in cap.residue("fe80::1465:426a:443:4ac2%en0"))
+
+    def test_a_clean_capture_is_silent(self):
+        clean = "\n".join([
+            "2001:db8:2::/64   link#6   UC   en0",
+            "default   fe80::1%en0   UGcg   en0",
+            "        inet6 2001:db8::1 prefixlen 64",
+            "        inet6 fe80::e%en0 prefixlen 64 scopeid 0x6",
+            "        ether a4:83:e7:01:01:01",
+            "? (192.168.1.1) at 02:00:00:02:02:02 on en0",
+            "tcp4  0  0  192.168.1.42.51000  198.51.100.1.443  ESTABLISHED",
+            "nameserver[0] : 8.8.8.8",
+            "        Firmware Version: wl0: Sep 12 2024 21:44:11 version 22.10.375.6",
+        ])
+        assert cap.residue(clean) == []
+
+    def test_the_preserved_constants_are_not_false_alarms(self):
+        """These are kept on purpose, and a check that cried wolf 117 times
+        over the bridge interface would bury the two findings that matter."""
+        kept = "\n".join([
+            "ff02::1 ff02::fb ::1 ::",
+            "fe80::%utun0 if=utun0, flags=IST",
+            "fe80::1%lo0 prefixlen 64",
+            "ac:de:48:00:11:22 ac:de:48:0:11:22 ff:ff:ff:ff:ff:ff 01:00:5e:00:00:fb",
+            "0:0:0:0:0:0",
+            "fe80::aede:48ff:fe00:1122%en5",
+            "tcp6  0  0  fe80::aede:48ff:.49152  fe80::aede:48ff:.0  ESTABLISHED",
+        ])
+        assert cap.residue(kept) == []
