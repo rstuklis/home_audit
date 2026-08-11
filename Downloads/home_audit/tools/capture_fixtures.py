@@ -314,6 +314,14 @@ class Redactor:
     # -- per-command redaction ------------------------------------------
 
     def _ssid(self, real):
+        # macOS writes the literal "<redacted>" where an SSID would go when the
+        # calling process has no Location Services authorisation — which is the
+        # default for anything run from a terminal, so it is what most people
+        # running this audit actually get. check_evil_twin tests for that exact
+        # string and reports REVIEW; renaming it to a plausible SSID produces a
+        # fixture claiming the Mac read a network name it was refused.
+        if real.lower() in ("<redacted>", "redacted"):
+            return real
         if real not in self.ssids:
             # The connected network is listed first and keeps a stable name, so
             # an evil-twin fixture still reads as "two BSSIDs, one SSID".

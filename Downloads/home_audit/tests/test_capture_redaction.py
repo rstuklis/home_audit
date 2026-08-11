@@ -740,3 +740,34 @@ class TestExitStatusCommandsAreNotFalseAlarms:
         text, note = cap.capture("systemsetup_rae", ["systemsetup"])
         assert text is None
         assert "stderr" in note
+
+
+class TestTheLocationServicesSentinel:
+    """macOS withholds SSIDs from a process without Location Services, writing
+    the literal "<redacted>" in their place. That is the output most people
+    running this audit from a terminal actually get, and the audit tests for
+    the string by name."""
+
+    WIFI = ("      Current Network Information:\n"
+            "        <redacted>:\n"
+            "          PHY Mode: 802.11ax\n"
+            "          BSSID: <redacted>\n"
+            "          Channel: 44\n")
+
+    def test_the_sentinel_is_not_renamed_to_a_network(self, red):
+        assert "<redacted>:" in red.wifi(self.WIFI)
+        assert "HomeNet" not in red.wifi(self.WIFI)
+
+    def test_the_audit_still_reports_review_after_redaction(self, mod, red):
+        """The property that matters: a capture taken without Location
+        Services has to keep producing the 'could not read the SSID' answer,
+        not a confident reading of a network that was never named."""
+        redacted = red.wifi(self.WIFI)
+        ssid, _ = mod._parse_connected_wifi_block(redacted)
+        assert ssid == "<redacted>"
+
+    def test_a_real_ssid_is_still_renamed(self, red):
+        """The sentinel is the exception, not a licence to keep SSIDs."""
+        out = red.wifi(self.WIFI.replace("<redacted>:", "Rautu-5G:"))
+        assert "Rautu-5G" not in out
+        assert "HomeNet:" in out
