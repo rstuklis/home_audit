@@ -319,68 +319,29 @@ class TestResolveSubnets:
             ipaddress.ip_network("192.168.87.0/24"),
         }
 
-    def test_every_detected_subnet_is_returned_exactly_once(self, mod):
-        """The order-independent half of the contract, which never flakes.
+    def test_interface_order_is_preserved_so_the_primary_link_is_swept_first(self, mod):
+        """Auto-detected interfaces are swept in the order they were found.
 
-        Deliberately compares as multisets: this is the part of resolve_subnets'
-        behaviour that does not depend on set iteration order, so it is a real
-        regression guard on every build. The order half is the xfail below.
+        This was a known bug: resolve_subnets used to launder the interfaces
+        through a set, so the returned order was the set's iteration order and
+        the primary link (en0) could be swept and reported after a secondary
+        one. It is now a plain list comprehension, with the order-preserving
+        de-duplication below doing the work the set was redundant with.
+
+        Ten subnets rather than two, deliberately. While the bug existed the
+        symptom was build-dependent — a two-subnet case matched insertion order
+        in 378 of the 780 pairs across 192.168.0-39.0/24, and CI showed x86_64
+        Linux and macOS arm64 disagreeing at both two and ten subnets. Ten keeps
+        the assertion strong enough that any reintroduction of set-laundering
+        shows up as a real ordering difference rather than a coin flip.
         """
         expected = [ipaddress.ip_network(f"192.168.{i}.0/24") for i in range(10, 20)]
         ifaces = [_iface(f"en{n}", f"192.168.{i}.24", str(net))
                   for n, (i, net) in enumerate(zip(range(10, 20), expected))]
 
         got = mod.resolve_subnets(None, None, ifaces, None)
-        assert sorted(got, key=str) == sorted(expected, key=str)
+        assert got == expected
         assert len(got) == len(set(got)) == 10
-
-    @pytest.mark.known_bug
-    # strict=False is deliberate and is the only correct marker here — see the
-    # docstring. Everything else in this suite uses strict=True.
-    @pytest.mark.xfail(strict=False, reason=(
-        "home_net_audit.py:1969 collapses the auto-detected interfaces with a set "
-        "comprehension -- `subnets = list({net for _, _, net in interfaces})` -- "
-        "which discards interface order, so the primary interface (en0) is not "
-        "necessarily swept or reported first. The order-preserving de-duplication "
-        "at lines 1982-1987 cannot recover an order the set already threw away; "
-        "the set is redundant with it and should be a plain list comprehension. "
-        "NON-STRICT because the symptom is build-dependent: this XFAILs on x86_64 "
-        "Linux and XPASSes on macOS arm64. Fixing line 1969 makes it pass "
-        "everywhere; until then the outcome varies by platform."))
-    def test_interface_order_is_preserved_so_the_primary_link_is_swept_first(self, mod):
-        """Auto-detected interfaces should be swept in the order they were found.
-
-        This is the one non-strict xfail in the suite, and the exception is
-        forced rather than chosen. The defect is real — line 1969 launders the
-        interfaces through a set, so the returned order is the set's iteration
-        order, which is an unspecified implementation detail. But the *symptom*
-        is build-dependent, and that makes `strict` unusable:
-
-          * x86_64 Linux (3.9 / 3.11 / 3.13): the set scrambles -> XFAIL
-          * macOS arm64 (3.11): the set comes out in insertion order -> XPASS
-
-        Measured, not assumed. A two-subnet version matched insertion order in
-        378 of the 780 pairs across 192.168.0-39.0/24 (52% of random pairs), so
-        raising the count to ten was the obvious hardening — but CI showed ten
-        subnets XPASSing on macOS too, which rules out coincidence, since ten
-        elements landing in insertion order by chance is about 1 in 10!. The
-        underlying cause was not identified; what is established is that the
-        outcome differs per build, which is enough to disqualify strict.
-
-        A strict marker here fails CI on whichever platform happens to preserve
-        order, which is a false alarm about working test code. Non-strict keeps
-        the defect documented and listed under `pytest -rxX` without that.
-
-        The cost is real and worth stating: this marker will NOT turn red on the
-        day someone fixes line 1969. The companion test above is the deterministic
-        guard; when the line is fixed, fold the order assertion back into it and
-        delete this test.
-        """
-        expected = [ipaddress.ip_network(f"192.168.{i}.0/24") for i in range(10, 20)]
-        ifaces = [_iface(f"en{n}", f"192.168.{i}.24", str(net))
-                  for n, (i, net) in enumerate(zip(range(10, 20), expected))]
-
-        assert mod.resolve_subnets(None, None, ifaces, None) == expected
 
     def test_a_subnet_on_two_interfaces_is_swept_once(self, mod):
         ifaces = [
