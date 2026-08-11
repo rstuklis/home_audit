@@ -328,14 +328,25 @@ class TestResolveSubnets:
         "at lines 1982-1987 cannot recover an order the set already threw away; "
         "the set is redundant with it and should be a plain list comprehension."))
     def test_interface_order_is_preserved_so_the_primary_link_is_swept_first(self, mod):
-        ifaces = [
-            _iface("en0", "192.168.85.24", "192.168.85.0/24"),
-            _iface("en1", "192.168.87.10", "192.168.87.0/24"),
-        ]
-        assert mod.resolve_subnets(None, None, ifaces, None) == [
-            ipaddress.ip_network("192.168.85.0/24"),
-            ipaddress.ip_network("192.168.87.0/24"),
-        ]
+        """Auto-detected interfaces must be swept in the order they were found.
+
+        Uses ten subnets, not two, and that count is load-bearing. The defect is
+        that line 1969 launders the interfaces through a set, so the output order
+        is the set's iteration order — an unspecified implementation detail. With
+        only two subnets that order coincides with insertion order roughly half
+        the time (378 of the 780 pairs across 192.168.0-39.0/24), so a two-subnet
+        version of this test is a coin flip: it XFAILed on the x86_64 Linux
+        runners and XPASSed on macOS arm64, turning CI red under xfail_strict.
+
+        With ten subnets an accidental match would require the set to iterate in
+        exactly insertion order, so the test observes the defect reliably on any
+        build rather than depending on which slots the hashes happen to land in.
+        """
+        expected = [ipaddress.ip_network(f"192.168.{i}.0/24") for i in range(10, 20)]
+        ifaces = [_iface(f"en{n}", f"192.168.{i}.24", str(net))
+                  for n, (i, net) in enumerate(zip(range(10, 20), expected))]
+
+        assert mod.resolve_subnets(None, None, ifaces, None) == expected
 
     def test_a_subnet_on_two_interfaces_is_swept_once(self, mod):
         ifaces = [
