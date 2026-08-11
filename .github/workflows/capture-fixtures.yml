@@ -1,0 +1,58 @@
+name: capture-fixtures
+
+# Maintenance workflow. The test fixtures are captured command output, and the
+# only real Mac this project has access to is the macOS runner — so this prints
+# genuine output for every command the parsers read, with delimiters, so the
+# fixtures can be checked against reality rather than against documentation.
+#
+# Caveat worth knowing before trusting the result: a runner is a virtualised
+# macOS instance in a datacenter. It has no Wi-Fi hardware and no home LAN, so
+# the wireless and neighbour captures will be thin or empty. Those fixtures
+# still have to come from a real machine on a real network.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/capture-fixtures.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: macos-latest
+    steps:
+      - name: Capture
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)"
+
+          cap() {
+            echo ""
+            echo "===BEGIN $1==="
+            shift
+            "$@" 2>&1 | head -60 || echo "(command failed: $?)"
+            echo "===END==="
+          }
+
+          cap route_get_default route -n get default
+          cap netstat_rn netstat -rn
+          cap ifconfig_a ifconfig -a
+          cap scutil_dns scutil --dns
+          cap arp_a arp -a
+          cap ndp_a ndp -a
+          cap ndp_r ndp -r
+          cap netstat_rn6 netstat -rn -f inet6
+          cap lsof_tcp_listen lsof -nP -iTCP -sTCP:LISTEN
+          cap lsof_udp lsof -nP -iUDP
+          cap netstat_anp_tcp netstat -anp tcp
+          cap netstat_anp_udp netstat -anp udp
+          cap fw_global /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+          cap fw_stealth /usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode
+          cap fw_blockall /usr/libexec/ApplicationFirewall/socketfilterfw --getblockall
+          cap launchctl_print_disabled launchctl print-disabled system
+          cap launchctl_print_sshd launchctl print system/com.openssh.sshd
+          cap systemsetup_rae systemsetup -getremoteappleevents
+          cap security_trust security dump-trust-settings -d
+          cap system_profiler_airport system_profiler SPAirPortDataType
