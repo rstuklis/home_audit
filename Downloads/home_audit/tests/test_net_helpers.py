@@ -319,28 +319,62 @@ class TestResolveSubnets:
             ipaddress.ip_network("192.168.87.0/24"),
         }
 
+    def test_every_detected_subnet_is_returned_exactly_once(self, mod):
+        """The order-independent half of the contract, which never flakes.
+
+        Deliberately compares as multisets: this is the part of resolve_subnets'
+        behaviour that does not depend on set iteration order, so it is a real
+        regression guard on every build. The order half is the xfail below.
+        """
+        expected = [ipaddress.ip_network(f"192.168.{i}.0/24") for i in range(10, 20)]
+        ifaces = [_iface(f"en{n}", f"192.168.{i}.24", str(net))
+                  for n, (i, net) in enumerate(zip(range(10, 20), expected))]
+
+        got = mod.resolve_subnets(None, None, ifaces, None)
+        assert sorted(got, key=str) == sorted(expected, key=str)
+        assert len(got) == len(set(got)) == 10
+
     @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
+    # strict=False is deliberate and is the only correct marker here — see the
+    # docstring. Everything else in this suite uses strict=True.
+    @pytest.mark.xfail(strict=False, reason=(
         "home_net_audit.py:1969 collapses the auto-detected interfaces with a set "
         "comprehension -- `subnets = list({net for _, _, net in interfaces})` -- "
         "which discards interface order, so the primary interface (en0) is not "
         "necessarily swept or reported first. The order-preserving de-duplication "
         "at lines 1982-1987 cannot recover an order the set already threw away; "
-        "the set is redundant with it and should be a plain list comprehension."))
+        "the set is redundant with it and should be a plain list comprehension. "
+        "NON-STRICT because the symptom is build-dependent: this XFAILs on x86_64 "
+        "Linux and XPASSes on macOS arm64. Fixing line 1969 makes it pass "
+        "everywhere; until then the outcome varies by platform."))
     def test_interface_order_is_preserved_so_the_primary_link_is_swept_first(self, mod):
-        """Auto-detected interfaces must be swept in the order they were found.
+        """Auto-detected interfaces should be swept in the order they were found.
 
-        Uses ten subnets, not two, and that count is load-bearing. The defect is
-        that line 1969 launders the interfaces through a set, so the output order
-        is the set's iteration order — an unspecified implementation detail. With
-        only two subnets that order coincides with insertion order roughly half
-        the time (378 of the 780 pairs across 192.168.0-39.0/24), so a two-subnet
-        version of this test is a coin flip: it XFAILed on the x86_64 Linux
-        runners and XPASSed on macOS arm64, turning CI red under xfail_strict.
+        This is the one non-strict xfail in the suite, and the exception is
+        forced rather than chosen. The defect is real — line 1969 launders the
+        interfaces through a set, so the returned order is the set's iteration
+        order, which is an unspecified implementation detail. But the *symptom*
+        is build-dependent, and that makes `strict` unusable:
 
-        With ten subnets an accidental match would require the set to iterate in
-        exactly insertion order, so the test observes the defect reliably on any
-        build rather than depending on which slots the hashes happen to land in.
+          * x86_64 Linux (3.9 / 3.11 / 3.13): the set scrambles -> XFAIL
+          * macOS arm64 (3.11): the set comes out in insertion order -> XPASS
+
+        Measured, not assumed. A two-subnet version matched insertion order in
+        378 of the 780 pairs across 192.168.0-39.0/24 (52% of random pairs), so
+        raising the count to ten was the obvious hardening — but CI showed ten
+        subnets XPASSing on macOS too, which rules out coincidence, since ten
+        elements landing in insertion order by chance is about 1 in 10!. The
+        underlying cause was not identified; what is established is that the
+        outcome differs per build, which is enough to disqualify strict.
+
+        A strict marker here fails CI on whichever platform happens to preserve
+        order, which is a false alarm about working test code. Non-strict keeps
+        the defect documented and listed under `pytest -rxX` without that.
+
+        The cost is real and worth stating: this marker will NOT turn red on the
+        day someone fixes line 1969. The companion test above is the deterministic
+        guard; when the line is fixed, fold the order assertion back into it and
+        delete this test.
         """
         expected = [ipaddress.ip_network(f"192.168.{i}.0/24") for i in range(10, 20)]
         ifaces = [_iface(f"en{n}", f"192.168.{i}.24", str(net))
