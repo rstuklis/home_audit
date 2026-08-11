@@ -400,6 +400,194 @@ def _read_arp_bsd():
 # Scanning
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# IPv6 neighbours and router advertisements
+#
+# Rogue RA is among the easiest LAN takeovers there is. An attacker advertises
+# itself as an IPv6 default router, SLAAC does the rest, and because macOS
+# prefers IPv6 the traffic reroutes silently — while an IPv4-only audit reports
+# a perfectly clean network. It is the one attack in this tool's scope that
+# produced no signal at all.
+#
+# Detection is comparative, not absolute: one advertising router is normal, a
+# second one appearing is the alarm, and a router that was not in the baseline
+# is the stronger alarm. Both dialects are parsed into the same shape so the
+# Mac and an observer agree on what they saw.
+# ---------------------------------------------------------------------------
+
+_MAC_RE = re.compile(r"^[0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5}$")
+
+
+def _normalise_v6(raw):
+    """Return (canonical_address_with_zone, bare_address) or (None, None)."""
+    addr, sep, zone = raw.partition("%")
+    try:
+        parsed = ipaddress.ip_address(addr)
+    except ValueError:
+        return None, None
+    if parsed.version != 6:
+        return None, None
+    return str(parsed) + sep + zone, str(parsed)
+
+
+def _normalise_mac(raw):
+    if not _MAC_RE.match(raw or ""):
+        return None
+    try:
+        return ":".join(f"{int(x, 16):02x}" for x in raw.split(":"))
+    except ValueError:
+        return None
+
+
+def parse_ndp_neighbours(out):
+    """macOS `ndp -a`.
+
+        Neighbor                    Linklayer Address  Netif Expire    S Flags
+        fe80::1%en0                 3c:22:fb:11:22:33  en0   23h59m58s S R
+
+    The R flag marks a router — that column is the whole point of reading this.
+    """
+    neighbours = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0].lower().startswith("neighbor"):
+            continue
+        addr, _ = _normalise_v6(parts[0])
+        mac = _normalise_mac(parts[1])
+        if not addr or not mac:
+            continue          # (incomplete) entries carry no usable address
+        neighbours[addr] = {
+            "mac": mac,
+            "iface": parts[2],
+            "router": "R" in parts[3:],
+        }
+    return neighbours
+
+
+def parse_ndp_routers(out):
+    """macOS `ndp -r` -> 'fe80::1%en0 if=en0, flags=O, pref=medium, ...'."""
+    routers = []
+    for line in out.splitlines():
+        token = line.split()[0] if line.split() else ""
+        addr, _ = _normalise_v6(token)
+        if addr and addr not in routers:
+            routers.append(addr)
+    return routers
+
+
+def parse_neigh6_iproute(out):
+    """Linux `ip -6 neigh show`. The literal word `router` marks a router."""
+    neighbours = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or "FAILED" in parts or "INCOMPLETE" in parts:
+            continue
+        addr, _ = _normalise_v6(parts[0])
+        if not addr or "lladdr" not in parts:
+            continue
+        mac = _normalise_mac(parts[parts.index("lladdr") + 1])
+        if not mac:
+            continue
+        neighbours[addr] = {
+            "mac": mac,
+            "iface": parts[parts.index("dev") + 1] if "dev" in parts else "",
+            "router": "router" in parts,
+        }
+    return neighbours
+
+
+def parse_routes6_iproute(out):
+    """Linux `ip -6 route show default`.
+
+        default via fe80::1 dev eth0 proto ra metric 1024 expires 1794sec
+
+    `proto ra` means the route was learned from a Router Advertisement, which
+    is exactly the mechanism being watched.
+    """
+    routers = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "default" or "via" not in parts:
+            continue
+        addr, _ = _normalise_v6(parts[parts.index("via") + 1])
+        if addr and addr not in routers:
+            routers.append(addr)
+    return routers
+
+
+def get_ipv6_neighbours():
+    neighbours = parse_ndp_neighbours(run(["ndp", "-a"]))
+    if neighbours:
+        return neighbours
+    return parse_neigh6_iproute(run(["ip", "-6", "neigh", "show"]))
+
+
+def get_ipv6_routers():
+    """Every address currently advertising itself as an IPv6 default router."""
+    routers = parse_ndp_routers(run(["ndp", "-r"]))
+    if routers:
+        return routers
+    routers = parse_routes6_iproute(run(["ip", "-6", "route", "show", "default"]))
+    if routers:
+        return routers
+    # Last resort: the neighbour table's own router flag. Less authoritative
+    # than the routing table but better than reporting none at all.
+    return sorted(a for a, n in get_ipv6_neighbours().items() if n.get("router"))
+
+
+def check_ipv6_routers(known=None):
+    """Classify the advertising routers against the ones seen before.
+
+    `known` is the baseline's list. Absolute counts alone are not enough: one
+    router is normal, and on a network that legitimately has two the count
+    would cry wolf forever. A router that was never in the baseline is the
+    signal worth waking someone for.
+    """
+    routers = get_ipv6_routers()
+    known = list(known or [])
+    unexpected = [r for r in routers if r not in known] if known else []
+
+    if not routers:
+        return {"routers": [], "unexpected": [], "risk": "INFO",
+                "note": "No IPv6 router is advertising on this link."}
+    if unexpected:
+        return {"routers": routers, "unexpected": unexpected, "risk": "HIGH",
+                "note": f"IPv6 router(s) not in the baseline: {', '.join(unexpected)}. "
+                        "A rogue Router Advertisement makes the sender your default "
+                        "gateway for IPv6, and macOS prefers IPv6 — traffic would "
+                        "reroute with nothing visible on the IPv4 side."}
+    if len(routers) > 1 and not known:
+        return {"routers": routers, "unexpected": [], "risk": "HIGH",
+                "note": f"{len(routers)} IPv6 routers are advertising: "
+                        f"{', '.join(routers)}. More than one is the classic sign of "
+                        "a rogue Router Advertisement; confirm every one is yours, "
+                        "then save a baseline so only new ones are flagged."}
+    if len(routers) > 1:
+        # Every one of them is in the baseline, so the operator has already
+        # accepted this network's shape. Re-flagging it HIGH on every run would
+        # train them to skip the section that shows a genuinely new router.
+        return {"routers": routers, "unexpected": [], "risk": "OK",
+                "note": f"{len(routers)} IPv6 routers advertising "
+                        f"({', '.join(routers)}), all of them in the baseline."}
+    return {"routers": routers, "unexpected": [], "risk": "OK",
+            "note": f"One IPv6 router advertising ({routers[0]}), matching the baseline."
+                    if known else
+                    f"One IPv6 router advertising ({routers[0]}). No baseline to "
+                    "compare against yet — save one so a second router would show up."}
+
+
+def action_ipv6_routers(known=None):
+    hr("IPv6 ROUTER ADVERTISEMENTS")
+    result = check_ipv6_routers(known)
+    neighbours = get_ipv6_neighbours()
+    print(f"  IPv6 neighbours seen : {len(neighbours)}")
+    for addr, n in sorted(neighbours.items()):
+        flag = "  <-- advertising as a router" if n.get("router") else ""
+        print(f"    {addr:<42} {n['mac']}{flag}")
+    print(f"  [{result['risk']:6}] {result['note']}")
+    return result
+
+
 def check_port(host, port, timeout=0.6):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1019,6 +1207,15 @@ def diff_baseline(old, new):
         notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
     if old_ports - new_ports:
         notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
+    old_ra = set(old.get("ipv6_routers", []))
+    new_ra = set(new.get("ipv6_routers", []))
+    if new_ra - old_ra:
+        notes.append(
+            "NEW IPv6 router advertising on the LAN: "
+            f"{sorted(new_ra - old_ra)} — a rogue Router Advertisement would "
+            "look exactly like this, and reroutes traffic with no IPv4 sign.")
+    if old_ra - new_ra:
+        notes.append(f"IPv6 router(s) no longer advertising: {sorted(old_ra - new_ra)}")
     if set(old.get("dns", [])) != set(new.get("dns", [])):
         notes.append(f"DNS servers CHANGED: was {old.get('dns')}, now {new.get('dns')}")
     return notes
@@ -2785,6 +2982,10 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     arp = action_arp_spoof_check()
     state["arp_spoof"] = arp
+
+    ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
+    state["ipv6"] = ra
+    state["ipv6_routers"] = ra["routers"]
 
     fw = action_firewall_check()
     state["firewall"] = fw
