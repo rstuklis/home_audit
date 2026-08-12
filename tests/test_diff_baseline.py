@@ -447,12 +447,11 @@ class TestKnownBugs:
 
         assert any(INTRUDER in n for n in notes), "new device masked by a corrupt neighbour"
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "lines 428-433 diff only 'router_open_ports'. 'upstream_open_ports' is "
-        "collected (line 2123) and saved into the baseline but never compared, "
-        "so Telnet appearing on the upstream modem is silent."))
     def test_new_port_on_the_upstream_modem_is_reported(self, mod):
+        # Fixed regression: only 'router_open_ports' was diffed.
+        # 'upstream_open_ports' had been collected and saved into the baseline
+        # all along but never compared, so Telnet appearing on the modem was
+        # silent — on the one device in the house facing the internet directly.
         old = {"router_open_ports": [80], "upstream_open_ports": [80]}
         new = {"router_open_ports": [80], "upstream_open_ports": [23, 80]}
 
@@ -462,11 +461,35 @@ class TestKnownBugs:
         assert "23" in notes[0]
         assert "upstream" in notes[0].lower(), "note must say which host opened the port"
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "lines 428-433 diff only 'router_open_ports'; a port closing on the "
-        "upstream modem (line 2123's 'upstream_open_ports') is never reported."))
+    def test_an_unmeasured_upstream_scan_is_not_diffed(self, mod):
+        # The upstream host gets the same tri-state treatment as the router:
+        # None means the scan could not reach it, so comparing it against a
+        # known list would invent a change in whichever direction the blocked
+        # run happened to fall. Both directions must stay silent.
+        assert mod.diff_baseline({"upstream_open_ports": [80, 443]},
+                                 {"upstream_open_ports": None}) == []
+        assert mod.diff_baseline({"upstream_open_ports": None},
+                                 {"upstream_open_ports": [80, 443]}) == []
+
+    def test_both_hosts_are_reported_separately_in_one_run(self, mod):
+        # The note has to say WHICH host opened the port. Reporting a change on
+        # the modem as though it were on the router would send the reader to the
+        # wrong admin page, and the two hosts carry different weight.
+        old = {"router_open_ports": [80], "upstream_open_ports": [80]}
+        new = {"router_open_ports": [80, 8080], "upstream_open_ports": [80, 23]}
+
+        notes = mod.diff_baseline(old, new)
+
+        router_note = [n for n in notes if "router" in n and "8080" in n]
+        modem_note = [n for n in notes if "upstream" in n and "23" in n]
+        assert router_note and modem_note, f"hosts not reported separately: {notes}"
+        assert "8080" not in modem_note[0] and "23" not in router_note[0], \
+            "a port was attributed to the wrong host"
+
     def test_closed_port_on_the_upstream_modem_is_reported(self, mod):
+        # The other direction of the same gap. A port closing matters too: it
+        # can mean a service you rely on has died, or that something reconfigured
+        # the modem without telling you.
         old = {"upstream_open_ports": [80, 443]}
         new = {"upstream_open_ports": [443]}
 

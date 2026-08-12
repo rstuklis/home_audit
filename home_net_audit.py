@@ -1699,15 +1699,28 @@ def diff_baseline(old, new):
     # Diffing an unknown against a known would invent a change in whichever
     # direction the blocked run happened to fall: a blocked new run reads as
     # "all ports closed", and the recovery run after it as "all ports opened".
-    old_ports = old.get("router_open_ports")
-    new_ports = new.get("router_open_ports")
-    if old_ports is not None and new_ports is not None:
+    #
+    # Both scanned hosts are compared, not just the router. upstream_open_ports
+    # has been collected and saved into the baseline all along but never diffed,
+    # so Telnet appearing on the modem was completely silent — on the one device
+    # in the house that faces the internet directly, where an open port is worth
+    # more than it is on the LAN side of the router behind it.
+    for key, host in (("router_open_ports", "router"),
+                      ("upstream_open_ports", "upstream modem")):
+        old_ports = old.get(key)
+        new_ports = new.get(key)
+        if old_ports is None or new_ports is None:
+            continue
         old_ports = set(old_ports)
         new_ports = set(new_ports)
         if new_ports - old_ports:
-            notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
+            note = f"NEW open port(s) on {host}: {sorted(new_ports - old_ports)}"
+            if key == "upstream_open_ports":
+                note += (". This device faces the internet, so a port opening here "
+                         "is exposed more widely than one on the router behind it.")
+            notes.append(note)
         if old_ports - new_ports:
-            notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
+            notes.append(f"Port(s) now closed on {host}: {sorted(old_ports - new_ports)}")
     old_bssids = set(old.get("wifi_bssids", []))
     new_bssids = set(new.get("wifi_bssids", []))
     if new_bssids - old_bssids:
