@@ -1596,18 +1596,99 @@ def diff_baseline(old, new):
     # only claim a rotating identifier supports. Six becoming twelve is worth
     # saying; naming which six is not, because the names are already stale.
     def _split(entry):
-        macs = {d["mac"] for d in entry.get("devices", []) if d["mac"] != "unknown"}
-        stable = {m for m in macs if not is_randomized_mac(m)}
-        return stable, macs - stable
+        """Read the device list defensively and index it by MAC.
 
-    old_macs, old_private = _split(old)
-    new_macs, new_private = _split(new)
+        Returns (stable_macs, private_macs, subnets_by_mac).
+
+        Two kinds of damage are tolerated here, because a baseline is
+        hand-editable JSON on disk and this is the code that has to survive it:
+
+        A device dict with no usable "mac" is skipped rather than indexed. It
+        used to be read as d["mac"], so a single truncated entry raised
+        KeyError, and since that happened before any comparison, the healthy
+        devices beside it were never compared at all — a real intruder sitting
+        next to one corrupt record was silently never reported.
+
+        MACs are lowercased. read_arp_table already normalises, so both sides
+        agreed only by coincidence; a baseline that had been hand-edited or
+        pasted from a vendor page (uppercase is the usual rendering) made every
+        unmoved device read as one arriving AND one leaving, on every run, for
+        ever.
+        """
+        macs = set()
+        subnets = {}
+        for d in entry.get("devices", []) or []:
+            if not isinstance(d, dict):
+                continue
+            mac = d.get("mac")
+            if not isinstance(mac, str) or mac == "unknown":
+                continue
+            mac = mac.lower()
+            macs.add(mac)
+            subnet = d.get("subnet")
+            if isinstance(subnet, str) and subnet:
+                subnets.setdefault(mac, set()).add(subnet)
+        stable = {m for m in macs if not is_randomized_mac(m)}
+        return stable, macs - stable, subnets
+
+    old_macs, old_private, old_subnets = _split(old)
+    new_macs, new_private, new_subnets = _split(new)
     appeared = new_macs - old_macs
     vanished = old_macs - new_macs
     if appeared:
         notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
     if vanished:
         notes.append(f"Device(s) gone since baseline: {', '.join(sorted(vanished))}")
+    # A device that changes subnet leaves the MAC set completely unchanged, so
+    # the two comparisons above are structurally blind to it — collect_devices
+    # records a "subnet" per device precisely so this can be seen. It matters
+    # in both directions: something that was on the guest network appearing on
+    # the trusted one is a boundary being crossed, and a device that moved the
+    # other way may have been re-homed by someone else. Only stable MACs are
+    # considered; a rotating private address is a different identity each run,
+    # so "the same device moved" is a claim it cannot support.
+    # One test carries the claim: this run swept every subnet the device used to
+    # be on and did not find it there, so "it left" is a measurement rather than
+    # an absence of looking. Without it, two runs covering different ground
+    # report a move for every device answering on both (a gateway, or a VLAN
+    # subinterface sharing the parent MAC) — the menu's device scan sweeps one
+    # subnet chosen from DEFAULT_NETWORKS while a full audit sweeps what the
+    # interfaces suggest, so "not seen there" and "never looked there" have to be
+    # told apart, and only a recorded sweep list can do it.
+    #
+    # Requiring the BASELINE to have covered the destination too was a mistake
+    # worth naming, because it read as caution and behaved as blindness. That
+    # test asks only whether the destination is novel, and on an unknown answer
+    # it discarded the half of the finding that HAD been measured. A baseline
+    # saved from the menu covers the single subnet it swept, so the veto silenced
+    # a move onto any other network — including a device crossing from the IoT
+    # subnet to the trusted one, the exact boundary crossing this check exists to
+    # catch. Novelty of the destination is worth saying, never worth suppressing
+    # the note for.
+    new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
+    old_cov = {s for s in (old.get("scanned_subnets") or ()) if isinstance(s, str)}
+    moved = []
+    for mac in sorted(old_subnets.keys() & new_subnets.keys() & old_macs & new_macs):
+        was, now = old_subnets[mac], new_subnets[mac]
+        if new_cov and was.isdisjoint(now) and was <= new_cov:
+            entry = f"{mac} ({', '.join(sorted(was))} -> {', '.join(sorted(now))})"
+            if old_cov and not now <= old_cov:
+                entry += " [the baseline never covered that destination]"
+            moved.append(entry)
+    if moved:
+        # This note is reported whatever else fired, and it claims nothing about
+        # anything else. It used to end "The MAC set is unchanged, so nothing
+        # else about the network looks different" — a statement about the WHOLE
+        # report, made from inside one check, before the router-port, evil-twin,
+        # DHCP and certificate comparisons below have even run. It printed
+        # directly above a new-open-port and an evil-twin finding and told the
+        # reader to stand down about them. Gating the whole note on there being
+        # no arrivals was no better: it deleted a boundary crossing precisely
+        # when the run was at its most eventful.
+        notes.append(
+            f"Device(s) moved to a different subnet: {'; '.join(moved)}. A device "
+            "that changes subnet keeps its MAC, so it is not reported as an "
+            "arrival or a departure above.")
     if len(new_private) > len(old_private):
         notes.append(
             f"{len(new_private)} device(s) using rotating private addresses, up "
@@ -3434,6 +3515,31 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
         print(f"    python3 home_net_audit.py --label MAC='Device Name' ...")
 
 
+def onlink_coverage(subnets_to_sweep, interfaces):
+    """Which swept subnets this host could actually have seen a device on.
+
+    A sweep is evidence of absence only where a sighting was possible. Device
+    discovery resolves neighbours through the ARP cache, which holds ON-LINK
+    entries only, so sweeping a subnet this machine has no interface in returns
+    nothing whatever is actually there. Recording that as "scanned" converts
+    "could not reach" into "measured absence" — the single inference the rest of
+    this module refuses to make (probe_port keeps unreachable as a third state;
+    audit_host will not print a blocked scan as "no open ports"; diff_baseline
+    will not compare a router-port list against an unknown).
+
+    It matters because the sweep list is often fixed while the vantage point is
+    not: menu option 3's "All networks" sweeps all of DEFAULT_NETWORKS, and a
+    --subnet job sweeps whatever it was given, regardless of which network this
+    Mac happens to be joined to today. Without this filter, a laptop moving
+    between household SSIDs makes the router — one MAC answering on whichever
+    subnet is currently on-link — look like it crossed a network boundary, when
+    only the observer moved.
+    """
+    onlink = [net for _, _, net in (interfaces or [])]
+    return [str(s) for s in subnets_to_sweep
+            if any(s.overlaps(net) for net in onlink)]
+
+
 def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
     """Build the ordered list of subnets to sweep: CLI overrides (validated) or
     auto-detected interfaces, plus any explicit extras. Invalid CIDRs are
@@ -3515,6 +3621,13 @@ def action_discover_devices(no_vendors=False, subnet_overrides=None, extra_subne
 
     subnet_overrides  — replace auto-detected subnets entirely (CLI --subnet flag)
     extra_subnets     — append to auto-detected subnets (menu option 3b / Pearl network)
+
+    Returns (devices, scanned_subnets). The second element is which subnets were
+    actually swept, as strings. A caller that saves a baseline must record it:
+    without it a later comparison cannot tell a device that left a subnet from a
+    subnet that was never scanned, and this entry point is exactly where the two
+    diverge — it sweeps whatever single subnet the menu offered, while a full
+    audit sweeps what the interfaces suggest.
     """
     hr("CONNECTED DEVICES")
     interfaces = get_all_interfaces()
@@ -3525,12 +3638,15 @@ def action_discover_devices(no_vendors=False, subnet_overrides=None, extra_subne
     subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
     if not subnets_to_sweep:
         print("  Could not determine any subnet. Pass one with --subnet 192.168.1.0/24")
-        return []
+        return [], []
 
     all_devices = collect_devices(subnets_to_sweep, labels, networks,
                                   no_vendors=no_vendors, sweep_note="  (this takes ~10-30s)")
     _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
-    return all_devices
+    # Only the on-link subnets count as coverage. This entry point is where the
+    # sweep list and the vantage point diverge most: "All networks" sweeps every
+    # DEFAULT_NETWORKS entry whether or not this Mac is joined to any of them.
+    return all_devices, onlink_coverage(subnets_to_sweep, interfaces)
 
 
 def action_check_dns():
@@ -3653,6 +3769,12 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         if subnets_to_sweep:
             all_devices = collect_devices(subnets_to_sweep, labels, networks, no_vendors=no_vendors)
             state["devices"] = all_devices
+            # Record where we looked AND could have seen something — not merely
+            # what was on the sweep list. Without this a later comparison cannot
+            # tell "the device is no longer on that subnet" from "that subnet
+            # was never scanned this run"; with the unfiltered list it cannot
+            # tell it from "that subnet was unreachable from here".
+            state["scanned_subnets"] = onlink_coverage(subnets_to_sweep, interfaces)
             _print_devices_grouped(all_devices, labels, networks, scanned_subnets=subnets_to_sweep)
 
     # Speed test
@@ -3838,8 +3960,13 @@ def interactive_menu():
                 subnet_overrides = [ordered[0][0]]
 
             no_v = input("  Skip vendor lookups (faster)? [y/N]: ").strip().lower() == "y"
-            devices = action_discover_devices(no_vendors=no_v, subnet_overrides=subnet_overrides)
+            devices, swept = action_discover_devices(no_vendors=no_v,
+                                                     subnet_overrides=subnet_overrides)
             ts(); session_state["devices"] = devices
+            # This path sweeps ONE subnet chosen from the menu, which is
+            # routinely not the ground a full audit covers. Recording it is what
+            # stops a later comparison calling that difference a device move.
+            session_state["scanned_subnets"] = swept
 
         elif choice == "4":
             dns = action_check_dns()

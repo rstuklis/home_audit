@@ -83,16 +83,15 @@ class TestDeviceAppearedOrVanished:
 
         assert mod.diff_baseline(old, new) == []
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "lines 420-421 build the MAC sets from the raw d['mac'] strings, so the "
-        "comparison is case-sensitive: '3C:22:FB:...' and '3c:22:fb:...' are two "
-        "different devices and one unmoved device raises BOTH a 'NEW device(s)' "
-        "and a 'Device(s) gone' note. read_arp_table normalises to lowercase "
-        "(line 218), so the two sides only agree by accident — a hand-edited or "
-        "vendor-pasted baseline (uppercase is the usual vendor rendering) breaks "
-        "the coincidence and double-alarms forever."))
     def test_a_mac_differing_only_in_case_is_the_same_device(self, mod):
+        # Fixed regression: the MAC sets were built from the raw d['mac']
+        # strings, so the comparison was case-sensitive and '3C:22:FB:...' and
+        # '3c:22:fb:...' were two different devices — one unmoved device raised
+        # BOTH a 'NEW device(s)' and a 'Device(s) gone' note. read_arp_table
+        # normalises to lowercase, so the two sides agreed only by accident; a
+        # hand-edited or vendor-pasted baseline (uppercase is the usual vendor
+        # rendering) broke the coincidence and double-alarmed for ever.
+        # _split now lowercases both sides.
         old = {"devices": [dev(LAPTOP.upper())]}
         new = {"devices": [dev(LAPTOP)]}
 
@@ -411,13 +410,12 @@ class TestCombinedChanges:
 
 
 class TestKnownBugs:
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "lines 420-421 index d['mac'] directly, so one device dict missing the "
-        "'mac' key raises KeyError and change detection dies. Baselines are "
-        "hand-editable JSON on disk and a truncated write corrupts them."))
     @pytest.mark.parametrize("corrupt_side", ["old", "new"], ids=["corrupt_old", "corrupt_new"])
     def test_device_entry_without_a_mac_key_degrades_instead_of_raising(self, mod, corrupt_side):
+        # Fixed regression: d['mac'] was indexed directly, so one device dict
+        # missing the 'mac' key raised KeyError and change detection died
+        # outright. Baselines are hand-editable JSON on disk and a truncated
+        # write corrupts them. _split now skips entries without a usable MAC.
         healthy = {"devices": [dev(LAPTOP)]}
         corrupt = {"devices": [{"ip": "192.168.1.99"}]}  # truncated write: no "mac"
         old, new = (corrupt, healthy) if corrupt_side == "old" else (healthy, corrupt)
@@ -426,12 +424,22 @@ class TestKnownBugs:
 
         assert isinstance(notes, list)
         assert all(isinstance(n, str) for n in notes)
+        # Asserting only "it did not raise" was too weak to be worth much: a
+        # version that indexed the corrupt record as an empty MAC also passes
+        # that, while emitting "NEW device(s) since baseline: " — an unnamed
+        # intruder alarm nobody can act on or dismiss. Found by adversarial
+        # review, which demonstrated the mutation surviving the suite. Pin the
+        # exact note instead: the corrupt entry contributes nothing, and the one
+        # healthy device is named correctly on whichever side it sits.
+        expected = (f"NEW device(s) since baseline: {LAPTOP}" if corrupt_side == "old"
+                    else f"Device(s) gone since baseline: {LAPTOP}")
+        assert notes == [expected], f"corrupt entry leaked into the notes: {notes}"
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "lines 420-421 raise KeyError on a mac-less device, so the healthy "
-        "devices beside it are never compared and a real change is lost."))
     def test_a_corrupt_device_entry_does_not_hide_a_real_new_device(self, mod):
+        # Fixed regression, and the one that made the KeyError above dangerous
+        # rather than merely annoying: it was raised before any comparison ran,
+        # so the healthy devices beside the corrupt record were never compared
+        # and a real intruder went unreported.
         old = {"devices": [dev(LAPTOP)]}
         new = {"devices": [{"ip": "192.168.1.99"}, dev(INTRUDER, ip="192.168.1.66")]}
 
@@ -468,14 +476,190 @@ class TestKnownBugs:
         assert "80" in notes[0]
         assert "upstream" in notes[0].lower()
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "lines 420-423 compare MAC sets only, so a device that moves to another "
-        "subnet leaves the set unchanged and produces no note, even though "
-        "collect_devices records a 'subnet' key per device (line 2005)."))
+    def test_disjoint_scan_coverage_is_not_reported_as_a_move(self, mod):
+        # Found by adversarial review. The two runs cover different ground, so a
+        # device answering on both subnets under one MAC — a gateway, or a VLAN
+        # subinterface sharing the parent MAC — is seen on A by one run and on B
+        # by the other. The subnet sets ARE disjoint, so a disjointness test
+        # alone calls that a move; it is a scope change. This is not exotic on
+        # this tool: the menu's device scan sweeps one subnet chosen from
+        # DEFAULT_NETWORKS, a full audit sweeps what the interfaces suggest, and
+        # a baseline from one is routinely compared against the other.
+        MAC = "3c:22:fb:11:22:33"
+        old = {"devices": [dev(MAC, ip="192.168.85.5", subnet="192.168.85.0/24")],
+               "scanned_subnets": ["192.168.85.0/24"]}
+        new = {"devices": [dev(MAC, ip="192.168.87.5", subnet="192.168.87.0/24")],
+               "scanned_subnets": ["192.168.87.0/24"]}
+
+        assert mod.diff_baseline(old, new) == [], \
+            "a scope change was reported as a device moving"
+
+    def test_no_move_is_claimed_without_recorded_coverage(self, mod):
+        # A baseline saved before scanned_subnets was recorded carries no
+        # evidence of where anyone looked, so "it is not there any more" is not
+        # a claim the data supports. Same refusal the router-port diff makes
+        # when either side is unknown.
+        MAC = "3c:22:fb:11:22:33"
+        old = {"devices": [dev(MAC, ip="192.168.1.50", subnet="192.168.1.0/24")]}
+        new = {"devices": [dev(MAC, ip="192.168.87.50", subnet="192.168.87.0/24")]}
+
+        assert mod.diff_baseline(old, new) == []
+
+    def test_coverage_records_only_subnets_a_sighting_was_possible_on(self, mod):
+        # Found by adversarial review, and the subtlest defect in this cluster.
+        # scanned_subnets used to record the nominal sweep LIST. Discovery
+        # resolves neighbours through the ARP cache, which is on-link only, so
+        # sweeping a subnet this Mac has no interface in finds nothing whatever
+        # is there — and recording it as coverage turns "could not reach" into
+        # "measured absence", the one inference the rest of the module refuses
+        # to make.
+        #
+        # The consequence: menu option 3's "All networks" sweeps all of
+        # DEFAULT_NETWORKS regardless of which SSID the laptop is on, so a
+        # router answering on whichever subnet is currently on-link looked like
+        # it crossed a network boundary every time the OBSERVER moved.
+        import ipaddress
+        sweep = [ipaddress.ip_network(s) for s in
+                 ("192.168.85.0/24", "192.168.86.0/24", "192.168.87.0/24")]
+        interfaces = [("en0", "192.168.87.249",
+                       ipaddress.ip_network("192.168.87.0/24"))]
+
+        assert mod.onlink_coverage(sweep, interfaces) == ["192.168.87.0/24"], \
+            "an unreachable subnet was recorded as if it had been searched"
+        assert mod.onlink_coverage(sweep, []) == [], \
+            "with no interfaces nothing could have been seen anywhere"
+
+    def test_the_observer_changing_network_is_not_reported_as_a_device_move(self, mod):
+        # The end-to-end shape of the bug above. The AP answers under one MAC on
+        # whichever subnet is on-link; the laptop was joined to 86 when the
+        # baseline was taken and to 87 the next day. Coverage now records only
+        # the subnet each run could actually see, so "not on 86 any more" is
+        # never claimed — because this run could not have seen it there.
+        AP = "3c:28:6d:aa:bb:cc"
+        old = {"devices": [dev(AP, ip="192.168.86.1", subnet="192.168.86.0/24")],
+               "scanned_subnets": ["192.168.86.0/24"]}
+        new = {"devices": [dev(AP, ip="192.168.87.1", subnet="192.168.87.0/24")],
+               "scanned_subnets": ["192.168.87.0/24"]}
+
+        assert not any("moved to a different subnet" in n
+                       for n in mod.diff_baseline(old, new)), \
+            "the scanning Mac changing network was reported as the AP moving"
+
+    def test_a_move_into_ground_the_baseline_never_covered_is_still_reported(self, mod):
+        # Found by adversarial review, and the most dangerous defect in this
+        # cluster because it was silent. Requiring the BASELINE to have covered
+        # the destination reads as caution and behaves as blindness: a baseline
+        # saved from the menu covers the one subnet it swept, so that test
+        # vetoed a move onto ANY other network — including a device crossing
+        # from the IoT subnet to the trusted one, which is the boundary crossing
+        # the check exists to catch. The new run swept 192.168.85.0/24 and did
+        # not find the device there; that is a measurement, and it must reach
+        # the reader whether or not the destination was ever baselined.
+        MAC = "3c:22:fb:11:22:33"
+        old = {"devices": [dev(MAC, ip="192.168.85.5", subnet="192.168.85.0/24")],
+               "scanned_subnets": ["192.168.85.0/24"]}
+        new = {"devices": [dev(MAC, ip="192.168.87.5", subnet="192.168.87.0/24")],
+               "scanned_subnets": ["192.168.85.0/24", "192.168.87.0/24"]}
+
+        notes = mod.diff_baseline(old, new)
+
+        assert any(MAC in n for n in notes), "a device leaving its baselined subnet was silent"
+        assert any("192.168.87.0/24" in n for n in notes)
+        assert any("never covered" in n for n in notes), \
+            "the note should say the destination was outside the baseline's coverage"
+
+    def test_the_move_note_survives_alongside_other_findings(self, mod):
+        # The move note was briefly gated on there being no arrivals, which
+        # deleted a boundary crossing exactly when the run was most eventful.
+        MOVER, INTRUDER_MAC = "3c:22:fb:11:22:33", "b8:27:eb:de:ad:01"
+        cov = ["192.168.1.0/24", "192.168.87.0/24"]
+        old = {"devices": [dev(MOVER, ip="192.168.1.50", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov, "router_open_ports": [80]}
+        new = {"devices": [dev(MOVER, ip="192.168.87.50", subnet="192.168.87.0/24"),
+                           dev(INTRUDER_MAC, ip="192.168.1.66", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov, "router_open_ports": [80, 23]}
+
+        notes = mod.diff_baseline(old, new)
+
+        assert any("moved to a different subnet" in n for n in notes), "the move was dropped"
+        assert any(INTRUDER_MAC in n for n in notes), "the arrival was dropped"
+        assert any("23" in n for n in notes), "the new open port was dropped"
+
+    def test_no_note_claims_the_rest_of_the_report_is_clean(self, mod):
+        # The move note used to end "nothing else about the network looks
+        # different" — a claim about the WHOLE report made from inside one
+        # check, before the router-port, evil-twin, DHCP and certificate
+        # comparisons below have even run. It printed above a new-open-port and
+        # an evil-twin finding and told the reader to stand down about them.
+        MOVER = "3c:22:fb:11:22:33"
+        cov = ["192.168.1.0/24", "192.168.87.0/24"]
+        old = {"devices": [dev(MOVER, ip="192.168.1.50", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov, "router_open_ports": [80],
+               "wifi_bssids": ["aa:aa:aa:aa:aa:aa"]}
+        new = {"devices": [dev(MOVER, ip="192.168.87.50", subnet="192.168.87.0/24")],
+               "scanned_subnets": cov, "router_open_ports": [80, 23],
+               "wifi_bssids": ["aa:aa:aa:aa:aa:aa", "bb:bb:bb:bb:bb:bb"]}
+
+        notes = mod.diff_baseline(old, new)
+
+        assert any("23" in n for n in notes) and any("evil twin" in n.lower() for n in notes)
+        assert not any("nothing else about the network" in n for n in notes), \
+            "a note told the reader to stand down about findings printed beside it"
+
+    def test_the_move_note_does_not_contradict_an_arrival_note(self, mod):
+        # Found by adversarial review, and the worst of the three: the note used
+        # to end with "The MAC set is unchanged, so nothing else about the
+        # network looks different" unconditionally — printed directly beneath a
+        # NEW-device note, telling the reader to stand down about a genuine
+        # intrusion signal three lines above it.
+        MOVER, INTRUDER_MAC = "3c:22:fb:11:22:33", "b8:27:eb:de:ad:01"
+        cov = ["192.168.1.0/24", "192.168.87.0/24"]
+        old = {"devices": [dev(MOVER, ip="192.168.1.50", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov}
+        new = {"devices": [dev(MOVER, ip="192.168.87.50", subnet="192.168.87.0/24"),
+                           dev(INTRUDER_MAC, ip="192.168.1.66", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov}
+
+        notes = mod.diff_baseline(old, new)
+
+        assert any(INTRUDER_MAC in n for n in notes), "the arrival must still be reported"
+        assert not any("nothing else about the network" in n for n in notes), \
+            "a stand-down sentence was printed alongside a real arrival"
+
+    def test_a_changed_scan_coverage_is_not_reported_as_a_move(self, mod):
+        # A device seen on {A, B} and then only on {B} has not moved — the
+        # second run simply scanned less of the network (--extra-subnet used
+        # once and not the next time). An earlier version of the move check
+        # tested `was != now` and emitted "A, B -> B", which is not a move and
+        # not a sentence. The check requires the sets to be DISJOINT: no longer
+        # on ANY subnet it used to be on. The surrounding code goes to some
+        # trouble to avoid alarms that fire when nothing happened; this is one
+        # of them.
+        MAC = "3c:22:fb:11:22:33"          # globally administered, so it is a
+                                           # stable identity the check applies to
+        both = {"devices": [dev(MAC, ip="192.168.1.5", subnet="192.168.1.0/24"),
+                            dev(MAC, ip="192.168.87.5", subnet="192.168.87.0/24")],
+                "scanned_subnets": ["192.168.1.0/24", "192.168.87.0/24"]}
+        one = {"devices": [dev(MAC, ip="192.168.87.5", subnet="192.168.87.0/24")],
+               "scanned_subnets": ["192.168.87.0/24"]}
+
+        assert mod.diff_baseline(both, one) == [], "narrower scan read as a move"
+        assert mod.diff_baseline(one, both) == [], "wider scan read as a move"
+
     def test_a_device_moving_between_subnets_is_reported(self, mod):
-        old = {"devices": [dev(LAPTOP, ip="192.168.1.50", subnet="192.168.1.0/24")]}
-        new = {"devices": [dev(LAPTOP, ip="192.168.87.50", subnet="192.168.87.0/24")]}
+        # Fixed regression: only MAC sets were compared, so a device moving to
+        # another subnet left the set unchanged and produced no note at all —
+        # structurally invisible — even though collect_devices records a
+        # 'subnet' per device. diff_baseline now compares subnets per stable MAC.
+        # Both runs swept both subnets, so "not on 192.168.1.0/24 any more" is a
+        # measurement rather than an absence of looking. Without that coverage
+        # the tool correctly declines to claim a move — see
+        # test_no_move_is_claimed_without_recorded_coverage.
+        cov = ["192.168.1.0/24", "192.168.87.0/24"]
+        old = {"devices": [dev(LAPTOP, ip="192.168.1.50", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov}
+        new = {"devices": [dev(LAPTOP, ip="192.168.87.50", subnet="192.168.87.0/24")],
+               "scanned_subnets": cov}
 
         notes = mod.diff_baseline(old, new)
 
