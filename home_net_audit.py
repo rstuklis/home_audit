@@ -3305,8 +3305,14 @@ def generate_html_report(state, output_path=None):
                     for m in mappings]
             body = table(["Ext Port", "Proto", "Int IP", "Int Port", "Description"], rows)
         else:
+            # _esc, like every sibling interpolation in this function. The note
+            # is not ours: get_upnp_port_mappings builds it from the SOAP fault
+            # or error text the router returned, so its content is chosen by the
+            # device being audited. Interpolated raw it was markup injection
+            # into a report the owner is likely to forward to someone else, from
+            # the one participant in the exchange with a reason to shape it.
             note = state["upnp"].get("note", "No UPnP port mappings found.")
-            body = f"<p>{note}</p>"
+            body = f"<p>{_esc(note)}</p>"
         sections_html += section("UPnP Port Mappings", body)
 
     # DHCP

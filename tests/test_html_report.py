@@ -320,12 +320,13 @@ class TestUpnpNoteEscaping:
              "int_port": 80, "description": PAYLOAD}]}})
         assert PAYLOAD not in text
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1755 renders the UPnP note as f'<p>{note}</p>' with no "
-        "_esc() call, so a router-supplied note is injected into the report raw. "
-        "Every sibling interpolation in generate_html_report goes through _esc."))
     def test_a_upnp_note_is_escaped(self, mod, tmp_path):
+        # Fixed regression: the note was rendered as f'<p>{note}</p>' with no
+        # _esc() call while every sibling interpolation went through _esc. The
+        # note is built from the SOAP fault or error text the ROUTER returned,
+        # so its content is chosen by the device under audit — raw
+        # interpolation was markup injection into a report the owner is likely
+        # to forward, from the one participant with a reason to shape it.
         text = render(mod, tmp_path, {"upnp": {"mappings": [], "note": PAYLOAD}})
         assert PAYLOAD not in text
         assert ESCAPED_PAYLOAD in text
