@@ -2973,7 +2973,30 @@ def check_sharing_services():
                            capture_output=True, text=True, timeout=5)
         m = re.search(r'"com\.apple\.smbd"\s*=>\s*(\w+)', p.stdout)
         if m:
-            smb_cfg = (m.group(1) == "enabled")
+            # This is the dict of DISABLED services, so the value answers "is it
+            # disabled?", not "is it on?". Two dialects appear across macOS
+            # versions and only an explicit map reads both:
+            #
+            #   "=> true"      listed as disabled      -> SMB off
+            #   "=> disabled"  listed as disabled      -> SMB off
+            #   "=> enabled"   listed as NOT disabled  -> SMB on
+            #   "=> false"     listed as NOT disabled  -> SMB on
+            #
+            # `== "enabled"` got three of the four right and read "=> false" —
+            # the one token that means sharing is ON — as off. That is the
+            # dangerous direction to be wrong in: smbd is launch-on-demand, so a
+            # Mac that is genuinely sharing files sits with "state = not
+            # running" and port 445 closed, and neither live probe can see it.
+            # The config flag is the only signal that can tell the truth, and it
+            # printed a confident "Disabled." over a real exposure.
+            #
+            # Anything outside these four tokens leaves smb_cfg as None so the
+            # live probes decide, rather than a guess dressed as a measurement.
+            token = m.group(1).lower()
+            if token in ("enabled", "false"):
+                smb_cfg = True
+            elif token in ("disabled", "true"):
+                smb_cfg = False
     except (subprocess.TimeoutExpired, OSError):
         pass
     smb_on = bool(smb_cfg) or (_launchd_running("com.apple.smbd") is True) \

@@ -342,20 +342,6 @@ class TestSharingServicesSMB:
         assert smb["enabled"] is False
         assert smb["risk"] == "OK"
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1444 computes smb_cfg = (m.group(1) == 'enabled') over the "
-        "output of `launchctl print-disabled system`, which is a dict of DISABLED "
-        "services. In the boolean dialect of that dict '=> false' means 'NOT disabled', "
-        "i.e. File Sharing is ON, yet the comparison yields False. Line 1447's "
-        "`smb_on = bool(smb_cfg) or ...` cannot rescue it: smbd is launch-on-demand, so an "
-        "idle Mac that is genuinely sharing shows 'state = not running' and a closed port "
-        "445, and the audit prints a confident false OFF (risk OK, note 'Disabled.'). "
-        "The inversion is confined to the boolean dialect: '=> true' and '=> disabled' "
-        "both correctly yield off, '=> enabled' correctly yields on, and only '=> false' "
-        "-- the one token that means ON -- is read backwards. A maintainer who establishes "
-        "that '=> false' is unreachable on every supported macOS version may therefore "
-        "delete this marker with that justification rather than by changing line 1444."))
     def test_boolean_dialect_false_means_not_disabled_so_smb_is_on(
             self, mod, monkeypatch, fixture):
         """`"com.apple.smbd" => false` in the disabled-services dict means SMB is ON.
@@ -371,6 +357,8 @@ class TestSharingServicesSMB:
         enabled-but-idle launch-on-demand smbd, so the config flag is the only
         signal that can tell the truth here, and it is inverted.
         """
+        # Fixed: check_sharing_services now maps all four tokens explicitly
+        # instead of `== "enabled"`, which read the one token meaning ON as OFF.
         dump = fixture("launchctl_print_disabled_legacy_bools.out")
         assert '"com.apple.smbd" => false' in dump, "fixture must carry the boolean dialect"
         _patch_sharing(monkeypatch, mod,
