@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: Downloads/home_audit
-
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -48,7 +44,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-xml
-          path: Downloads/home_audit/coverage.xml
+          path: coverage.xml
           if-no-files-found: error
 
   macos:

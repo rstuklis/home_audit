@@ -13,7 +13,7 @@ place in the integrity chain, so a later silent rewrite is detectable.
 
 Run it yourself in a terminal, so the prompt can read your passphrase securely:
 
-    python3 ~/Downloads/home_audit/seal_baseline.py
+    python3 ~/src/home_audit/seal_baseline.py
 
 Leave the passphrase blank to abort without changing anything.
 """
