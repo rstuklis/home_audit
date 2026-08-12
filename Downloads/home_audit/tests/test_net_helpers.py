@@ -12,6 +12,7 @@ boundaries:
   instead of aborting the sweep (same commit: EMFILE under high worker counts).
 """
 
+import errno
 import ipaddress
 import socket
 import subprocess
@@ -482,16 +483,25 @@ class TestCheckPort:
 
 
 class TestScanPorts:
+    """scan_ports fans probe_port out over a thread pool and keeps the opens.
+
+    The fake seam is `probe_port`, not `check_port`: scan_ports needs the
+    three-state answer (open / closed / unreachable) that check_port's boolean
+    throws away. A boolean fake still works here because True and False are two
+    of those three states; the unreachable case is covered in
+    TestScanPortsDetailed below.
+    """
+
     def test_returns_only_open_ports_sorted_ascending(self, mod, monkeypatch):
-        monkeypatch.setattr(mod, "check_port", make_check_port([80, 22, 8080]))
+        monkeypatch.setattr(mod, "probe_port", make_check_port([80, 22, 8080]))
         assert mod.scan_ports("192.168.85.1", [443, 8080, 22, 80, 445]) == [22, 80, 8080]
 
     def test_no_open_ports_yields_an_empty_list(self, mod, monkeypatch):
-        monkeypatch.setattr(mod, "check_port", make_check_port([]))
+        monkeypatch.setattr(mod, "probe_port", make_check_port([]))
         assert mod.scan_ports("192.168.85.1", [22, 80, 443]) == []
 
     def test_empty_port_list_yields_an_empty_list(self, mod, monkeypatch):
-        monkeypatch.setattr(mod, "check_port", make_check_port([22]))
+        monkeypatch.setattr(mod, "probe_port", make_check_port([22]))
         assert mod.scan_ports("192.168.85.1", []) == []
 
     def test_every_requested_port_is_probed_on_the_requested_host(self, mod, monkeypatch):
@@ -501,7 +511,7 @@ class TestScanPorts:
             probed.append((host, port))
             return port == 22
 
-        monkeypatch.setattr(mod, "check_port", spy)
+        monkeypatch.setattr(mod, "probe_port", spy)
         mod.scan_ports("192.168.85.1", [22, 80, 443], workers=4)
         assert sorted(probed) == [("192.168.85.1", 22), ("192.168.85.1", 80),
                                   ("192.168.85.1", 443)]
@@ -514,14 +524,14 @@ class TestScanPorts:
                 raise OSError(24, "Too many open files")
             return port in (22, 80)
 
-        monkeypatch.setattr(mod, "check_port", flaky)
+        monkeypatch.setattr(mod, "probe_port", flaky)
         assert mod.scan_ports("192.168.85.1", [22, 80, 443, 445]) == [22, 80]
 
     def test_a_probe_that_raises_is_reported_closed_not_open(self, mod, monkeypatch):
         def always_raises(host, port, timeout=0.6):
             raise OSError(24, "Too many open files")
 
-        monkeypatch.setattr(mod, "check_port", always_raises)
+        monkeypatch.setattr(mod, "probe_port", always_raises)
         assert mod.scan_ports("192.168.85.1", [22, 80]) == []
 
     def test_a_duplicated_input_port_is_probed_and_reported_twice(self, mod, monkeypatch):
@@ -529,13 +539,135 @@ class TestScanPorts:
         # is keyed by future, not by port, so a caller-supplied duplicate lands
         # in the result twice. Latent only — both in-tree callers pass a
         # de-duplicated sequence (COMMON_PORTS is sorted(set(...)), or range()).
-        monkeypatch.setattr(mod, "check_port", make_check_port([22]))
+        monkeypatch.setattr(mod, "probe_port", make_check_port([22]))
         assert mod.scan_ports("192.168.85.1", [22, 22, 80]) == [22, 22]
 
     def test_accepts_any_iterable_of_ports_not_just_a_list(self, mod, monkeypatch):
         # action_port_scan passes range(1, 65536) for a full scan.
-        monkeypatch.setattr(mod, "check_port", make_check_port([22, 80]))
+        monkeypatch.setattr(mod, "probe_port", make_check_port([22, 80]))
         assert mod.scan_ports("192.168.85.1", range(20, 90)) == [22, 80]
+
+
+class TestScanPortsDetailed:
+    """scan_ports_detailed separates "nothing is listening" from "I was blocked".
+
+    macOS Local Network privacy denies a launchd/cron-scheduled process any
+    connection to its own subnet. The refusal is instant EHOSTUNREACH, so a
+    blocked scan of 25 ports finishes in ~0ms with zero opens — identical, once
+    collapsed to a boolean, to a router with everything closed. Every scheduled
+    run of this tool reported "no open ports on your router" for that reason,
+    and saved the empty list into the baseline as fact. These tests pin the
+    distinction that stops it.
+    """
+
+    @staticmethod
+    def _fake(open_ports=(), unreachable=()):
+        def probe(host, port, timeout=0.6):
+            if port in unreachable:
+                return None
+            return port in open_ports
+        return probe
+
+    def test_all_probes_unreachable_is_reported_as_blocked(self, mod, monkeypatch):
+        ports = [22, 80, 443]
+        monkeypatch.setattr(mod, "probe_port", self._fake(unreachable=ports))
+        result = mod.scan_ports_detailed("192.168.87.1", ports)
+        assert result["blocked"] is True
+        assert result["open"] == []
+        assert result["unreachable"] == 3
+
+    def test_a_genuinely_closed_host_is_not_reported_as_blocked(self, mod, monkeypatch):
+        # Every port closed is a real, reportable finding; it must not be
+        # confused with the blocked case just because both yield no opens.
+        monkeypatch.setattr(mod, "probe_port", self._fake())
+        result = mod.scan_ports_detailed("192.168.87.1", [22, 80, 443])
+        assert result["blocked"] is False
+        assert result["open"] == []
+
+    def test_a_partial_failure_is_not_blocked(self, mod, monkeypatch):
+        # Blocked means EVERY probe was refused. One unreachable port beside a
+        # real answer is noise, not a denied scan — the host clearly answered.
+        monkeypatch.setattr(mod, "probe_port",
+                            self._fake(open_ports=[80], unreachable=[443]))
+        result = mod.scan_ports_detailed("192.168.87.1", [80, 443])
+        assert result["blocked"] is False
+        assert result["open"] == [80]
+
+    def test_no_ports_probed_is_not_blocked(self, mod, monkeypatch):
+        # Guards the `probed > 0` term: an empty port list must not divide by
+        # nothing and declare the host unreachable.
+        monkeypatch.setattr(mod, "probe_port", self._fake())
+        assert mod.scan_ports_detailed("192.168.87.1", [])["blocked"] is False
+
+    def test_scan_ports_still_returns_just_the_open_list(self, mod, monkeypatch):
+        # The thin wrapper keeps its old contract for the callers that only
+        # ever wanted the opens.
+        monkeypatch.setattr(mod, "probe_port",
+                            self._fake(open_ports=[80, 22], unreachable=[443]))
+        assert mod.scan_ports("192.168.87.1", [443, 80, 22]) == [22, 80]
+
+
+class TestProbePortTriState:
+    """probe_port's three states, driven through a fake socket.
+
+    connect_ex returns the errno rather than raising, so the unreachable case
+    is a return value, not an exception — which is exactly why it was so easy
+    to collapse into "closed".
+    """
+
+    @staticmethod
+    def _socket_returning(rc):
+        class FakeSocket:
+            def settimeout(self, t): pass
+            def connect_ex(self, addr): return rc
+            def close(self): pass
+        return lambda *a, **k: FakeSocket()
+
+    def test_rc_zero_is_open(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.socket, "socket", self._socket_returning(0))
+        assert mod.probe_port("192.168.87.1", 80) is True
+
+    def test_connection_refused_is_closed(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.socket, "socket",
+                            self._socket_returning(errno.ECONNREFUSED))
+        assert mod.probe_port("192.168.87.1", 80) is False
+
+    def test_timeout_is_closed_not_unreachable(self, mod, monkeypatch):
+        # A filtered port that never answers is "closed" for our purposes; only
+        # an unreachable-class errno means the probe never left the machine.
+        monkeypatch.setattr(mod.socket, "socket",
+                            self._socket_returning(errno.ETIMEDOUT))
+        assert mod.probe_port("192.168.87.1", 80) is False
+
+    @pytest.mark.parametrize("code", [errno.EHOSTUNREACH, errno.ENETUNREACH,
+                                      errno.ENETDOWN, errno.EHOSTDOWN])
+    def test_unreachable_errnos_are_none(self, mod, monkeypatch, code):
+        # EHOSTUNREACH (65 on macOS, 113 on Linux) is what Local Network
+        # privacy returns; compare via the errno module, never the raw number.
+        monkeypatch.setattr(mod.socket, "socket", self._socket_returning(code))
+        assert mod.probe_port("192.168.87.1", 80) is None
+
+    def test_socket_construction_failing_unreachably_is_none(self, mod, monkeypatch):
+        def boom(*a, **k):
+            raise OSError(errno.EHOSTUNREACH, "No route to host")
+        monkeypatch.setattr(mod.socket, "socket", boom)
+        assert mod.probe_port("192.168.87.1", 80) is None
+
+    def test_emfile_is_closed_not_unreachable(self, mod, monkeypatch):
+        # Regression guard, commit 0a79294: EMFILE under a 100-worker pool is a
+        # local resource limit, not a network verdict. It must stay "closed" so
+        # a busy scan is never mistaken for a denied one.
+        def boom(*a, **k):
+            raise OSError(errno.EMFILE, "Too many open files")
+        monkeypatch.setattr(mod.socket, "socket", boom)
+        assert mod.probe_port("192.168.87.1", 80) is False
+
+    def test_check_port_stays_boolean_for_the_unreachable_case(self, mod, monkeypatch):
+        # check_port's callers ask about one known port on localhost and want a
+        # yes/no; unreachable must read as not-open, never as None.
+        monkeypatch.setattr(mod.socket, "socket",
+                            self._socket_returning(errno.EHOSTUNREACH))
+        assert mod.check_port("127.0.0.1", 22) is False
 
 
 class TestGetLocalIp:

@@ -183,19 +183,114 @@ class TestRouterPorts:
     def test_both_sides_missing_the_key_is_not_a_change(self, mod):
         assert mod.diff_baseline({"dns": ["1.1.1.1"]}, {"dns": ["1.1.1.1"]}) == []
 
-    def test_dropping_the_port_section_reads_as_every_port_closing(self, mod):
-        # DOCUMENTS ACTUAL BEHAVIOUR: a scan that could not reach the gateway
-        # has no "router_open_ports" key at all, and an absent key is treated
-        # as "no ports open" rather than "not measured". main() guards the
-        # save path against this (lines 2498-2502) but a comparison against an
-        # incomplete in-session state still raises the false alarm.
+    def test_an_unmeasured_port_section_is_not_read_as_every_port_closing(self, mod):
+        # This test previously pinned the OPPOSITE, as a documented wart: an
+        # absent "router_open_ports" was treated as "no ports open" rather than
+        # "not measured", so a scan that could not reach the gateway raised a
+        # false "every port closed" alarm.
+        #
+        # The wart had a real cause, found later: macOS Local Network privacy
+        # denies a launchd-scheduled run any connection to its own subnet, and
+        # the refusal arrives as an instant EHOSTUNREACH. check_port collapsed
+        # that to False, so a blocked scan looked exactly like a router with
+        # nothing listening — and every scheduled run wrote that false empty
+        # list into the baseline. probe_port keeps the states apart and
+        # audit_host now returns None for a blocked scan, so the diff has an
+        # "unknown" to recognise. Unknown on either side means no comparison.
         old = {"router_open_ports": [80, 443]}
-        new = {}
 
-        notes = mod.diff_baseline(old, new)
+        assert mod.diff_baseline(old, {}) == []
+        assert mod.diff_baseline(old, {"router_open_ports": None}) == []
 
+    def test_a_recovered_scan_after_a_blocked_one_is_not_read_as_new_ports(self, mod):
+        # The mirror image, and the reason "unknown" must not default to []:
+        # otherwise the run after a blocked one reports every port as newly
+        # opened. Both directions have to stay silent.
+        assert mod.diff_baseline({"router_open_ports": None},
+                                 {"router_open_ports": [80, 443]}) == []
+
+    def test_a_real_port_change_is_still_reported(self, mod):
+        # The safety valve above must not silence genuine findings.
+        notes = mod.diff_baseline({"router_open_ports": [80]},
+                                  {"router_open_ports": [80, 23]})
         assert len(notes) == 1
-        assert "80" in notes[0] and "443" in notes[0]
+        assert "23" in notes[0]
+
+
+class TestUnmeasuredDoesNotDestroyTheBaseline:
+    """A run that could not measure must not overwrite the last real reading.
+
+    Found by adversarial review of the unreachable-scan change, which hardened
+    the read side (diff_baseline skips unknowns) without hardening the write
+    side. The combination was worse than the bug it replaced: a blocked run
+    saved None over the known-good port list, and because the diff then refuses
+    to compare against an unknown, the NEXT successful run reported nothing and
+    re-baselined its own reading as known-good. A port opened in between was
+    never reported, on that run or any later one — where the pre-change
+    behaviour at least raised a noisy false alarm that named the port.
+
+    main()'s existing guard cannot catch this: it skips the save only when the
+    gateway is unknown, and the gateway comes from the routing table, which
+    macOS Local Network privacy does not gate. A blocked scheduled run has a
+    perfectly good gateway and an unmeasurable scan.
+    """
+
+    def test_an_unmeasured_scan_keeps_the_previous_reading(self, mod):
+        previous = {"router_open_ports": [80, 443]}
+        merged = mod.carry_forward_unmeasured(
+            {"gateway": "192.168.87.1", "router_open_ports": None}, previous)
+        assert merged["router_open_ports"] == [80, 443]
+
+    def test_the_substitution_is_recorded_rather_than_silent(self, mod):
+        # The baseline must not imply a measurement that was never taken.
+        merged = mod.carry_forward_unmeasured(
+            {"router_open_ports": None}, {"router_open_ports": [80]})
+        assert merged["carried_forward"] == ["router_open_ports"]
+
+    def test_a_real_reading_is_never_overwritten_by_an_older_one(self, mod):
+        merged = mod.carry_forward_unmeasured(
+            {"router_open_ports": [22]}, {"router_open_ports": [80, 443]})
+        assert merged["router_open_ports"] == [22]
+        assert "carried_forward" not in merged
+
+    def test_an_empty_list_is_a_real_measurement_and_is_kept(self, mod):
+        # [] means "scanned, nothing listening" — a genuine finding, and the
+        # whole point of the tri-state. Only None is "not measured".
+        merged = mod.carry_forward_unmeasured(
+            {"router_open_ports": []}, {"router_open_ports": [80]})
+        assert merged["router_open_ports"] == []
+
+    def test_no_previous_baseline_leaves_the_unknown_as_unknown(self, mod):
+        merged = mod.carry_forward_unmeasured({"router_open_ports": None}, {})
+        assert merged["router_open_ports"] is None
+
+    def test_the_upstream_modem_reading_is_carried_forward_too(self, mod):
+        merged = mod.carry_forward_unmeasured(
+            {"upstream_open_ports": None}, {"upstream_open_ports": [443]})
+        assert merged["upstream_open_ports"] == [443]
+
+    def test_a_port_opened_during_a_blocked_run_is_still_reported_afterwards(
+            self, mod, tmp_path, monkeypatch):
+        # The reviewer's end-to-end scenario, through the real save path.
+        monkeypatch.setattr(mod, "BASELINE_FILE", str(tmp_path / "baseline.json"))
+        monkeypatch.setattr(mod, "HISTORY_FILE", str(tmp_path / "history.jsonl"))
+
+        # 1. A good interactive run establishes the known-good ports.
+        mod.save_baseline({"gateway": "192.168.87.1",
+                           "router_open_ports": [80, 443]})
+
+        # 2. A blocked scheduled run: gateway resolves, scan does not.
+        mod.save_baseline({"gateway": "192.168.87.1",
+                           "router_open_ports": None})
+        assert mod.load_baseline()["router_open_ports"] == [80, 443], \
+            "the blocked run destroyed the known-good reading"
+
+        # 3. Telnet appears. The next successful run must say so.
+        notes = mod.diff_baseline(mod.load_baseline(),
+                                  {"gateway": "192.168.87.1",
+                                   "router_open_ports": [80, 443, 23]})
+        assert any("23" in n for n in notes), \
+            f"a newly opened port went unreported after a blocked run: {notes}"
 
 
 class TestDNS:

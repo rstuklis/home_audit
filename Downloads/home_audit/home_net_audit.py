@@ -36,6 +36,7 @@ Acronyms used below:
 
 import argparse
 import concurrent.futures as futures
+import errno
 import hashlib
 import hmac
 import html
@@ -643,32 +644,93 @@ def action_ipv6_routers(known=None):
     return result
 
 
-def check_port(host, port, timeout=0.6):
+# Errors that mean "the probe never left this machine", as opposed to a port
+# that answered with a refusal. connect_ex returns the errno rather than
+# raising, and the numbers differ between macOS and Linux, so compare against
+# the errno module rather than hard-coded integers.
+UNREACHABLE_ERRNOS = frozenset((
+    errno.EHOSTUNREACH,     # no route to host
+    errno.ENETUNREACH,      # network unreachable
+    errno.ENETDOWN,         # interface down
+    errno.EHOSTDOWN,        # host down
+))
+
+
+def probe_port(host, port, timeout=0.6):
+    """Probe one TCP port. True = open, False = closed, None = unreachable.
+
+    The None case is the point of this function. macOS Local Network privacy
+    denies a background/launchd process any connection to its own subnet, and
+    the denial arrives instantly as EHOSTUNREACH — indistinguishable from a
+    closed port if the result is collapsed to a boolean. That collapse is what
+    let a blocked scheduled audit report "no open ports on your router" as
+    fact, and write that empty list into the baseline as known-good. Keep the
+    three states apart so a caller can tell "nothing is listening" from "I was
+    never allowed to ask".
+    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
-            return s.connect_ex((host, port)) == 0
+            rc = s.connect_ex((host, port))
         finally:
             s.close()
-    except OSError:
+    except OSError as e:
         # socket() itself can raise (e.g. EMFILE "too many open files" under
-        # high worker counts); treat any socket error as "port not open".
-        return False
+        # high worker counts). Preserve the unreachable distinction here too.
+        return None if e.errno in UNREACHABLE_ERRNOS else False
+    if rc == 0:
+        return True
+    return None if rc in UNREACHABLE_ERRNOS else False
+
+
+def check_port(host, port, timeout=0.6):
+    """True only if the port is open. Unreachable counts as not-open.
+
+    Kept boolean because every caller that asks about a single known port
+    (is sshd listening on 127.0.0.1?) genuinely wants a yes/no. Callers that
+    scan a host they may not be able to reach should use probe_port or
+    scan_ports_detailed instead.
+    """
+    return probe_port(host, port, timeout) is True
+
+
+def scan_ports_detailed(host, ports, workers=100):
+    """Scan `ports` and report whether the host could be reached at all.
+
+    Returns {"open": sorted list, "unreachable": int, "probed": int,
+             "blocked": bool}. `blocked` is True only when every probe came
+    back unreachable, which is the signature of a host that is off the network
+    or a scan the OS refused outright — as opposed to a few probes failing
+    while others got a real answer.
+    """
+    open_ports = []
+    unreachable = 0
+    probed = 0
+    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = {pool.submit(probe_port, host, p): p for p in ports}
+        for fut in futures.as_completed(results):
+            try:
+                result = fut.result()
+            except OSError:
+                # A single failed probe should not abort the whole scan.
+                continue
+            probed += 1
+            if result is True:
+                open_ports.append(results[fut])
+            elif result is None:
+                unreachable += 1
+    return {
+        "open": sorted(open_ports),
+        "unreachable": unreachable,
+        "probed": probed,
+        "blocked": probed > 0 and unreachable == probed,
+    }
 
 
 def scan_ports(host, ports, workers=100):
-    open_ports = []
-    with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        results = {pool.submit(check_port, host, p): p for p in ports}
-        for fut in futures.as_completed(results):
-            try:
-                if fut.result():
-                    open_ports.append(results[fut])
-            except OSError:
-                # A single failed probe should not abort the whole scan.
-                pass
-    return sorted(open_ports)
+    """Open ports only. See scan_ports_detailed to tell blocked from closed."""
+    return scan_ports_detailed(host, ports, workers)["open"]
 
 
 def ping(ip):
@@ -999,12 +1061,51 @@ def resolve_passphrase(prompt=False):
     return None
 
 
+# Measurements that a run can fail to take without failing outright. A None
+# here means "not measured this run", and must never overwrite a real reading.
+CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports")
+
+
+def carry_forward_unmeasured(state, previous=None):
+    """Return `state` with unmeasured values replaced by the last known-good ones.
+
+    Writing None over a real reading does not just lose that reading — it
+    destroys the reference point that change detection compares against, and
+    because diff_baseline correctly refuses to compare against an unknown, the
+    loss is permanent and silent: the next successful run has nothing to diff,
+    reports no change, and then saves ITS reading as the new known-good. A port
+    opened in between is never reported, on that run or any later one.
+
+    This is reachable on exactly the deployment the unreachable-scan work was
+    written for. The gateway is read from the routing table, which macOS Local
+    Network privacy does not gate, so a blocked scheduled run resolves a
+    gateway (passing main's existing incomplete-scan guard) while its port scan
+    returns None. Keeping the previous value means the eventual successful run
+    still has a real baseline to compare against.
+
+    The substitution is recorded in `carried_forward` so the saved baseline
+    never implies a measurement that was not taken.
+    """
+    if previous is None:
+        previous = load_baseline() or {}
+    carried = [k for k in CARRY_FORWARD_KEYS
+               if state.get(k) is None and previous.get(k) is not None]
+    if not carried:
+        return state
+    merged = dict(state)
+    for key in carried:
+        merged[key] = previous[key]
+    merged["carried_forward"] = sorted(carried)
+    return merged
+
+
 def save_baseline(state, passphrase=None):
     """Seal `state` into the baseline and extend the tamper-evidence chain.
 
     Returns the record that was written. Passing no passphrase still chains and
     seals, but with a bare hash rather than an HMAC — see seal_payload.
     """
+    state = carry_forward_unmeasured(state)
     history = read_history()
     prev = history[-1]["seal"] if history else None
     seq = (history[-1]["seq"] + 1) if history else 1
@@ -1513,12 +1614,19 @@ def diff_baseline(old, new):
             f"from {len(old_private)}. These cannot be identified across runs, so "
             "they are counted rather than named; a rise can be new devices or the "
             "same ones having re-randomised.")
-    old_ports = set(old.get("router_open_ports", []))
-    new_ports = set(new.get("router_open_ports", []))
-    if new_ports - old_ports:
-        notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
-    if old_ports - new_ports:
-        notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
+    # None means the scan could not reach the router, not that it found nothing.
+    # Diffing an unknown against a known would invent a change in whichever
+    # direction the blocked run happened to fall: a blocked new run reads as
+    # "all ports closed", and the recovery run after it as "all ports opened".
+    old_ports = old.get("router_open_ports")
+    new_ports = new.get("router_open_ports")
+    if old_ports is not None and new_ports is not None:
+        old_ports = set(old_ports)
+        new_ports = set(new_ports)
+        if new_ports - old_ports:
+            notes.append(f"NEW open port(s) on router: {sorted(new_ports - old_ports)}")
+        if old_ports - new_ports:
+            notes.append(f"Port(s) now closed on router: {sorted(old_ports - new_ports)}")
     old_bssids = set(old.get("wifi_bssids", []))
     new_bssids = set(new.get("wifi_bssids", []))
     if new_bssids - old_bssids:
@@ -2977,6 +3085,14 @@ def generate_html_report(state, output_path=None):
                 rows.append([str(p), svc, risk_badge(risk), note])
                 colours.append(RISK_COLOUR.get(risk, ""))
             body = table(["Port", "Service", "Risk", "Note"], rows, colours)
+        elif ports is None:
+            # Distinct from the empty list below: the scan never reached the
+            # host, so reporting "no open ports found" would be a false all-clear
+            # in the one artefact most likely to be read by someone else.
+            body = ("<p>{} Could not reach the router to scan it, so its open "
+                    "ports are <strong>unknown</strong> for this run — this is "
+                    "not a finding of &quot;no open ports&quot;.</p>").format(
+                        risk_badge("REVIEW"))
         else:
             body = "<p>No open ports found.</p>"
         sections_html += section("Router Open Ports", body)
@@ -3187,7 +3303,25 @@ def audit_host(label, host, full_scan=False):
     n = "all 65535" if full_scan else str(len(COMMON_PORTS))
     print(f"\nScanning {n} ports on {label} ({host})...")
     t0 = time.time()
-    open_ports = scan_ports(host, port_set)
+    scan = scan_ports_detailed(host, port_set)
+    open_ports = scan["open"]
+    if scan["blocked"]:
+        # Every probe returned "unreachable", so this is not a host with
+        # nothing listening — it is a host we were never able to ask. Saying
+        # "none found" here would be a fabrication, and saving it as [] would
+        # tell the next run that the ports had closed.
+        print(f"Done in {time.time()-t0:.1f}s. UNKNOWN — could not reach {host}.")
+        print(f"  [REVIEW] All {scan['probed']} probes returned 'unreachable' "
+              f"before any timeout, so the result is not 'no open ports'.")
+        if sys.platform == "darwin":
+            print("           On macOS this is what Local Network privacy looks like "
+                  "when it denies a\n           background job: a scheduled "
+                  "(launchd/cron) run cannot reach its own subnet,\n           while the "
+                  "same audit run from a terminal can. Routed hosts on other subnets\n"
+                  "           still answer, which is why an upstream modem can scan "
+                  "cleanly in the\n           same run. Run the audit interactively to "
+                  "scan this host.")
+        return None
     print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
     for p in open_ports:
         svc, risk, note = PORTS_OF_INTEREST.get(
