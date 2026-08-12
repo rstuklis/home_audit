@@ -299,17 +299,16 @@ class TestResultShape:
 
 
 class TestKnownBugs:
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "line 1328 `if \"LISTEN\" in line or line.startswith(\"udp\")` accepts "
-        "every netstat UDP row regardless of its foreign address, so a "
-        "connected/outbound UDP socket that _add_from_lsof deliberately "
-        "skipped at lines 1310-1311 ('established connection, not a listener') "
-        "is re-added at line 1338 with pid/process '?'. "
-        "action_listening_services then flags the ephemeral port as an "
-        "unrecognised non-system listener."))
     def test_connected_udp_socket_is_not_re_added_as_a_listener_by_netstat(
             self, monkeypatch, mod):
+        # Fixed regression: the netstat pass accepted every UDP row regardless
+        # of its foreign address, so a connected/outbound socket that
+        # _add_from_lsof deliberately skipped ("established connection, not a
+        # listener") was re-added with pid/process '?', and
+        # action_listening_services then flagged the ephemeral source port of an
+        # ordinary web request as an unrecognised non-system listener. UDP has
+        # no state column; the foreign address is what distinguishes a listener
+        # ("*.*") from a socket this Mac dialled out on.
         lsof_udp = LSOF_HEADER + (
             "firefox     3312          alice   77u  IPv4 0x9e0a1b2c3d4e5fa6"
             "      0t0  UDP 192.168.87.24:61234->142.250.70.238:443\n"

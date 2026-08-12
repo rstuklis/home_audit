@@ -2846,6 +2846,21 @@ def check_listening_services():
             parts = line.split()
             if len(parts) < 4:
                 continue
+            # TCP rows are already filtered by the LISTEN state above. UDP has
+            # no state column, so a socket this Mac dialled OUT on looks exactly
+            # like one waiting for callers unless the foreign address is read:
+            # a listener has the wildcard "*.*", a connected socket names its
+            # peer. _add_from_lsof has always made this distinction ("->" in the
+            # address); netstat spells the same thing differently, and skipping
+            # it here re-added the ephemeral source port of an ordinary outbound
+            # request as an unrecognised listener with pid and process "?" —
+            # noise that pushes a real finding off the end of the list.
+            #
+            # Only a positively identified peer suppresses the row. A short or
+            # unexpected line keeps its entry: failing towards reporting is the
+            # right direction for a listener audit.
+            if line.startswith("udp") and len(parts) >= 5 and parts[4] not in ("*.*", "*:*"):
+                continue
             proto = parts[0].upper().replace("6", "").replace("4", "")
             # macOS netstat uses a DOT before the port (e.g. "*.59882").
             m = re.search(r"[.:](\d+)$", parts[3])
