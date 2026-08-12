@@ -2975,12 +2975,19 @@ def check_firewall():
         result["note"] = "Could not determine firewall state (unexpected command output)."
     elif not result["enabled"]:
         result["note"] = "Firewall is OFF. Enable it in System Settings → Network → Firewall."
-    elif result["block_all"]:
+    elif result["block_all"] is True:
         result["note"] = "Block all mode — maximum restriction. Verify legitimate apps still work."
-    elif result["stealth_mode"]:
+    elif result["stealth_mode"] is True:
         result["note"] = "Enabled with stealth mode — good configuration."
-    else:
+    elif result["stealth_mode"] is False:
         result["note"] = "Enabled (stealth mode off). Consider enabling stealth mode for extra protection."
+    else:
+        # stealth_mode is None: --getstealthmode output was unparseable. Saying
+        # "stealth mode off" here would state an unmeasured value as fact, and
+        # this note is not terminal-only — generate_html_report copies it
+        # verbatim into the shareable report.
+        result["note"] = ("Enabled. Stealth mode state could not be determined "
+                          "(unexpected --getstealthmode output).")
 
     return result
 
@@ -3042,6 +3049,19 @@ def generate_html_report(state, output_path=None):
         "GOOD":   "#27ae60",
         "UNKNOWN":"#95a5a6",
     }
+
+    def onoff(value):
+        """Render a tri-state as the terminal does: None is UNKNOWN, not OFF.
+
+        check_firewall and check_sharing_services both return None for a state
+        they could not determine — an unparseable socketfilterfw reply, or
+        Remote Apple Events without sudo. Collapsing that to "OFF" tells the
+        reader a service is definitely disabled when the audit never found out,
+        and this report is the artefact most likely to be forwarded to someone
+        else. action_firewall_check and action_sharing_services have always got
+        this right; this keeps the written report agreeing with the terminal.
+        """
+        return "UNKNOWN" if value is None else ("ON" if value else "OFF")
 
     def risk_badge(risk):
         colour = RISK_COLOUR.get(str(risk).upper(), "#95a5a6")
@@ -3137,9 +3157,13 @@ def generate_html_report(state, output_path=None):
     # Firewall
     if "firewall" in state:
         fw = state["firewall"]
-        risk = "OK" if fw.get("enabled") else "HIGH"
-        body = f"""<p>{risk_badge(risk)} Firewall: {'ON' if fw.get('enabled') else 'OFF'}</p>
-                   <p>Stealth mode: {'ON' if fw.get('stealth_mode') else 'OFF'}</p>
+        enabled = fw.get("enabled")
+        # REVIEW, not HIGH, for an undetermined firewall: a red HIGH badge
+        # asserts the firewall is off. Mirrors action_firewall_check's
+        # `"REVIEW" if fw["enabled"] is None else ...`.
+        risk = "REVIEW" if enabled is None else ("OK" if enabled else "HIGH")
+        body = f"""<p>{risk_badge(risk)} Firewall: {onoff(enabled)}</p>
+                   <p>Stealth mode: {onoff(fw.get('stealth_mode'))}</p>
                    <p>{_esc(fw.get('note',''))}</p>"""
         sections_html += section("Firewall Status", body)
 
@@ -3148,8 +3172,13 @@ def generate_html_report(state, output_path=None):
         rows = []
         colours = []
         for s in state["sharing"]:
-            state_str = "ON" if s["enabled"] else "OFF"
-            rows.append([s["name"], state_str, risk_badge(s["risk"]), s["note"]])
+            # onoff, not a truthiness test: enabled=None means the audit could
+            # not inspect the service (Remote Apple Events without sudo), and a
+            # reader must be able to tell that from one that is genuinely off.
+            # The row tint stays keyed on a service being definitely on, so an
+            # unknown is never painted with its worst-case risk colour.
+            rows.append([s["name"], onoff(s["enabled"]),
+                         risk_badge(s["risk"]), s["note"]])
             colours.append(RISK_COLOUR.get(s["risk"], "") if s["enabled"] else "")
         sections_html += section("Sharing Services", table(["Service", "State", "Risk", "Note"], rows, colours))
 

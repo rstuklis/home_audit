@@ -49,8 +49,13 @@ NOTE_BRANCH_TOKENS = [
     ("block_all", "block all"),
     ("stealth_on", "good configuration"),
     ("plain_on", "stealth mode off"),
+    # The stealth-unknown branch is tokenised on the command name rather than
+    # on "could not be determined", which reads too close to the whole-firewall
+    # unknown note above to be a trustworthy discriminator.
+    ("stealth_unknown", "--getstealthmode"),
 ]
-NOTE_BRANCH_IDS = ["unknown", "off", "block-all", "stealth-on", "plain-on"]
+NOTE_BRANCH_IDS = ["unknown", "off", "block-all", "stealth-on", "plain-on",
+                   "stealth-unknown"]
 
 
 @pytest.fixture
@@ -235,7 +240,16 @@ class TestUnknownEverything:
 
 
 class TestNoteBranchSelection:
-    """The note names one of five mutually exclusive situations."""
+    """The note names one of six mutually exclusive situations.
+
+    Every branch check_firewall can take must appear in `_notes`. A branch that
+    is absent here is invisible to the collapse detection below: it can be
+    given another branch's note, or one asserting a state that was never
+    measured, and the suite stays green. The stealth-unknown branch was added
+    without being registered here, and adversarial review demonstrated exactly
+    that — swapping its note for the stealth-on "good configuration" text, a
+    fabricated all-clear about an undetermined setting, left the file passing.
+    """
 
     def _notes(self, fw):
         return {
@@ -248,11 +262,16 @@ class TestNoteBranchSelection:
                              blockall_out=BLOCKALL_OFF)["note"],
             "plain_on": fw(global_out=GLOBAL_ON, stealth_out=STEALTH_OFF,
                            blockall_out=BLOCKALL_OFF)["note"],
+            # Firewall on, but --getstealthmode said something unparseable, so
+            # stealth_mode is None. Empty output is the case check_firewall
+            # cannot classify; see test_unparseable_stealth_output_is_unknown.
+            "stealth_unknown": fw(global_out=GLOBAL_ON, stealth_out="",
+                                  blockall_out=BLOCKALL_OFF)["note"],
         }
 
-    def test_the_five_branches_produce_five_different_notes(self, fw):
+    def test_the_six_branches_produce_six_different_notes(self, fw):
         notes = self._notes(fw)
-        assert len(set(notes.values())) == 5, f"branches collapsed: {notes}"
+        assert len(set(notes.values())) == 6, f"branches collapsed: {notes}"
 
     @pytest.mark.parametrize("branch, token", NOTE_BRANCH_TOKENS, ids=NOTE_BRANCH_IDS)
     def test_each_branch_names_its_situation(self, fw, branch, token):
@@ -296,18 +315,15 @@ class TestNoteBranchSelection:
                     stealth_out=STEALTH_ON, blockall_out=BLOCKALL_ON)
         assert result["note"] == notes["unknown"]
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1557-1560 picks the note with a truthiness test — "
-        "`elif result['stealth_mode']:` ... `else: 'Enabled (stealth mode off). ...'` — "
-        "so stealth_mode=None falls into the else and the note states as fact that "
-        "stealth is off. None is reachable whenever --getstealthmode output is "
-        "unparseable (see test_unparseable_stealth_output_is_unknown); the branch needs "
-        "`is True` / `is False` like the tri-state it is reading. The claim is not "
-        "terminal-only: action_firewall_check prints 'Stealth Mode : UNKNOWN' two lines "
-        "above the same note (lines 1570/1574/1576), and generate_html_report copies the "
-        "note verbatim into the shareable report at line 1712."))
     def test_unknown_stealth_is_not_reported_as_off_in_the_note(self, fw):
+        # Fixed regression: the note used to be picked by truthiness —
+        # `elif result['stealth_mode']:` ... `else: 'Enabled (stealth mode off)'`
+        # — so stealth_mode=None fell into the else and the note stated as fact
+        # that stealth was off. None is reachable whenever --getstealthmode
+        # output is unparseable (see test_unparseable_stealth_output_is_unknown).
+        # The branches now test `is True` / `is False` like the tri-state they
+        # read. Not a terminal-only claim: generate_html_report copies this note
+        # verbatim into the shareable report.
         result = fw(global_out=GLOBAL_ON, stealth_out="", blockall_out=BLOCKALL_OFF)
         assert result["stealth_mode"] is None
         assert "stealth mode off" not in result["note"].lower(), (

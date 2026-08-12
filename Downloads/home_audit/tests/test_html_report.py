@@ -363,32 +363,27 @@ class TestFirewallTriState:
         assert "Firewall: OFF" in text
         assert '<span style="background:#e74c3c;' in text
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1709 computes `risk = 'OK' if fw.get('enabled') else 'HIGH'`, "
-        "collapsing the tri-state that commit 4c349fd introduced: enabled=None means "
-        "UNKNOWN but renders as a red HIGH badge. action_firewall_check at line 1572 "
-        "gets this right with `'REVIEW' if fw['enabled'] is None else ...`."))
     def test_an_unknown_firewall_is_not_flagged_high(self, mod, tmp_path):
+        # Fixed regression: the risk used to be `'OK' if fw.get('enabled') else
+        # 'HIGH'`, collapsing the tri-state commit 4c349fd introduced — an
+        # undetermined firewall (enabled=None) rendered as a red HIGH badge,
+        # asserting it was off. Now REVIEW, matching action_firewall_check's
+        # `'REVIEW' if fw['enabled'] is None else ...`.
         text = render(mod, tmp_path, {"firewall": dict(UNKNOWN_FIREWALL)})
         assert "#e74c3c" not in text, "unknown firewall state painted as a HIGH risk"
         assert ">HIGH</span>" not in text
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1710 renders `{'ON' if fw.get('enabled') else 'OFF'}`, so an "
-        "undetermined firewall is reported to the reader as a definite OFF. The terminal "
-        "path prints UNKNOWN for the same value (onoff(), line 1570)."))
     def test_an_unknown_firewall_does_not_claim_to_be_off(self, mod, tmp_path):
+        # Fixed regression: rendered `{'ON' if fw.get('enabled') else 'OFF'}`,
+        # so an undetermined firewall was reported to the reader as a definite
+        # OFF while the terminal path printed UNKNOWN for the same value.
         text = render(mod, tmp_path, {"firewall": dict(UNKNOWN_FIREWALL)})
         assert "Firewall: OFF" not in text
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1711 renders `{'ON' if fw.get('stealth_mode') else 'OFF'}`, so "
-        "stealth_mode=None (unparseable socketfilterfw output) is reported as a definite "
-        "OFF. onoff() at line 1570 prints UNKNOWN for the same value."))
     def test_an_unknown_stealth_mode_does_not_claim_to_be_off(self, mod, tmp_path):
+        # Fixed regression: rendered `{'ON' if fw.get('stealth_mode') else
+        # 'OFF'}`, so stealth_mode=None (unparseable socketfilterfw output) was
+        # reported as a definite OFF.
         text = render(mod, tmp_path, {"firewall": dict(UNKNOWN_FIREWALL)})
         assert "Stealth mode: OFF" not in text
 
@@ -412,24 +407,22 @@ class TestSharingTriState:
              "risk": "HIGH", "note": "Screen visible to anyone with credentials."}]})
         assert 'style="background:#e74c3c22"' in text
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1720 renders `'ON' if s['enabled'] else 'OFF'`, so a service "
-        "whose state could not be determined (Remote Apple Events without sudo sets "
-        "enabled=None, home_net_audit.py:1462) is reported as a definite OFF. "
-        "action_sharing_services prints '?' for the same value at line 1498."))
     def test_an_unknown_service_is_not_rendered_as_a_definite_off(self, mod, tmp_path):
+        # Fixed regression: rendered `'ON' if s['enabled'] else 'OFF'`, so a
+        # service whose state could not be determined (Remote Apple Events
+        # without sudo sets enabled=None) was reported as a definite OFF while
+        # action_sharing_services printed '?' for the same value. Observed on a
+        # real run: the terminal showed "[UNKNOWN] ? Remote Apple Events" while
+        # the report for that same run would have said "OFF".
         text = render(mod, tmp_path, {"sharing": [
             {"name": "Remote Apple Events", "enabled": None, "risk": "UNKNOWN",
              "note": "Unknown — re-run this audit with sudo to determine its state."}]})
         assert row_cells(text, "Remote Apple Events")[1] != "OFF"
 
-    @pytest.mark.known_bug
-    @pytest.mark.xfail(strict=True, reason=(
-        "home_net_audit.py:1720 gives enabled=None and enabled=False the same 'OFF' cell, "
-        "so a reader cannot tell a service that is genuinely disabled from one the audit "
-        "could not inspect."))
     def test_an_unknown_service_reads_differently_from_a_disabled_one(self, mod, tmp_path):
+        # Fixed regression: enabled=None and enabled=False shared one 'OFF'
+        # cell, so a reader could not tell a service that is genuinely disabled
+        # from one the audit was never able to inspect.
         text = render(mod, tmp_path, {"sharing": [
             {"name": "Remote Apple Events", "enabled": None, "risk": "UNKNOWN",
              "note": "Unknown — re-run with sudo."},
