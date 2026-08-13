@@ -263,6 +263,29 @@ class TestUnmeasuredDoesNotDestroyTheBaseline:
         merged = mod.carry_forward_unmeasured({"router_open_ports": None}, {})
         assert merged["router_open_ports"] is None
 
+    def test_a_run_that_skipped_discovery_keeps_the_known_devices(self, mod):
+        # A real incident, not a hypothetical. `--no-discovery` produces a state
+        # with no "devices" key at all; saving it wiped a baseline of ten known
+        # devices, and the next audit would have reported every device in the
+        # house as newly arrived. Skipping the sweep says "do not spend the time
+        # looking", never "there is nothing there".
+        known = [{"ip": "192.168.87.1", "mac": "38:8b:59:e0:f1:70",
+                  "subnet": "192.168.87.0/24"}]
+        previous = {"devices": known, "scanned_subnets": ["192.168.87.0/24"]}
+        merged = mod.carry_forward_unmeasured({"gateway": "192.168.87.1"}, previous)
+
+        assert merged["devices"] == known
+        assert merged["scanned_subnets"] == ["192.168.87.0/24"]
+        assert "devices" in merged["carried_forward"]
+
+    def test_a_sweep_that_genuinely_found_nothing_is_kept(self, mod):
+        # [] is a measurement — the sweep ran and the network was empty — and
+        # must not be replaced by an older, richer list. Only an absent key or
+        # None means "not measured".
+        merged = mod.carry_forward_unmeasured(
+            {"devices": []}, {"devices": [{"mac": "aa:bb:cc:dd:ee:ff"}]})
+        assert merged["devices"] == []
+
     def test_the_upstream_modem_reading_is_carried_forward_too(self, mod):
         merged = mod.carry_forward_unmeasured(
             {"upstream_open_ports": None}, {"upstream_open_ports": [443]})

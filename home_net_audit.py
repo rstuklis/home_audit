@@ -1063,7 +1063,19 @@ def resolve_passphrase(prompt=False):
 
 # Measurements that a run can fail to take without failing outright. A None
 # here means "not measured this run", and must never overwrite a real reading.
-CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports")
+# Measurements a run can fail to take, or decline to take, without failing
+# outright. A missing key here means "not measured this run" and must never
+# overwrite a real reading.
+#
+# "devices" and "scanned_subnets" are on this list because of a real incident,
+# not a hypothetical: a --no-discovery run saves a state with no device list at
+# all, and saving that wiped a baseline of ten known devices. The next audit
+# would have reported every device in the house as newly arrived — the same
+# corruption the port keys were added to prevent, in the one section where a
+# false alarm is loudest. --no-discovery says "do not spend the time looking",
+# never "there is nothing there".
+CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports",
+                      "devices", "scanned_subnets")
 
 
 def carry_forward_unmeasured(state, previous=None):
