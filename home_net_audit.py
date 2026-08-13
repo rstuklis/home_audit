@@ -1846,6 +1846,28 @@ _DSL_PATTERNS = {
 }
 
 
+_TPLINK_ENCRYPTED_LOGIN_MARKERS = ("tpencrypt", "cryptojs", "gdprproxy", "/cgi_gdpr")
+
+
+def _tplink_uses_encrypted_login(login_page_html):
+    """True if this firmware encrypts credentials in the browser before login.
+
+    Newer TP-Link builds derive a session key with RSA, encrypt the payload
+    with AES and POST it to /cgi_gdpr; the legacy scheme this module speaks
+    puts a base64'd password straight in a GET query string. Telling them apart
+    matters because the failures look identical from the outside — no page is
+    retrieved either way — while the remedies are not remotely alike, and the
+    old message ("auth failed or unknown page paths") pointed at the two
+    remedies that cannot help.
+
+    Detected from the scripts the login page loads rather than by attempting a
+    login, so it costs nothing and cannot contribute to locking anyone out of
+    their own modem.
+    """
+    page = (login_page_html or "").lower()
+    return any(marker in page for marker in _TPLINK_ENCRYPTED_LOGIN_MARKERS)
+
+
 def _dsl_rows(raw):
     """Split a router status page into rows, each flattened to plain text.
 
@@ -1926,6 +1948,24 @@ def tplink_dsl_stats(ip, password):
             break
         raw = ""
     if not raw:
+        # "auth failed or unknown page paths" covers two very different
+        # situations and sends the reader after the wrong one. The common cause
+        # is neither: the login above is TP-Link's LEGACY scheme, a plain GET
+        # with the password base64'd in the query string, and current firmware
+        # does not accept it. Those builds encrypt the credentials in the
+        # browser (RSA for the session key, AES for the payload, POSTed to a
+        # /cgi_gdpr endpoint), which is a different protocol rather than a
+        # different path — no password and no page list can bridge it.
+        #
+        # The login page names the difference: it pulls tpEncrypt.js, cryptoJS
+        # and gdprProxy.js, none of which exist on the older builds this code
+        # was written against. Checking for them costs one unauthenticated GET
+        # and turns a misleading message into an actionable one.
+        if _tplink_uses_encrypted_login(fetch(base + "/")):
+            return stats, ("This modem's firmware uses TP-Link's encrypted login "
+                           "(RSA/AES via /cgi_gdpr), which this tool does not "
+                           "implement — the password is not the problem. DSL "
+                           "stats are unavailable until that login is supported.")
         return stats, "Could not retrieve DSL stats — auth failed or unknown page paths"
 
     rows = _dsl_rows(raw)

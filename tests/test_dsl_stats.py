@@ -141,3 +141,35 @@ class TestRowSplitting:
 
     def test_a_page_with_no_markup_is_one_row_per_line(self, mod):
         assert mod._dsl_rows("first line\nsecond line") == ["first line", "second line"]
+
+
+class TestFirmwareDiagnosis:
+    """Telling "wrong password" apart from "protocol this tool cannot speak".
+
+    Both fail identically — no page retrieved — so the note was the only thing
+    distinguishing them, and it named the two remedies that cannot work. A real
+    VX420-G2h sent an afternoon after the password before its login page gave
+    the answer away.
+    """
+
+    @pytest.mark.parametrize("marker", ["tpEncrypt.js", "cryptoJS.min.js",
+                                        "gdprProxy.js", "/cgi_gdpr"])
+    def test_each_modern_firmware_marker_is_recognised(self, mod, marker):
+        page = f'<html><head><script src="../js/{marker}"></script></head></html>'
+        assert mod._tplink_uses_encrypted_login(page) is True
+
+    def test_a_legacy_login_page_is_not_misreported(self, mod):
+        # The old builds this module's login actually works against.
+        legacy = ('<html><body><form action="/cgi/login" method="get">'
+                  '<input name="UserName"><input name="Passwd" type="password">'
+                  '</form></body></html>')
+        assert mod._tplink_uses_encrypted_login(legacy) is False
+
+    def test_an_empty_or_unreachable_page_is_not_a_diagnosis(self, mod):
+        # fetch() returns "" on any error; that is an absence of evidence and
+        # must not be reported as a positive finding about the firmware.
+        assert mod._tplink_uses_encrypted_login("") is False
+        assert mod._tplink_uses_encrypted_login(None) is False
+
+    def test_detection_is_case_insensitive(self, mod):
+        assert mod._tplink_uses_encrypted_login("<script src=TPENCRYPT.JS>") is True
