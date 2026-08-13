@@ -11,14 +11,31 @@ python3 -m pytest tests/ --cov=home_net_audit --cov-report=term-missing
 
 ## Why the suite is shaped this way
 
-Every bug this project has fixed so far was a **parsing or classification error in
+Nearly every bug this project has fixed was a **parsing or classification error in
 pure logic** — a regex that didn't match real macOS output, a substring test that
-misfired, a tri-state collapsed into a boolean. None of them needed a network or a
-Mac to reproduce; all of them needed one captured string and one assertion.
+misfired, a tri-state collapsed into a boolean. Those need one captured string and one
+assertion, not a network and not a Mac.
 
 So the suite is built around that: capture what a command really prints, feed it to
-the parser, and assert on the classification. It runs in well under a second, needs
-no network, and passes on Linux despite the tool targeting macOS.
+the parser, and assert on the classification. It runs in about ten seconds, needs no
+network, and passes on Linux despite the tool targeting macOS.
+
+**Where that shape does not reach, and it is worth knowing before you trust a green
+run.** The most serious defect found in this codebase was not a parsing error and
+could not have been found this way: macOS Local Network privacy denies a
+launchd-scheduled process any connection to its own subnet, and the refusal arrives as
+an instant `EHOSTUNREACH` that `check_port` collapsed into "closed". Every scheduled
+run reported "no open ports on your router" as fact, and saved that into the baseline,
+while the same audit from a terminal saw all four. No fixture could have shown it: the
+bug was in the difference between two execution contexts on one machine, and it was
+found by running the tool under `launchctl` and comparing.
+
+The pattern generalises. This suite is excellent at "given this output, is the verdict
+right" and blind to "would this output ever occur here". When a check depends on
+privilege, on scheduling context, or on the state of the machine rather than the text
+it read, verify it against the real thing at least once and pin what you learn as a
+fixture afterwards. Several tests here exist because that was done — see
+`test_audit_host.py` and the blocked-scan handling in `home_net_audit.py`.
 
 ## The three things `conftest.py` provides
 
@@ -108,12 +125,18 @@ What's left uncovered in these functions is the physical I/O itself (the `except
 OSError` around a real `sendto`, a `recvfrom` that genuinely blocks) — deliberately,
 since faking that tests the mock, not the tool.
 
-> **Provenance:** these fixtures were written from knowledge of the real output
-> formats, not captured from a live Mac — this repo's CI has no macOS host to capture
-> from. They're faithful to the documented layouts and to the output shapes described
-> in the commit history, but if you ever run the tool on a real Mac, replacing them
-> with genuine captures would strengthen the suite. That is the single highest-value
-> follow-up here.
+> **Provenance:** two kinds live here, and the difference matters when one of them
+> disagrees with reality. `tests/fixtures/*.out` were written from knowledge of the
+> documented output formats rather than captured — they are curated, and shaped to
+> exercise a specific branch. `tests/fixtures/real/*.out` were captured from a live
+> Mac by `tools/capture_fixtures.py` and redacted; they are the ones to trust when a
+> parser and a curated fixture agree with each other but not with a machine.
+>
+> Both are snapshots of one macOS version on one host. That is the standing risk to
+> this suite: an OS update that changes `launchctl print-disabled` output or retires a
+> binary would break the tool while every test stayed green, because the fixtures
+> would still describe the old world. Re-capturing after a major macOS upgrade is the
+> highest-value maintenance here.
 
 ## Known-bug tests
 
@@ -133,6 +156,17 @@ marker. That turns each one into an executable specification with an expiry date
 rather than a permanent suppression that quietly rots.
 
 Run `python3 -m pytest tests/ -rxX` to list every known bug the suite is tracking.
+
+**There are currently none.** All sixteen the suite once carried have been fixed and
+their markers removed, so `-rxX` reports nothing and the mechanism is idle rather than
+gone. That is worth knowing before you read the section above and go looking: the
+absence is the finished state, not a sign the markers were quietly dropped. Each fix
+left the reason behind as a comment on the test that pinned it, so the history of what
+was wrong is still readable at the assertion rather than only in the log.
+
+Reach for the marker again when you find behaviour that is wrong but cannot be fixed in
+the same sitting. It is worth more than an issue: it fails the moment someone fixes the
+bug by accident.
 
 ## Conventions
 
