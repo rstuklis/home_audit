@@ -1,0 +1,245 @@
+"""One baseline per network.
+
+A single baseline.json served every network, and this machine has three known
+Wi-Fi networks. Comparing one against another's baseline is not a comparison:
+every device on the new network reads as an arrival, every device on the old one
+as a departure, and two different routers' port lists are diffed against each
+other. The run then saves over the baseline, so switching back produces the
+mirror image — neither network ever accumulates a usable history, and the report
+cries wolf every time the laptop moves.
+
+The identity is the subnet, not the friendly name: renaming "pearl" in
+networks.json is a labelling change and must not orphan that network's baseline
+or its seal chain.
+"""
+
+import json
+import os
+
+import pytest
+
+
+LOVESHACK = "192.168.87.0/24"
+PEARL = "192.168.86.0/24"
+IOT = "192.168.85.0/24"
+
+
+def state_for(subnet, macs, ports, timestamp="2026-08-13T05:00:00+00:00"):
+    prefix = subnet.rsplit(".", 2)[0]
+    return {
+        "timestamp": timestamp,
+        "gateway": f"{prefix}.1",
+        "devices": [{"ip": f"{prefix}.{i}", "mac": m, "subnet": subnet}
+                    for i, m in enumerate(macs, start=10)],
+        "scanned_subnets": [subnet],
+        "router_open_ports": ports,
+    }
+
+
+@pytest.fixture
+def net(mod, monkeypatch, tmp_path):
+    """Point BASELINE_DIR at tmp and give tests a select/save/load helper."""
+    monkeypatch.setattr(mod, "BASELINE_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "BASELINE_FILE", str(tmp_path / "baseline.json"))
+    monkeypatch.setattr(mod, "HISTORY_FILE", str(tmp_path / "history.jsonl"))
+    return tmp_path
+
+
+class TestNetworksDoNotShareABaseline:
+    def test_saving_one_network_does_not_disturb_another(self, mod, net):
+        mod.select_network_baseline(LOVESHACK)
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80, 5000]))
+        mod.select_network_baseline(PEARL)
+        mod.save_baseline(state_for(PEARL, ["b8:27:eb:00:00:01"], [80]))
+
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.load_baseline()["router_open_ports"] == [80, 5000]
+        mod.select_network_baseline(PEARL)
+        assert mod.load_baseline()["router_open_ports"] == [80]
+
+    def test_switching_networks_reports_no_change(self, mod, net):
+        # The whole point. Each network diffed against ITS OWN baseline is
+        # quiet; the old shared file made every switch a full false alarm.
+        love = state_for(LOVESHACK, ["3c:22:fb:00:00:01", "3c:22:fb:00:00:02"], [80, 5000])
+        pearl = state_for(PEARL, ["b8:27:eb:00:00:01"], [80])
+
+        mod.select_network_baseline(LOVESHACK)
+        mod.save_baseline(love)
+        mod.select_network_baseline(PEARL)
+        mod.save_baseline(pearl)
+
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.diff_baseline(mod.load_baseline(), love) == []
+        mod.select_network_baseline(PEARL)
+        assert mod.diff_baseline(mod.load_baseline(), pearl) == []
+
+    def test_the_old_shared_file_would_have_alarmed(self, mod, net):
+        # Pins what the change is worth, by showing the failure it removes: the
+        # two states really are wholly different, so a shared baseline could
+        # only ever produce a full arrival/departure sweep.
+        love = state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80, 5000])
+        pearl = state_for(PEARL, ["b8:27:eb:00:00:01"], [80])
+        notes = mod.diff_baseline(love, pearl)
+        assert any("NEW device" in n for n in notes)
+        assert any("gone" in n for n in notes)
+
+    def test_each_network_keeps_its_own_seal_chain(self, mod, net):
+        # A chain means nothing except relative to what it chains, so a shared
+        # history would interleave three networks' sequence numbers.
+        mod.select_network_baseline(LOVESHACK)
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        mod.select_network_baseline(PEARL)
+        mod.save_baseline(state_for(PEARL, ["b8:27:eb:00:00:01"], [80]))
+
+        assert mod.load_baseline_record()["seq"] == 1, "pearl inherited another chain"
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.load_baseline_record()["seq"] == 2
+
+    def test_a_third_network_starts_clean_rather_than_inheriting(self, mod, net):
+        mod.select_network_baseline(LOVESHACK)
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        mod.select_network_baseline(IOT)
+        assert mod.load_baseline() is None, "an unseen network inherited a baseline"
+
+
+class TestKeying:
+    def test_the_key_is_filename_safe(self, mod):
+        key = mod.baseline_key(LOVESHACK)
+        assert "/" not in key and "." not in key
+        assert key == "192-168-87-0-24"
+
+    def test_distinct_subnets_get_distinct_keys(self, mod):
+        assert len({mod.baseline_key(s) for s in (LOVESHACK, PEARL, IOT)}) == 3
+
+    def test_an_unidentifiable_network_leaves_the_defaults_alone(self, mod, net):
+        before = mod.BASELINE_FILE
+        assert mod.select_network_baseline(None) is None
+        assert mod.BASELINE_FILE == before, \
+            "an unknown network silently repointed the baseline"
+
+    def test_renaming_a_network_does_not_orphan_its_baseline(self, mod, net):
+        # The key comes from the subnet, so the friendly name is presentation.
+        mod.select_network_baseline(LOVESHACK)
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        path_before = mod.BASELINE_FILE
+        mod.select_network_baseline(LOVESHACK)   # as if renamed in networks.json
+        assert mod.BASELINE_FILE == path_before
+        assert mod.load_baseline() is not None
+
+
+class TestIdentifyNetwork:
+    IFACES = [("en0", "192.168.87.249", __import__("ipaddress").ip_network(LOVESHACK))]
+
+    def test_the_gateway_subnet_wins(self, mod):
+        assert mod.identify_network(self.IFACES, "192.168.87.249", "192.168.87.1") == LOVESHACK
+
+    def test_falls_back_to_this_machine_s_own_subnet(self, mod):
+        assert mod.identify_network(self.IFACES, "192.168.87.249", None) == LOVESHACK
+
+    def test_a_gateway_outside_every_interface_does_not_match_one(self, mod):
+        # An upstream modem on another subnet must not be mistaken for the
+        # network this machine is attached to.
+        assert mod.identify_network(self.IFACES, "192.168.87.249", "192.168.1.1") == LOVESHACK
+
+    def test_no_interfaces_and_no_ip_identifies_nothing(self, mod):
+        assert mod.identify_network([], None, None) is None
+
+
+class TestLegacyMigration:
+    """A baseline saved before per-network storage says which network it
+    describes; migrating on that evidence keeps a verified seal chain attached
+    to the right network instead of stranding it."""
+
+    def _write_legacy(self, mod, net, state):
+        mod.BASELINE_FILE = str(net / "baseline.json")
+        mod.HISTORY_FILE = str(net / "history.jsonl")
+        mod.save_baseline(state)
+
+    def test_a_legacy_baseline_moves_to_the_network_it_recorded(self, mod, net):
+        self._write_legacy(mod, net, state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80, 5000]))
+        assert mod.migrate_legacy_baseline() == "192-168-87-0-24"
+        assert not (net / "baseline.json").exists()
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.load_baseline()["router_open_ports"] == [80, 5000]
+
+    def test_the_seal_chain_moves_with_it(self, mod, net):
+        self._write_legacy(mod, net, state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        mod.migrate_legacy_baseline()
+        assert (net / "history-192-168-87-0-24.jsonl").exists()
+        assert not (net / "history.jsonl").exists()
+
+    def test_a_baseline_with_no_subnet_recorded_is_left_alone(self, mod, net):
+        # Filing it under a guess would attach a real chain to the wrong
+        # network, which is worse than leaving it where it is.
+        self._write_legacy(mod, net, {"timestamp": "t", "gateway": "192.168.87.1"})
+        assert mod.migrate_legacy_baseline() is None
+        assert (net / "baseline.json").exists()
+
+    def test_migration_never_overwrites_an_existing_per_network_baseline(self, mod, net):
+        mod.select_network_baseline(LOVESHACK)
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:99"], [443]))
+        self._write_legacy(mod, net, state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+
+        assert mod.migrate_legacy_baseline() is None
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.load_baseline()["router_open_ports"] == [443], "migration clobbered a newer baseline"
+
+    def test_migrating_twice_is_harmless(self, mod, net):
+        self._write_legacy(mod, net, state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        assert mod.migrate_legacy_baseline() == "192-168-87-0-24"
+        assert mod.migrate_legacy_baseline() is None
+
+    def test_the_device_subnet_identifies_it_when_coverage_was_not_recorded(self, mod, net):
+        # Baselines saved before scanned_subnets existed still carry a subnet
+        # on every device.
+        state = state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80])
+        del state["scanned_subnets"]
+        self._write_legacy(mod, net, state)
+        assert mod.migrate_legacy_baseline() == "192-168-87-0-24"
+
+    def test_a_corrupt_legacy_file_is_not_moved(self, mod, net):
+        (net / "baseline.json").write_text("{not json")
+        mod.BASELINE_FILE = str(net / "baseline.json")
+        assert mod.migrate_legacy_baseline() is None
+        assert (net / "baseline.json").exists()
+
+
+class TestSelectionCannotEscapeRedirection:
+    """Selection must follow wherever the baseline has been pointed.
+
+    BASELINE_DIR and BASELINE_FILE are separate module names that can disagree.
+    Deriving the per-network paths from BASELINE_DIR meant anything repointing
+    only BASELINE_FILE — the test sandbox in conftest.py patches every attribute
+    ending in _FILE — had selection jump back to BASELINE_DIR and write outside
+    the redirection. In a test suite that means writing into the user's real
+    ~/.home_net_audit, which is the one thing the sandbox exists to prevent.
+    Deriving from the selected file leaves a single source of truth.
+    """
+
+    def test_selection_lands_beside_the_file_it_was_pointed_at(self, mod, tmp_path,
+                                                               monkeypatch):
+        elsewhere = tmp_path / "somewhere_else"
+        elsewhere.mkdir()
+        monkeypatch.setattr(mod, "BASELINE_FILE", str(elsewhere / "baseline.json"))
+        # BASELINE_DIR deliberately NOT repointed: the disagreement is the test.
+        mod.select_network_baseline(LOVESHACK)
+        assert str(elsewhere) in mod.BASELINE_FILE, mod.BASELINE_FILE
+        assert str(elsewhere) in mod.HISTORY_FILE, mod.HISTORY_FILE
+
+    def test_selection_never_reaches_the_real_home_directory(self, mod, tmp_path,
+                                                             monkeypatch):
+        real = os.path.expanduser("~/.home_net_audit")
+        monkeypatch.setattr(mod, "BASELINE_FILE", str(tmp_path / "baseline.json"))
+        for subnet in (IOT, PEARL, LOVESHACK):
+            mod.select_network_baseline(subnet)
+            assert not mod.BASELINE_FILE.startswith(real), mod.BASELINE_FILE
+            assert not mod.HISTORY_FILE.startswith(real), mod.HISTORY_FILE
+
+    def test_selecting_twice_does_not_nest_directories(self, mod, net):
+        mod.select_network_baseline(LOVESHACK)
+        first = mod.BASELINE_FILE
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.BASELINE_FILE == first
+        mod.select_network_baseline(PEARL)
+        assert os.path.dirname(mod.BASELINE_FILE) == os.path.dirname(first)

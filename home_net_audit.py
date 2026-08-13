@@ -60,6 +60,10 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 BASELINE_DIR = os.path.expanduser("~/.home_net_audit")
+# Reassigned by select_network_baseline() once a run knows which network it is
+# on. They stay module-level names rather than becoming functions because the
+# test sandbox redirects every attribute ending in _FILE by name; a computed
+# path would slip that net and let a test write to the real ~/.home_net_audit.
 BASELINE_FILE = os.path.join(BASELINE_DIR, "baseline.json")
 HISTORY_FILE  = os.path.join(BASELINE_DIR, "history.jsonl")
 LABELS_FILE   = os.path.join(BASELINE_DIR, "labels.json")
@@ -1282,6 +1286,30 @@ def verify_baseline(passphrase=None):
 # overwrite remote history, an attacker on that host holds them too.
 # ---------------------------------------------------------------------------
 
+def chain_id(baseline_path=None):
+    """An opaque, stable identifier for the chain a baseline belongs to.
+
+    Sequence numbers restart at 1 for every network once baselines are stored
+    per network, so a shared receipt sink holds several chains whose seq values
+    collide. compare_with_receipts reads the highest seq it can see and calls a
+    lower local one "history_truncated" — the most severe thing this tool says,
+    and the code's own words for it are "the strongest single indicator
+    available that something removed the evidence". Auditing any network but the
+    busiest would raise that, falsely, every time.
+
+    Hashed rather than named on purpose. baseline_receipt exists to prove a run
+    happened without shipping the network's shape off-host, and a subnet in
+    clear would undo that for the users the restraint is for. A digest is enough
+    to tell two chains apart, which is all the comparison needs.
+
+    Derived from the selected baseline path, so it follows
+    select_network_baseline automatically and needs no global of its own — one
+    that the test sandbox does not redirect would leak between tests.
+    """
+    name = os.path.basename(baseline_path or BASELINE_FILE)
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+
+
 def baseline_receipt(record):
     """The minimum that proves a run happened, and nothing more.
 
@@ -1290,12 +1318,16 @@ def baseline_receipt(record):
     topology and any accepted credentials to a remote endpoint would create a
     fresh disclosure risk for exactly the users this is meant to protect.
     Publishing the full record is available but has to be asked for.
+
+    `chain` says WHICH sequence this seq belongs to, without saying which
+    network it is.
     """
     return {
         "seq": record.get("seq"),
         "seal": record.get("seal"),
         "prev": record.get("prev"),
         "keyed": record.get("keyed"),
+        "chain": chain_id(),
     }
 
 
@@ -1392,6 +1424,21 @@ def compare_with_receipts(record, receipts):
     Returns {status, detail}. Statuses: ok, no_receipts, history_truncated,
     seal_mismatch.
     """
+    # Only this chain's receipts. A sink is shared across networks while
+    # sequence numbers restart at 1 for each, so comparing against all of them
+    # reads another network's longer history as this one's evidence being
+    # deleted. Receipts written before chains existed carry no id and form one
+    # legacy chain of their own; matching them to a per-network baseline would
+    # reintroduce exactly the collision this avoids.
+    # A receipt written before chains existed carries no id and belongs to the
+    # single shared baseline that was the only one then. Treating it as that
+    # chain keeps tamper detection working for anyone who has not migrated;
+    # dropping it would quietly disable the check for them, which is worse than
+    # the collision being fixed.
+    mine = chain_id()
+    legacy = chain_id("baseline.json")
+    receipts = [r for r in (receipts or []) if (r.get("chain") or legacy) == mine]
+
     if not receipts:
         return {"status": "no_receipts",
                 "detail": "No off-host receipts to compare against."}
@@ -1651,6 +1698,171 @@ def save_networks(networks):
     os.makedirs(BASELINE_DIR, exist_ok=True)
     with open(NETWORKS_FILE, "w") as f:
         json.dump(networks, f, indent=2)
+
+
+def identify_network(interfaces, local_ip, gateway=None):
+    """Which network this run is ON, as a subnet string, or None.
+
+    Not the set of subnets swept — that is coverage, and a run may sweep ground
+    it is not attached to. This is the one network whose baseline the run should
+    be compared against: the subnet holding the default gateway, falling back to
+    the one holding this machine's own address.
+    """
+    nets = [net for _, _, net in (interfaces or [])]
+    if gateway:
+        try:
+            gw = ipaddress.ip_address(gateway)
+            for net in nets:
+                if gw in net:
+                    return str(net)
+        except ValueError:
+            pass
+    if local_ip:
+        try:
+            me = ipaddress.ip_address(local_ip)
+            for net in nets:
+                if me in net:
+                    return str(net)
+        except ValueError:
+            pass
+    fallback = guess_subnet(local_ip) if local_ip else None
+    return str(fallback) if fallback else None
+
+
+def baseline_key(subnet_str):
+    """A filename-safe key for a subnet, or None.
+
+    Keyed on the subnet rather than the friendly name because the subnet is the
+    stable identity: renaming "pearl" in networks.json is a labelling change and
+    must not orphan that network's baseline and seal chain.
+    """
+    if not subnet_str:
+        return None
+    return re.sub(r"[^0-9A-Za-z]+", "-", str(subnet_str)).strip("-") or None
+
+
+def select_network_baseline(subnet_str):
+    """Point BASELINE_FILE and HISTORY_FILE at this network's own files.
+
+    One baseline per network, because comparing a network against another one's
+    baseline is not a comparison at all: every device on the new network reads
+    as an arrival, every device on the old one as a departure, and the two
+    routers' ports are diffed against each other. Worse, the run then saves
+    over the baseline, so switching back produces the mirror image and neither
+    network ever accumulates a usable history. Three known Wi-Fi networks made
+    that the normal case rather than an edge one.
+
+    The seal chain follows the baseline, since a chain only means anything
+    relative to the thing it is chaining.
+
+    Returns the key used, or None if the network could not be identified — in
+    which case the shared default files stay selected, which is what every
+    release before this one used.
+    """
+    global BASELINE_FILE, HISTORY_FILE
+    key = baseline_key(subnet_str)
+    if not key:
+        return None
+    # Siblings of the baseline CURRENTLY selected, not of BASELINE_DIR. Those
+    # are two names that can disagree, and anything repointing BASELINE_FILE
+    # without also repointing BASELINE_DIR -- the test sandbox among them --
+    # would otherwise have selection jump back to whatever BASELINE_DIR says and
+    # write outside the redirection entirely. Deriving from the file leaves one
+    # source of truth: selection follows wherever the baseline was pointed.
+    directory = os.path.dirname(BASELINE_FILE) or BASELINE_DIR
+    BASELINE_FILE = os.path.join(directory, f"baseline-{key}.json")
+    HISTORY_FILE = os.path.join(directory, f"history-{key}.jsonl")
+    return key
+
+
+def migrate_legacy_baseline(announce=None):
+    """Move a pre-per-network baseline to the network it was actually taken on.
+
+    The old layout had one baseline.json for every network. Which network it
+    described is not a guess: the record says so, in scanned_subnets or in the
+    subnet its devices were found on. Migrating on that evidence keeps the
+    existing seal chain intact and attached to the right network, where leaving
+    it would strand a verified history the moment per-network files took over.
+
+    A legacy baseline with nothing to identify it is left exactly where it is
+    rather than filed under a guess. Returns the key it was migrated to, or None.
+    """
+    legacy_baseline = os.path.join(BASELINE_DIR, "baseline.json")
+    legacy_history = os.path.join(BASELINE_DIR, "history.jsonl")
+    if not os.path.exists(legacy_baseline):
+        return None
+    try:
+        with open(legacy_baseline) as f:
+            record = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    state = record.get("state", record) if isinstance(record, dict) else {}
+    subnet = None
+    swept = state.get("scanned_subnets") or []
+    if swept and isinstance(swept[0], str):
+        subnet = swept[0]
+    if not subnet:
+        for d in state.get("devices") or []:
+            if isinstance(d, dict) and isinstance(d.get("subnet"), str):
+                subnet = d["subnet"]
+                break
+    key = baseline_key(subnet)
+    if not key:
+        return None
+
+    target_baseline = os.path.join(BASELINE_DIR, f"baseline-{key}.json")
+    target_history = os.path.join(BASELINE_DIR, f"history-{key}.jsonl")
+    if os.path.exists(target_baseline):
+        return None                      # already migrated; never overwrite
+    try:
+        os.replace(legacy_baseline, target_baseline)
+        if os.path.exists(legacy_history) and not os.path.exists(target_history):
+            os.replace(legacy_history, target_history)
+    except OSError:
+        return None
+    if announce:
+        announce(f"  Baseline migrated to per-network storage: {subnet} "
+                 f"-> {os.path.basename(target_baseline)}")
+    return key
+
+
+def use_current_network_baseline(interfaces=None, local_ip=None, gateway=None,
+                                 announce=print):
+    """Select this network's baseline, migrating a legacy one first.
+
+    Called before anything reads or writes a baseline. Migration runs first so
+    a pre-per-network baseline is filed under its own network rather than
+    stranded beside the new files.
+
+    Returns (subnet, key); either may be None when the network cannot be
+    identified, in which case the shared default files remain selected.
+    """
+    migrate_legacy_baseline(announce=announce)
+    if interfaces is None:
+        interfaces = get_all_interfaces()
+    if local_ip is None:
+        local_ip = get_local_ip()
+    if gateway is None:
+        gateway = get_default_gateway()
+    subnet = identify_network(interfaces, local_ip, gateway)
+    return subnet, select_network_baseline(subnet)
+
+
+def describe_current_network(subnet, networks=None):
+    """One line naming the network a comparison is against, or None.
+
+    Worth stating plainly once baselines are per-network: "No changes since
+    baseline" means nothing until the reader knows which baseline, and on a
+    machine that moves between three known Wi-Fi networks the answer is not
+    obvious from anything else on screen.
+    """
+    if not subnet:
+        return None
+    return None
+    name = network_name_for_subnet(subnet, networks or load_networks())
+    label = f"{name} ({subnet})" if name != subnet else subnet
+    return f"  Network: {label}"
 
 
 def network_name_for_subnet(subnet_str, networks):
@@ -3948,6 +4160,12 @@ def action_save_baseline(state):
         print("No data collected in this session yet.")
         print("Run a Full Audit or individual checks first, then save.")
         return
+    # Save against the network this session actually measured, not whichever
+    # file happens to be selected.
+    _subnet, _ = use_current_network_baseline()
+    _net_line = describe_current_network(_subnet)
+    if _net_line:
+        print(_net_line)
     passphrase = resolve_passphrase(prompt=True)
     save_baseline(state, passphrase=passphrase)
     print(f"Baseline saved to {BASELINE_FILE}")
@@ -3961,6 +4179,10 @@ def action_save_baseline(state):
 
 def action_compare_baseline(state):
     hr("CHANGE DETECTION (vs saved baseline)")
+    _subnet, _ = use_current_network_baseline()
+    _net_line = describe_current_network(_subnet)
+    if _net_line:
+        print(_net_line)
     print(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
     _sink = resolve_sink()
     if _sink:
@@ -4000,6 +4222,12 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     hr("NETWORK INTERFACES")
     interfaces, local_ip, gateway = print_network_info()
     state["gateway"] = gateway
+    # Choose the baseline before anything is compared or saved: this machine
+    # roams between known networks, and each keeps its own.
+    _subnet, _ = use_current_network_baseline(interfaces, local_ip, gateway)
+    _net_line = describe_current_network(_subnet)
+    if _net_line:
+        print(_net_line)
 
     # Port scan
     hr("ROUTER / GATEWAY PORT SCAN")
