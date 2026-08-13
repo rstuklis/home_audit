@@ -1921,13 +1921,43 @@ def speed_test(duration=6):
 # take the shortest gap — and would carry the load again if the character class
 # were ever loosened. Do not read it as tested; the digit exclusion is what the
 # tests in test_dsl_stats.py actually pin.
+# Excluding digits is necessary and not sufficient, because the thing that most
+# often sits between a direction word and somebody else's number carries no
+# digit at all: the link state. A status row reads
+#
+#     DSL Status | Up | Downstream SNR Margin | 6.5
+#
+# and once _dsl_rows has merged those cells, an unanchored [Uu]p matches the
+# bare state word, walks a digit-free gap through "Downstream SNR Margin", and
+# reports 6.5 as the UPSTREAM figure — a number the modem never gave for that
+# direction. Before rows existed the "<" between cells blocked it and nothing
+# was reported, so adding row support turned "no value" into "wrong value",
+# which this module's own docstrings call the worse outcome. Two things fix it:
+#
+#   the direction must be spelled out. "Downstream" and "Upstream" are what an
+#   xDSL status page calls the two directions; bare "Up" and "Down" are what it
+#   calls the LINK STATE, and abbreviations when they appear are "DS"/"US". So
+#   the short form was contributing almost nothing and mistaking a state for a
+#   direction constantly. Requiring the full word also disposes of "Setup",
+#   "Group", "Backup" and "Startup" in one move. Firmware that really does label
+#   a field "Down Rate" now yields no reading rather than a misattributed one,
+#   which is the trade this module makes everywhere else.
+#
+#   a gap that refuses to cross the OPPOSITE direction word, so a pattern
+#   cannot start at one direction and finish inside the other's field. This is
+#   the invariant the digit exclusion was reaching for and could not express:
+#   what disqualifies a match is another direction having been passed, whether
+#   or not it brought a number with it.
+_DSL_GAP_D = r"(?:(?!\b[Uu]pstream\b)[^<\d])"    # may not reach past "Upstream"
+_DSL_GAP_U = r"(?:(?!\b[Dd]ownstream\b)[^<\d])"  # may not reach past "Downstream"
+
 _DSL_PATTERNS = {
-    "downstream_kbps":   [re.compile(r"[Dd]own(?:stream)?[^<\d]{0,40}?(\d{3,6})\s*[Kk]bps")],
-    "upstream_kbps":     [re.compile(r"[Uu]p(?:stream)?[^<\d]{0,40}?(\d{3,6})\s*[Kk]bps")],
-    "downstream_snr_db": [re.compile(r"[Dd]own(?:stream)?[^<\d]{0,40}?SNR[^<\d]{0,20}?([\d.]+)")],
-    "upstream_snr_db":   [re.compile(r"[Uu]p(?:stream)?[^<\d]{0,40}?SNR[^<\d]{0,20}?([\d.]+)")],
-    "downstream_attn_db":[re.compile(r"[Dd]own(?:stream)?[^<\d]{0,40}?[Aa]ttenuation[^<\d]{0,20}?([\d.]+)")],
-    "upstream_attn_db":  [re.compile(r"[Uu]p(?:stream)?[^<\d]{0,40}?[Aa]ttenuation[^<\d]{0,20}?([\d.]+)")],
+    "downstream_kbps":   [re.compile(r"\b[Dd]ownstream" + _DSL_GAP_D + r"{0,40}?(\d{3,6})\s*[Kk]bps")],
+    "upstream_kbps":     [re.compile(r"\b[Uu]pstream" + _DSL_GAP_U + r"{0,40}?(\d{3,6})\s*[Kk]bps")],
+    "downstream_snr_db": [re.compile(r"\b[Dd]ownstream" + _DSL_GAP_D + r"{0,40}?SNR" + _DSL_GAP_D + r"{0,20}?([\d.]+)")],
+    "upstream_snr_db":   [re.compile(r"\b[Uu]pstream" + _DSL_GAP_U + r"{0,40}?SNR" + _DSL_GAP_U + r"{0,20}?([\d.]+)")],
+    "downstream_attn_db":[re.compile(r"\b[Dd]ownstream" + _DSL_GAP_D + r"{0,40}?[Aa]ttenuation" + _DSL_GAP_D + r"{0,20}?([\d.]+)")],
+    "upstream_attn_db":  [re.compile(r"\b[Uu]pstream" + _DSL_GAP_U + r"{0,40}?[Aa]ttenuation" + _DSL_GAP_U + r"{0,20}?([\d.]+)")],
 }
 
 

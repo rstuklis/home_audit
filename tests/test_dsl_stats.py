@@ -173,3 +173,67 @@ class TestFirmwareDiagnosis:
 
     def test_detection_is_case_insensitive(self, mod):
         assert mod._tplink_uses_encrypted_login("<script src=TPENCRYPT.JS>") is True
+
+
+class TestLinkStateIsNotADirection:
+    """Confirmed by adversarial review, and a regression introduced by _dsl_rows.
+
+    Excluding digits from the gap is necessary and not sufficient, because what
+    most often sits between a direction word and someone else's number carries
+    no digit at all: the link state. A status row reads
+
+        DSL Status | Up | Downstream SNR Margin | 6.5
+
+    and once the cells are merged into one row, an unanchored [Uu]p matched the
+    bare state word, crossed a digit-free gap and reported 6.5 as the UPSTREAM
+    figure — a number the modem never gave for that direction, then written into
+    the baseline. Before rows existed the "<" between cells blocked it and
+    nothing was reported, so adding row support turned "no value" into "wrong
+    value": the trade this module refuses to make everywhere else.
+    """
+
+    @pytest.mark.parametrize("row, fabricated", [
+        ("<tr><td>DSL Status</td><td>Up</td><td>Downstream SNR Margin</td><td>6.5</td></tr>",
+         "upstream_snr_db"),
+        ("<tr><td>Line State</td><td>Down</td><td>Upstream SNR</td><td>12.3</td></tr>",
+         "downstream_snr_db"),
+        ("<tr><td>Status</td><td>Up</td><td>Downstream Rate</td><td>1024 Kbps</td></tr>",
+         "upstream_kbps"),
+        ("<tr><td>Link</td><td>Up</td><td>Downstream Attenuation</td><td>24.8</td></tr>",
+         "upstream_attn_db"),
+    ], ids=["snr-up", "snr-down", "rate", "attenuation"])
+    def test_a_link_state_does_not_donate_its_word_to_the_other_direction(
+            self, mod, row, fabricated):
+        assert fabricated not in parse(mod, row), \
+            "a link-state cell was read as a direction label"
+
+    def test_the_real_direction_in_that_row_is_still_read(self, mod):
+        # Suppressing the fabrication must not cost the genuine reading beside it.
+        got = parse(mod, "<tr><td>DSL Status</td><td>Up</td>"
+                         "<td>Downstream SNR Margin</td><td>6.5</td></tr>")
+        assert got["downstream_snr_db"] == 6.5
+
+    @pytest.mark.parametrize("word", ["Setup", "Group", "Backup", "Startup"])
+    def test_a_word_merely_containing_up_is_not_a_direction(self, mod, word):
+        got = parse(mod, f"<tr><td>{word}</td><td>Downstream SNR</td><td>6.5</td></tr>")
+        assert "upstream_snr_db" not in got
+
+    def test_a_directionless_label_is_not_assigned_to_a_direction(self, mod):
+        # "Showtime | Up | SNR Margin | 6.5" names no direction for that figure.
+        # Guessing one is fabrication; reporting nothing is the honest answer.
+        assert parse(mod, "<tr><td>Showtime</td><td>Up</td>"
+                          "<td>SNR Margin</td><td>6.5</td></tr>") == {}
+
+    def test_a_minified_page_without_row_tags_is_also_safe(self, mod):
+        # No </tr>, </p>, <br> or newline to split on, so the whole page is one
+        # row and the state word sits beside the figure.
+        got = parse(mod, "<ul><li>Line Status: Up</li><li>Downstream SNR: 6.5 dB</li></ul>")
+        assert "upstream_snr_db" not in got
+        assert got["downstream_snr_db"] == 6.5
+
+    def test_a_digit_free_field_between_two_directions_does_not_bleed(self, mod):
+        # The digit exclusion cannot see this one: "N/A" carries no number, so
+        # only the opposite-direction guard stops upstream reaching downstream's
+        # figure.
+        got = parse(mod, "<tr><td>Upstream Rate N/A Downstream SNR 6.5</td></tr>")
+        assert got.get("upstream_snr_db") != 6.5
