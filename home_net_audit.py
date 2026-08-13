@@ -1812,14 +1812,70 @@ def speed_test(duration=6):
 
 # DSL stat regexes, pre-compiled once at import (the scrape loop runs them
 # against every candidate page).
+# The gaps around each keyword exclude DIGITS, and that single change fixes two
+# separate ways these patterns produced a plausible wrong number rather than no
+# number — which is why neither was ever noticed.
+#
+# It stops the quantifier before the capture group eating into the value.
+# `[^<]{0,20}` was greedy: it swallowed as much of "SNR: 6.5 dB" as it could,
+# then gave back only what `([\d.]+)` needed, which is the single character
+# after the decimal point. Every SNR and attenuation figure came out as its own
+# last digit — 6.5 read as 5, 24.8 as 8, 13.1 as 1 — printed beside this tool's
+# own "healthy >6 dB" note, so a perfectly good line reported itself as failing.
+# A quantifier that cannot cross a digit cannot reach into the number at all.
+#
+# It also stops a label reaching a different field's value. In a row holding
+# more than one measurement — "Upstream Rate 1024 Kbps Downstream SNR 6.5" —
+# the upstream pattern would otherwise step over the rate and capture the
+# DOWNSTREAM figure. A number in the gap means another field has already been
+# passed, so the label and the keyword do not belong to each other.
+#
+# The trailing `?` on those quantifiers is deliberate but, given the digit
+# exclusion, currently unobservable: no input can distinguish lazy from greedy
+# while a digit cannot be crossed. It is kept because it states the intent —
+# take the shortest gap — and would carry the load again if the character class
+# were ever loosened. Do not read it as tested; the digit exclusion is what the
+# tests in test_dsl_stats.py actually pin.
 _DSL_PATTERNS = {
-    "downstream_kbps":   [re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps")],
-    "upstream_kbps":     [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?(\d{3,6})\s*[Kk]bps")],
-    "downstream_snr_db": [re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)")],
-    "upstream_snr_db":   [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?SNR[^<]{0,20}([\d.]+)")],
-    "downstream_attn_db":[re.compile(r"[Dd]own(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)")],
-    "upstream_attn_db":  [re.compile(r"[Uu]p(?:stream)?[^<]{0,40}?[Aa]ttenuation[^<]{0,20}([\d.]+)")],
+    "downstream_kbps":   [re.compile(r"[Dd]own(?:stream)?[^<\d]{0,40}?(\d{3,6})\s*[Kk]bps")],
+    "upstream_kbps":     [re.compile(r"[Uu]p(?:stream)?[^<\d]{0,40}?(\d{3,6})\s*[Kk]bps")],
+    "downstream_snr_db": [re.compile(r"[Dd]own(?:stream)?[^<\d]{0,40}?SNR[^<\d]{0,20}?([\d.]+)")],
+    "upstream_snr_db":   [re.compile(r"[Uu]p(?:stream)?[^<\d]{0,40}?SNR[^<\d]{0,20}?([\d.]+)")],
+    "downstream_attn_db":[re.compile(r"[Dd]own(?:stream)?[^<\d]{0,40}?[Aa]ttenuation[^<\d]{0,20}?([\d.]+)")],
+    "upstream_attn_db":  [re.compile(r"[Uu]p(?:stream)?[^<\d]{0,40}?[Aa]ttenuation[^<\d]{0,20}?([\d.]+)")],
 }
+
+
+def _dsl_rows(raw):
+    """Split a router status page into rows, each flattened to plain text.
+
+    Two things have to be true at once, and getting one without the other
+    produces a wrong number rather than no number:
+
+    A label and its value must be able to reach each other. A router serves a
+    table — `<td>Downstream SNR</td><td>6.5</td>` — so the patterns, which
+    cannot cross a `<`, failed on precisely the pages this function is aimed
+    at, and every run reported "format unrecognised" whatever the modem said.
+
+    A label must NOT be able to reach a different measurement's value. Simply
+    deleting the tags allows that: flattened to one string, "Upstream Rate 1024
+    Kbps Downstream SNR 6.5" lets the upstream-SNR pattern start at "Upstream",
+    run past the rate, and capture the DOWNSTREAM figure. Upstream then reports
+    downstream's number, which is worse than reporting nothing.
+
+    Rows are the structure that separates measurements, so rows are what this
+    preserves. Tags within a row become spaces rather than vanishing, so cells
+    cannot be glued into a word that never appeared.
+    """
+    parts = re.split(r"(?i)</tr>|</p>|<br\s*/?>|[\r\n]+", raw)
+    rows = []
+    for part in parts:
+        text = re.sub(r"<[^>]+>", " ", part)
+        text = text.replace("&nbsp;", " ").replace("&#160;", " ")
+        text = re.sub(r"[ \t]+", " ", text).strip()
+        if text:
+            rows.append(text)
+    return rows
 
 
 def tplink_dsl_stats(ip, password):
@@ -1872,14 +1928,20 @@ def tplink_dsl_stats(ip, password):
     if not raw:
         return stats, "Could not retrieve DSL stats — auth failed or unknown page paths"
 
+    rows = _dsl_rows(raw)
     for key, pats in _DSL_PATTERNS.items():
+        matched = False
         for pat in pats:
-            m = pat.search(raw)
-            if m:
-                try:
-                    stats[key] = float(m.group(1))
-                except ValueError:
-                    pass
+            for row in rows:
+                m = pat.search(row)
+                if m:
+                    try:
+                        stats[key] = float(m.group(1))
+                    except ValueError:
+                        pass
+                    matched = True
+                    break
+            if matched:
                 break
     note = "" if any(v is not None for v in stats.values()) else \
         "Connected but no DSL values parsed — format unrecognised"
