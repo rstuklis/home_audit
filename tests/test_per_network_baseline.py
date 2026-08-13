@@ -169,10 +169,13 @@ class TestLegacyMigration:
         assert (net / "history-192-168-87-0-24.jsonl").exists()
         assert not (net / "history.jsonl").exists()
 
-    def test_a_baseline_with_no_subnet_recorded_is_left_alone(self, mod, net):
+    def test_a_baseline_with_nothing_identifying_is_left_alone(self, mod, net):
         # Filing it under a guess would attach a real chain to the wrong
-        # network, which is worse than leaving it where it is.
-        self._write_legacy(mod, net, {"timestamp": "t", "gateway": "192.168.87.1"})
+        # network, which is worse than leaving it where it is. Note a recorded
+        # gateway IS enough — see
+        # TestUnidentifiableLegacyBaselineIsNotAbandoned — so this state has
+        # none: no coverage, no devices, no gateway.
+        self._write_legacy(mod, net, {"timestamp": "t", "router_open_ports": [80]})
         assert mod.migrate_legacy_baseline() is None
         assert (net / "baseline.json").exists()
 
@@ -243,3 +246,111 @@ class TestSelectionCannotEscapeRedirection:
         assert mod.BASELINE_FILE == first
         mod.select_network_baseline(PEARL)
         assert os.path.dirname(mod.BASELINE_FILE) == os.path.dirname(first)
+
+
+class TestReceiptChains:
+    """Sequence numbers restart at 1 per network, so a shared off-host sink
+    holds several chains whose seq values collide. Untangling them must not cost
+    the check those receipts exist for: catching a wiped ~/.home_net_audit,
+    where the local baseline and its history go together and only the off-host
+    record survives to contradict a run claiming to be the first.
+
+    Adversarial review found the whole filter untested — deleting it left the
+    entire suite green while restoring the cross-network false alarm.
+    """
+
+    def _chain_for(self, mod, subnet):
+        mod.select_network_baseline(subnet)
+        return mod.chain_id()
+
+    def test_another_network_s_receipts_do_not_read_as_deleted_evidence(self, mod, net):
+        love = self._chain_for(mod, LOVESHACK)
+        pearl = self._chain_for(mod, PEARL)
+        sink = ([{"seq": n, "seal": f"s{n}", "chain": love} for n in range(1, 14)]
+                + [{"seq": 1, "seal": "p1", "chain": pearl}])
+
+        mod.select_network_baseline(PEARL)
+        assert mod.compare_with_receipts({"seq": 1, "seal": "p1"}, sink)["status"] == "ok"
+
+    def test_this_network_s_own_receipts_still_catch_a_wipe(self, mod, net):
+        love = self._chain_for(mod, LOVESHACK)
+        sink = [{"seq": n, "seal": f"s{n}", "chain": love} for n in range(1, 8)]
+        mod.select_network_baseline(LOVESHACK)
+        # A wiped machine starts again at seq 1 while the sink remembers seven.
+        assert mod.compare_with_receipts({"seq": 1, "seal": "s1"}, sink)["status"] == \
+            "history_truncated"
+
+    def test_receipts_predating_chains_still_catch_a_wipe_after_migration(self, mod, net):
+        # The regression that mattered most. Pre-upgrade receipts carry no chain
+        # id; pinning them to an id derived from the old filename meant
+        # migration renamed the baseline, the id moved, and every one of them
+        # stopped matching — silently disabling wipe detection for exactly the
+        # users who had been publishing receipts the longest.
+        legacy = [{"seq": n, "seal": f"s{n}"} for n in range(1, 6)]   # no "chain"
+        mod.select_network_baseline(LOVESHACK)                        # i.e. migrated
+        assert mod.compare_with_receipts({"seq": 1, "seal": "x"}, legacy)["status"] == \
+            "history_truncated"
+
+    def test_a_chainless_receipt_is_accepted_on_any_network(self, mod, net):
+        # It cannot be attributed to one network now, and the alternative to
+        # accepting it everywhere was discarding it everywhere.
+        legacy = [{"seq": 4, "seal": "d"}]
+        for subnet in (LOVESHACK, PEARL, IOT):
+            mod.select_network_baseline(subnet)
+            assert mod.compare_with_receipts({"seq": 1, "seal": "a"}, legacy)["status"] == \
+                "history_truncated"
+
+    def test_distinct_networks_get_distinct_chain_ids(self, mod, net):
+        ids = {self._chain_for(mod, s) for s in (LOVESHACK, PEARL, IOT)}
+        assert len(ids) == 3
+
+    def test_a_chain_id_says_nothing_about_the_network(self, mod, net):
+        # baseline_receipt exists to prove a run happened without shipping the
+        # network's shape off-host, so the id must not carry the subnet.
+        cid = self._chain_for(mod, LOVESHACK)
+        assert "192" not in cid and "87" not in cid
+        assert "loveshack" not in cid.lower()
+
+
+class TestUnidentifiableLegacyBaselineIsNotAbandoned:
+    def test_a_no_discovery_baseline_is_identified_by_its_gateway(self, mod, net):
+        # Scheduled runs use --no-discovery, so they save neither coverage nor
+        # devices — but they do record the gateway, and the network is its own.
+        mod.BASELINE_FILE = str(net / "baseline.json")
+        mod.HISTORY_FILE = str(net / "history.jsonl")
+        mod.save_baseline({"timestamp": "t", "gateway": "192.168.87.1",
+                           "router_open_ports": [80]})
+        assert mod.migrate_legacy_baseline() == "192-168-87-0-24"
+
+    def test_a_baseline_with_nothing_identifying_stays_selected(self, mod, net):
+        # Selecting a per-network file here would leave a sealed, verified chain
+        # on disk and unread for ever, and restart at seq 1 — losing change
+        # detection AND the chain, which is worse than sharing one baseline was.
+        mod.BASELINE_FILE = str(net / "baseline.json")
+        mod.HISTORY_FILE = str(net / "history.jsonl")
+        mod.save_baseline({"timestamp": "t", "router_open_ports": [80]})
+
+        subnet, key = mod.use_current_network_baseline(
+            interfaces=[], local_ip=None, gateway=None, announce=None)
+
+        assert (subnet, key) == (None, None)
+        assert mod.load_baseline() is not None, "a sealed baseline was abandoned"
+
+
+class TestTheNetworkLineIsActuallyPrinted:
+    """Found by adversarial review: an unreachable `return None` had been left in
+    describe_current_network, so the one line telling the reader WHICH baseline a
+    comparison used never printed. "No changes since baseline" means nothing
+    without it, and it is the guard that would surface a mis-selected network."""
+
+    def test_a_known_network_is_named(self, mod):
+        line = mod.describe_current_network(LOVESHACK, {LOVESHACK: "loveshack"})
+        assert line is not None, "the network line is dead code again"
+        assert "loveshack" in line and LOVESHACK in line
+
+    def test_an_unnamed_subnet_still_reports_the_subnet(self, mod):
+        line = mod.describe_current_network("10.9.9.0/24", {})
+        assert line is not None and "10.9.9.0/24" in line
+
+    def test_no_line_when_the_network_is_unknown(self, mod):
+        assert mod.describe_current_network(None) is None

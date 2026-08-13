@@ -1424,20 +1424,33 @@ def compare_with_receipts(record, receipts):
     Returns {status, detail}. Statuses: ok, no_receipts, history_truncated,
     seal_mismatch.
     """
-    # Only this chain's receipts. A sink is shared across networks while
-    # sequence numbers restart at 1 for each, so comparing against all of them
-    # reads another network's longer history as this one's evidence being
-    # deleted. Receipts written before chains existed carry no id and form one
-    # legacy chain of their own; matching them to a per-network baseline would
-    # reintroduce exactly the collision this avoids.
+    # Only this chain's receipts, plus every receipt that predates chains.
+    #
+    # A sink is shared across networks while sequence numbers restart at 1 for
+    # each, so comparing against all of them reads another network's longer
+    # history as this one's evidence being deleted. Filtering on the chain id
+    # fixes that for anything published since.
+    #
+    # A receipt with no chain id was published when one shared baseline served
+    # everything, and cannot be attributed to a network now. An earlier attempt
+    # pinned those to a "legacy" id derived from the old filename, which read
+    # well and was wrong: migration renames the baseline, so the id moved and
+    # every pre-upgrade receipt stopped matching anything. That silently
+    # disabled the one check that catches a wiped ~/.home_net_audit — the local
+    # copy and its history go together, and only the off-host record survives to
+    # contradict a run claiming to be the first.
+    #
+    # So they are accepted for every chain. The cost is that a second network
+    # may report history_truncated off another network's older runs: a false
+    # alarm, loud and investigable. The alternative was a missed one. Between
+    # those this module chooses loud every time.
     # A receipt written before chains existed carries no id and belongs to the
     # single shared baseline that was the only one then. Treating it as that
     # chain keeps tamper detection working for anyone who has not migrated;
     # dropping it would quietly disable the check for them, which is worse than
     # the collision being fixed.
     mine = chain_id()
-    legacy = chain_id("baseline.json")
-    receipts = [r for r in (receipts or []) if (r.get("chain") or legacy) == mine]
+    receipts = [r for r in (receipts or []) if r.get("chain") in (None, mine)]
 
     if not receipts:
         return {"status": "no_receipts",
@@ -1787,8 +1800,13 @@ def migrate_legacy_baseline(announce=None):
     A legacy baseline with nothing to identify it is left exactly where it is
     rather than filed under a guess. Returns the key it was migrated to, or None.
     """
-    legacy_baseline = os.path.join(BASELINE_DIR, "baseline.json")
-    legacy_history = os.path.join(BASELINE_DIR, "history.jsonl")
+    # dirname(BASELINE_FILE), not BASELINE_DIR: the two can disagree, and
+    # selection already derives from the file. Using different roots here would
+    # let migration look for a legacy baseline in one place while selection
+    # points somewhere else.
+    root = os.path.dirname(BASELINE_FILE) or BASELINE_DIR
+    legacy_baseline = os.path.join(root, "baseline.json")
+    legacy_history = os.path.join(root, "history.jsonl")
     if not os.path.exists(legacy_baseline):
         return None
     try:
@@ -1807,6 +1825,18 @@ def migrate_legacy_baseline(announce=None):
             if isinstance(d, dict) and isinstance(d.get("subnet"), str):
                 subnet = d["subnet"]
                 break
+    if not subnet:
+        # A --no-discovery run saves neither coverage nor devices, so those two
+        # say nothing — but such a baseline still records the gateway it audited,
+        # and the network is the gateway's own. Without this a scheduled-only
+        # user's entire sealed chain is unidentifiable, and the caller below
+        # would leave it on disk unread for ever.
+        gw = state.get("gateway")
+        if isinstance(gw, str):
+            guessed = guess_subnet(gw)
+            if guessed:
+                subnet = str(guessed)
+
     key = baseline_key(subnet)
     if not key:
         return None
@@ -1839,6 +1869,21 @@ def use_current_network_baseline(interfaces=None, local_ip=None, gateway=None,
     identified, in which case the shared default files remain selected.
     """
     migrate_legacy_baseline(announce=announce)
+
+    # If a legacy baseline is still here, migration could not work out which
+    # network it describes. Selecting a per-network file now would abandon it:
+    # it stays on disk, sealed and verified, while every later run reads an
+    # empty path, reports "no baseline saved yet" for a network that has one,
+    # and starts a fresh chain at seq 1. Losing change detection AND the chain
+    # is worse than sharing one baseline was. Keep reading it, and say so.
+    root = os.path.dirname(BASELINE_FILE) or BASELINE_DIR
+    if os.path.exists(os.path.join(root, "baseline.json")):
+        if announce:
+            announce("  Baseline predates per-network storage and does not record "
+                     "which network it describes, so it is still shared. Save a "
+                     "baseline from a full audit to give this network its own.")
+        return None, None
+
     if interfaces is None:
         interfaces = get_all_interfaces()
     if local_ip is None:
@@ -1859,7 +1904,6 @@ def describe_current_network(subnet, networks=None):
     """
     if not subnet:
         return None
-    return None
     name = network_name_for_subnet(subnet, networks or load_networks())
     label = f"{name} ({subnet})" if name != subnet else subnet
     return f"  Network: {label}"

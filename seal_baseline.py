@@ -26,6 +26,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import home_net_audit as h  # importing does not run the audit (main() is guarded)
 
+# Baselines are stored per network, so this has to pick the same one an audit
+# would before it reads or writes anything. Without it the script seals whatever
+# the module-level default points at — on a migrated setup, a file no audit
+# consults — and then reports success, leaving the baseline actually in use
+# unsealed while its owner believes it is tamper-evident. Silent, and in exactly
+# the direction that matters.
+subnet, _ = h.use_current_network_baseline()
+net_line = h.describe_current_network(subnet)
+
 state = h.load_baseline()
 if state is None:
     sys.exit(f"No baseline found at {h.BASELINE_FILE} — run the audit first to create one.")
@@ -34,6 +43,9 @@ ts = state.get("timestamp", "unknown")
 ndev = len(state.get("devices", []))
 ports = state.get("router_open_ports")
 print("About to seal the baseline already on disk (no new scan):")
+if net_line:
+    print(net_line.rstrip())
+print(f"  file        : {os.path.basename(h.BASELINE_FILE)}")
 print(f"  captured    : {ts}")
 print(f"  devices     : {ndev}")
 print(f"  router ports: {ports}")
