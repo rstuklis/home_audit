@@ -1096,18 +1096,46 @@ def carry_forward_unmeasured(state, previous=None):
     still has a real baseline to compare against.
 
     The substitution is recorded in `carried_forward` so the saved baseline
-    never implies a measurement that was not taken.
+    never implies a measurement that was not taken, and `measured_at` records
+    WHEN each value was last genuinely measured.
+
+    That second record is what stops carrying quietly becoming lying. A carried
+    value inherits the new run's timestamp along with the rest of the state, so
+    without it a device list observed once in August would still present itself
+    as measured today after months of runs that skipped the sweep — indefinitely
+    and invisibly, because carrying has no natural end. Nothing here expires a
+    value: refusing to carry is what destroyed a baseline in the first place.
+    The age is recorded and surfaced instead, so a reader can weigh it.
     """
     if previous is None:
         previous = load_baseline() or {}
-    carried = [k for k in CARRY_FORWARD_KEYS
-               if state.get(k) is None and previous.get(k) is not None]
+    stamp = state.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    previously_measured = previous.get("measured_at") or {}
+
+    carried = []
+    measured_at = {}
+    for key in CARRY_FORWARD_KEYS:
+        if state.get(key) is not None:
+            measured_at[key] = stamp
+        elif previous.get(key) is not None:
+            carried.append(key)
+            # The origin of the reading, not the run that inherited it. Falling
+            # back to the previous state's own timestamp covers a baseline saved
+            # before measured_at existed.
+            measured_at[key] = (previously_measured.get(key)
+                                or previous.get("timestamp") or "")
+
     if not carried:
+        # Nothing was inherited, so there is no age to track and no bookkeeping
+        # to add: a run that measured everything saves exactly what it measured.
+        # The next run that DOES carry recovers this run's time from the state's
+        # own timestamp, which is when these values were read.
         return state
     merged = dict(state)
     for key in carried:
         merged[key] = previous[key]
     merged["carried_forward"] = sorted(carried)
+    merged["measured_at"] = measured_at
     return merged
 
 
@@ -1546,6 +1574,51 @@ def describe_baseline_integrity(report):
         "chain_missing": "HIGH",
     }.get(report.get("status"), "REVIEW")
     return f"  [{risk:6}] Baseline integrity: {report.get('detail', '')}"
+
+
+_CARRIED_LABELS = {
+    "devices": "device list",
+    "scanned_subnets": "scan coverage",
+    "router_open_ports": "router ports",
+    "upstream_open_ports": "upstream modem ports",
+}
+
+
+def describe_baseline_freshness(state, now=None):
+    """A caveat line when the baseline holds values it did not measure, or None.
+
+    "No changes since baseline" reads as an all-clear over the whole network.
+    It is a weaker statement than that whenever part of the baseline was carried
+    forward: those values were compared against a reading taken some time ago,
+    not against what the baseline run saw. Carrying is still right — the
+    alternative destroyed a baseline of ten devices — but the reader is entitled
+    to know which parts of the comparison rest on old ground, and how old.
+
+    Silent when everything was measured, so the ordinary run gains no noise.
+    """
+    carried = (state or {}).get("carried_forward") or []
+    if not carried:
+        return None
+    measured_at = state.get("measured_at") or {}
+    now = now or datetime.now(timezone.utc)
+    parts = []
+    oldest_days = 0
+    for key in sorted(carried):
+        label = _CARRIED_LABELS.get(key, key)
+        when = measured_at.get(key)
+        try:
+            stamp = datetime.fromisoformat(when)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            days = max(0, (now - stamp).days)
+            oldest_days = max(oldest_days, days)
+            parts.append(f"{label} ({days}d)" if days else f"{label} (today)")
+        except (TypeError, ValueError):
+            parts.append(f"{label} (age unknown)")
+            oldest_days = max(oldest_days, 1)
+    risk = "REVIEW" if oldest_days >= 7 else "INFO"
+    return (f"  [{risk:6}] Baseline freshness: carried forward, not measured when "
+            f"the baseline was saved — {', '.join(parts)}.")
 
 
 def load_labels():
@@ -3864,6 +3937,9 @@ def action_compare_baseline(state):
         print(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink))))
     old = load_baseline()
+    _freshness = describe_baseline_freshness(old)
+    if _freshness:
+        print(_freshness)
     if not old:
         print("No baseline saved yet.")
         print("Run option 5 (Save baseline) after a full audit to enable this.")
@@ -4016,6 +4092,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         print(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink))))
     old = load_baseline()
+    _freshness = describe_baseline_freshness(old)
+    if _freshness:
+        print(_freshness)
     if old:
         changes = diff_baseline(old, state)
         print(f"Baseline from: {old.get('timestamp', '?')}")

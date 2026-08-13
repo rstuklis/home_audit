@@ -774,3 +774,87 @@ class TestRotatingPrivateAddresses:
         old = {"devices": [dev(LAPTOP), dev(PHONE_MON), dev(PHONE_TUE)]}
         new = {"devices": [dev(LAPTOP), dev(PHONE_WED), dev("6a:11:22:33:44:55")]}
         assert mod.diff_baseline(old, new) == []
+
+
+class TestBaselineFreshness:
+    """A carried value inherits the new run's timestamp along with the rest of
+    the state, so without a separate record of when it was last actually
+    measured, carrying quietly becomes lying: a device list observed once in
+    August still presents itself as measured today, indefinitely, because
+    carrying has no natural end. Nothing expires a value — refusing to carry is
+    what destroyed a baseline in the first place — so the age is recorded and
+    surfaced instead.
+    """
+
+    from datetime import datetime, timezone
+
+    def test_a_run_that_measured_everything_saves_exactly_what_it_measured(self, mod):
+        # No bookkeeping keys on the ordinary path. An earlier version of this
+        # stamped measured_at onto every save, which changed the shape of every
+        # baseline to no benefit and broke the round-trip property that
+        # load_baseline() returns the state it was given. The age of a value is
+        # only needed once something is inherited, and the first carry recovers
+        # it from this state's own timestamp — see the fallback test below.
+        state = {"timestamp": "2026-08-13T04:00:00+00:00", "devices": [{"mac": "a"}]}
+        merged = mod.carry_forward_unmeasured(state, {})
+        assert merged == state
+        assert "measured_at" not in merged and "carried_forward" not in merged
+
+    def test_a_carried_value_keeps_its_ORIGINAL_measurement_time(self, mod):
+        # The point of the whole mechanism: the carried entry must not inherit
+        # the new run's clock, or age becomes unknowable.
+        previous = {"timestamp": "2026-08-01T00:00:00+00:00",
+                    "devices": [{"mac": "a"}],
+                    "measured_at": {"devices": "2026-08-01T00:00:00+00:00"}}
+        merged = mod.carry_forward_unmeasured(
+            {"timestamp": "2026-08-13T04:00:00+00:00"}, previous)
+        assert merged["measured_at"]["devices"] == "2026-08-01T00:00:00+00:00"
+
+    def test_age_survives_repeated_carrying(self, mod):
+        # Carry the same value three times; the origin must not drift forward.
+        state = {"timestamp": "2026-08-01T00:00:00+00:00", "devices": [{"mac": "a"}]}
+        carried = mod.carry_forward_unmeasured(state, {})
+        for day in ("08-05", "08-09", "08-13"):
+            carried = mod.carry_forward_unmeasured(
+                {"timestamp": f"2026-{day}T00:00:00+00:00"}, carried)
+        assert carried["measured_at"]["devices"] == "2026-08-01T00:00:00+00:00"
+
+    def test_a_baseline_predating_measured_at_falls_back_to_its_timestamp(self, mod):
+        previous = {"timestamp": "2026-08-01T00:00:00+00:00", "devices": [{"mac": "a"}]}
+        merged = mod.carry_forward_unmeasured(
+            {"timestamp": "2026-08-13T04:00:00+00:00"}, previous)
+        assert merged["measured_at"]["devices"] == "2026-08-01T00:00:00+00:00"
+
+    def test_a_fully_measured_baseline_produces_no_caveat(self, mod):
+        # The ordinary run must gain no noise.
+        assert mod.describe_baseline_freshness(
+            {"devices": [], "measured_at": {"devices": "2026-08-13T00:00:00+00:00"}}) is None
+        assert mod.describe_baseline_freshness({}) is None
+        assert mod.describe_baseline_freshness(None) is None
+
+    def test_the_caveat_names_what_was_carried_and_how_old_it_is(self, mod):
+        now = self.datetime(2026, 8, 13, tzinfo=self.timezone.utc)
+        line = mod.describe_baseline_freshness(
+            {"carried_forward": ["devices"],
+             "measured_at": {"devices": "2026-08-01T00:00:00+00:00"}}, now=now)
+        assert "device list" in line
+        assert "12d" in line
+
+    def test_a_stale_carry_is_escalated_from_INFO_to_REVIEW(self, mod):
+        now = self.datetime(2026, 8, 13, tzinfo=self.timezone.utc)
+        fresh = mod.describe_baseline_freshness(
+            {"carried_forward": ["devices"],
+             "measured_at": {"devices": "2026-08-12T00:00:00+00:00"}}, now=now)
+        stale = mod.describe_baseline_freshness(
+            {"carried_forward": ["devices"],
+             "measured_at": {"devices": "2026-07-01T00:00:00+00:00"}}, now=now)
+        assert "INFO" in fresh and "REVIEW" not in fresh
+        assert "REVIEW" in stale
+
+    def test_an_unparseable_or_missing_timestamp_is_said_rather_than_crashed(self, mod):
+        # Baselines are hand-editable JSON; an unusable timestamp must degrade.
+        line = mod.describe_baseline_freshness(
+            {"carried_forward": ["devices"], "measured_at": {"devices": "not-a-date"}})
+        assert "age unknown" in line
+        line = mod.describe_baseline_freshness({"carried_forward": ["devices"]})
+        assert "age unknown" in line
