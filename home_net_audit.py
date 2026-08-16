@@ -1705,9 +1705,16 @@ def _publish_https(payload, url, token, mode):
     if token and not url.startswith("https://"):
         # A bearer token over plain http is readable by anyone on the path,
         # starting with the LAN this tool is auditing.
+        #
+        # Named by mode rather than "the sink token": this function is the
+        # transport for receipts, heartbeats and alerts, and the alert channel
+        # carries a different credential to a different endpoint. Telling an
+        # alert user their sink token was refused points them at the wrong
+        # setting.
+        which = "alert token" if mode == "alert" else "sink token"
         return {"published": False, "mode": mode,
-                "detail": f"Refusing to send the sink token to {url}: it is not https. "
-                          "Use an https sink, or clear the token."}
+                "detail": f"Refusing to send the {which} to {url}: it is not https. "
+                          f"Use an https destination, or clear the {which}."}
     headers = {"Content-Type": "application/json", "User-Agent": "home_net_audit"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
