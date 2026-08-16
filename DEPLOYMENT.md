@@ -92,6 +92,43 @@ Routine bookkeeping and things a person must wake up for usually belong on
 different channels — and an alert printed to a terminal on the host under
 suspicion has been delivered to the adversary and nobody else.
 
+### Silence is not evidence
+
+Every check in the loop catches someone who is in the path **while the loop is
+running**. None of them are worth anything when the process is not running, and
+stopping a process is far cheaper than defeating an ARP check. So the attack on
+a monitor is not evasion, it is switching it off — and you do not need an
+attacker for that. A reboot, a crash, an OOM kill or a `RestartSec` window does
+it just as well.
+
+Two things follow, and the monitor now handles both.
+
+**Its reference point survives a restart.** The last snapshot is persisted to
+`~/.home_net_audit/monitor_state.json`. It used to live in memory only, which
+meant a restart re-baselined into whatever world it woke up in: poison the ARP
+cache and the resolver while the monitor is down, and the restart adopted the
+attacker's MAC and DNS as normal and never alerted on them — not just during the
+gap, but ever. A restart now compares across the downtime and reports what
+changed, flagged as observed across a window nobody was watching.
+
+**It publishes a heartbeat**, on the receipt sink, saying observation was
+happening at that moment. Without one, "no alerts this week" and "nothing was
+watching this week" are the same output, and the reassuring reading is the one
+people take. `--monitor` therefore wants `HOME_NET_AUDIT_SINK` set as much as a
+full audit does; it says so at startup if it is missing. The next audit reads
+those heartbeats back and names any window with no monitoring in it.
+
+Gaps resolve to within one heartbeat interval (15 minutes), which the report
+states rather than rounds away. A gap that is still open — no heartbeat between
+the last one and now — is reported as HIGH rather than REVIEW, because that is
+the one an attacker is inside at the moment you are reading.
+
+What a heartbeat proves is narrow, and it is worth being exact about: **it says
+the process was alive and could reach the sink. It does not say the checks were
+meaningful.** An attacker who owns the host can keep heartbeats flowing while
+feeding the monitor whatever they like. This detects a *stopped* monitor, not a
+*subverted* one.
+
 ### systemd unit
 
 ```ini
@@ -146,6 +183,78 @@ Mac itself.
 
 ---
 
+## Which program wrote the report
+
+Sealing, receipts and heartbeats all authenticate **data**. None of them says
+anything about the **program**, and the program runs on the machine being
+assessed. Delete the check that would report a backdoor port and every one of
+those defences keeps working perfectly, indefinitely, over a report that has
+quietly stopped looking.
+
+So every receipt and every heartbeat now carries a SHA-256 of the script that
+wrote it, and the audit reports when that digest changes across the off-host
+record.
+
+**Read the limit before you rely on this.** The script hashes itself. A modified
+script reports whatever digest it likes, including the original's, and nothing
+here can tell — any check the script runs on itself is a check the attacker has
+already edited. This is the same weakness the provenance section calls
+*self-reported*, and it is in that class deliberately.
+
+What it catches is a modification that did not anticipate being watched: an
+unreviewed edit, a file swapped by someone who did not read it, drift between two
+machines meant to run the same audit, a half-finished upgrade. Against an
+adversary who knows the line exists it is worth nothing.
+
+It covers this file only — not the interpreter, not the standard library, not
+anything else on the host.
+
+The digest is printed in the report so you can compare it against a trusted
+source by hand, which is the one check that does not run on the suspect machine:
+
+```sh
+shasum -a 256 home_net_audit.py      # from a copy you trust, on a machine you trust
+```
+
+---
+
+## Which findings survive a lying gateway
+
+The report prints as one flat list of risk-tagged lines, and that format quietly
+implies they are all equally well founded. They are not, and the report now says
+so in an **Evidence provenance** section rather than leaving it to this document.
+
+| Class | Means | Defeated by |
+|---|---|---|
+| Observed | Read from this machine's own OS — ARP cache, routing table, interfaces, firewall, its own listening sockets | A compromised **host** (which is why you run it from a second machine) |
+| Measured | This tool did it and watched the result — TCP connect, TLS handshake, a DHCP offer arriving, a Router Advertisement on the link | Someone actively in the path, who has to act to interfere |
+| Self-reported | The device under assessment said so — UPnP mappings, the router's admin pages, its answers to login attempts | The router simply omitting what it does not wish to mention |
+| Via resolver | Answered through DNS, which on a home network the gateway usually serves | The gateway answering a question about itself |
+| Third party | Fetched from an outside service — vendor names come from `api.macvendors.com` | Anyone on the path to that service; it also sends every discovered MAC off-network |
+
+The distinction is not decoration. Two examples of what it changes:
+
+**The router hostname check asks the suspect to confirm its own identity.** It
+detects a rogue router by a reverse DNS lookup, and that lookup goes to whatever
+resolver this machine is configured with — normally the router. A rogue one
+answers with something unremarkable or with nothing at all, and *no PTR record*
+is the most likely output on any real home network. It used to print `[OK]`. It
+now prints `[INFO]` with the reason whenever the resolver is the gateway, and
+keeps `[OK]` only when an independent resolver answered.
+
+**A quiet UPnP dump is the router's account of its own forwarding table.** A
+router that has punched a hole for an attacker omits it, and there is no second
+source to check against. "No mappings" is now reported as what it is.
+
+Read the class as a question about *what would have to be true for this to be
+wrong*, not as a severity. A self-reported finding that **incriminates** is the
+strongest evidence in the report — the router volunteered something against its
+own interest. It is specifically the clean self-reported result that is weak, for
+the same reason an unkeyed seal verifies without being forgery-proof: passing was
+always available to an attacker.
+
+---
+
 ## What none of this catches
 
 Worth being blunt, because a monitoring setup invites more confidence than it
@@ -153,11 +262,20 @@ earns.
 
 - **Passive interception upstream.** Anything at or beyond your ISP leaves no
   trace on the LAN. Assume it is possible and encrypt accordingly.
-- **A compromised router.** UPnP mappings, DHCP responses and the admin page are
-  all self-reported by the device you are trying to assess.
+- **A compromised router.** UPnP mappings, DHCP offer contents and the admin page
+  are all self-reported by the device you are trying to assess. The report now
+  marks which findings those are rather than only saying so here, but marking
+  them does not make them verifiable — nothing on the LAN can.
 - **Endpoint implants.** Empirically the most likely route to a targeted
   individual, and a network monitor cannot see them. Lockdown Mode, prompt
   patching and Apple Threat Notifications matter far more here.
+- **A subverted monitor.** Heartbeats catch a monitor that stopped. They do
+  nothing about one that is still running and lying, because both the checks and
+  the heartbeat come from the same host. Anyone who owns the observer gets both.
+- **An edited audit script that knows it is attested.** The digest is computed by
+  the same script it describes, so a deliberate edit can carry the original
+  forward. Comparing the digest by hand against a trusted copy is the only check
+  here that does not run on the machine under suspicion.
 - **Wholesale destruction of the observer.** Receipts survive it; the observer
   does not.
 

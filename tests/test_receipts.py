@@ -94,6 +94,61 @@ class TestWipedHistoryIsDetected:
         assert "REVIEW" in mod.describe_receipt_status(report)
 
 
+class TestKeyStrippingIsCaughtOffHost:
+    """The downgrade the local chain cannot catch on a fully-compromised host.
+
+    verify_baseline holds the keyed/unkeyed line only while the local history is
+    honest. Against an attacker who owns the host — and so rewrites baseline AND
+    history together — the cheapest forgery is not to break the passphrase but to
+    strip it: replace the baseline with an unkeyed record (a seal the host can
+    recompute) and extend the chain one unkeyed step, rewriting local history to
+    agree. Locally that is internally consistent and verifies. Only the off-host
+    receipts still remember the chain was keyed, so this is where it has to be
+    caught.
+    """
+
+    def _forge_unkeyed_successor(self, mod, evil_state):
+        """Return an unkeyed record that continues the current chain, no passphrase."""
+        prev = mod.load_baseline_record()
+        forged = {"format": mod.BASELINE_FORMAT, "seq": prev["seq"] + 1,
+                  "prev": prev["seal"], "keyed": False, "state": evil_state}
+        forged["seal"] = mod.seal_payload(
+            {k: v for k, v in forged.items() if k != "seal"}, key=None)
+        return forged
+
+    def test_stripping_the_key_and_extending_the_chain_is_caught(self, mod, sink):
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+
+        evil = dict(STATE, router_open_ports=[23])   # telnet, now "known good"
+        forged = self._forge_unkeyed_successor(mod, evil)
+
+        # The attacker owns the host: rewrite both local files to agree...
+        mod._write_json_atomic(mod.BASELINE_FILE, forged)
+        with open(mod.HISTORY_FILE, "a") as f:
+            f.write(json.dumps({"seq": forged["seq"], "seal": forged["seal"],
+                                "keyed": False, "ts": "t"}, sort_keys=True) + "\n")
+        # ...and append a matching receipt (appending is all an append-only sink allows).
+        with open(sink / "receipts.jsonl", "a") as f:
+            f.write(json.dumps(mod.baseline_receipt(forged), sort_keys=True) + "\n")
+
+        # Locally consistent: the seal verifies and the chain agrees.
+        assert mod.verify_baseline(passphrase=PASSPHRASE)["status"] == "ok"
+
+        # The off-host record still says the chain was keyed.
+        report = mod.compare_with_receipts(
+            mod.load_baseline_record(), mod.read_receipts(str(sink)))
+        assert report["status"] == "keyed_downgrade"
+        assert "HIGH" in mod.describe_receipt_status(report)
+
+    def test_an_unkeyed_chain_that_was_always_unkeyed_is_not_flagged(self, mod, sink):
+        # No passphrase ever: dropping from nothing to nothing is not a downgrade.
+        for _ in range(3):
+            mod.save_baseline(STATE)
+        report = mod.compare_with_receipts(
+            mod.load_baseline_record(), mod.read_receipts(str(sink)))
+        assert report["status"] == "ok"
+
+
 class TestReceiptsCarryNoAuditState:
     def test_a_receipt_excludes_the_state_entirely(self, mod):
         record = {"seq": 1, "seal": "abc", "prev": None, "keyed": True, "state": STATE}

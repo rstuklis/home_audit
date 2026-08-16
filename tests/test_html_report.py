@@ -521,10 +521,31 @@ class TestSecretRedaction:
         assert "Default credentials accepted!" in text
         assert '<span style="background:#e74c3c;' in text
 
-    def test_no_successes_renders_a_clean_result(self, mod, tmp_path):
+    def test_no_successes_without_coverage_does_not_claim_a_clean_result(self, mod,
+                                                                        tmp_path):
+        # This used to badge OK on "No default credentials accepted." alone. A
+        # record with no coverage predates the tracking, so whether anything was
+        # ever submitted is unknown — and unknown must not render as a pass in
+        # the artefact most likely to be read by someone who did not run it.
         text = render(mod, tmp_path, {"default_creds": {"successes": []}})
-        assert "No default credentials accepted." in text
+        assert "is unknown" in text
+        assert '<span style="background:#27ae60;' not in text
+
+    def test_credentials_actually_submitted_and_refused_renders_a_pass(self, mod,
+                                                                      tmp_path):
+        text = render(mod, tmp_path, {"default_creds": {
+            "successes": [],
+            "coverage": {"attempts": 12, "open": [80], "blocked": [], "closed": []}}})
+        assert "every one was refused" in text
         assert '<span style="background:#27ae60;' in text
+
+    def test_a_probe_that_found_nothing_to_try_is_not_a_pass(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"default_creds": {
+            "successes": [],
+            "coverage": {"attempts": 0, "open": [], "blocked": [],
+                         "closed": [80, 8080, 8443, 443]}}})
+        assert "no credentials were tested" in text
+        assert '<span style="background:#27ae60;' not in text
 
     def test_a_password_containing_markup_is_still_withheld(self, mod, tmp_path):
         text = render(mod, tmp_path, {"default_creds": {
@@ -625,13 +646,23 @@ class TestDocumentStructure:
         assert text.count("<table>") > 1, "rich state should render several tables"
 
     def test_each_table_row_has_as_many_cells_as_the_header(self, mod, tmp_path):
+        # Scoped per table rather than over the whole document. A device list
+        # carrying vendor names now also renders the provenance table — the
+        # vendors were fetched from a third party whatever else the run did — so
+        # collecting every <th> on the page mixed two headers into one list.
+        # Comparing each table against its own header is what this is for.
         text = render(mod, tmp_path, {"devices": RICH_STATE["devices"]})
-        headers = re.findall(r"<th>(.*?)</th>", text, re.S)
-        assert headers == ["IP", "MAC", "Vendor", "Subnet"]
-        for tr in re.finditer(r"<tr[^>]*>(.*?)</tr>", text, re.S):
-            cells = re.findall(r"<td[^>]*>", tr.group(1))
-            if cells:
-                assert len(cells) == len(headers)
+        tables = re.findall(r"<table>(.*?)</table>", text, re.S)
+        assert tables, "expected at least one table"
+        seen = []
+        for tbl in tables:
+            headers = re.findall(r"<th>(.*?)</th>", tbl, re.S)
+            seen.append(headers)
+            for tr in re.finditer(r"<tr[^>]*>(.*?)</tr>", tbl, re.S):
+                cells = re.findall(r"<td[^>]*>", tr.group(1))
+                if cells:
+                    assert len(cells) == len(headers)
+        assert ["IP", "MAC", "Vendor", "Subnet"] in seen
 
     def test_the_charset_is_declared_before_any_content(self, mod, tmp_path):
         text = render(mod, tmp_path, dict(RICH_STATE))
@@ -664,6 +695,11 @@ class TestSectionSelection:
         "Sharing Services", "Default Credentials Probe", "Speed Test",
         "UPnP Port Mappings", "Rogue DHCP Check", "Listening Services",
         "Router Hostname Check",
+        # Renders whenever the run produced any finding the gateway supplied.
+        # RICH_STATE holds several (upnp, default_creds, router_hostname, and
+        # devices carrying vendor names), so dropping any single key below still
+        # leaves this section standing and the count arithmetic holds.
+        "Evidence Provenance",
     ]
 
     def test_a_full_state_renders_every_section(self, mod, tmp_path):

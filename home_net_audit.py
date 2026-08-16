@@ -1241,6 +1241,11 @@ def save_baseline(state, passphrase=None):
         "seq": seq,
         "prev": prev,
         "keyed": passphrase is not None,
+        # Which program wrote this. Inside the sealed payload so it cannot be
+        # edited after the fact without breaking the seal — though that buys
+        # less than it appears to, since the script computing the digest is the
+        # one an attacker would have edited. See script_digest.
+        "code": script_digest(),
         "state": state,
     }
     key = None
@@ -1392,6 +1397,42 @@ def chain_id(baseline_path=None):
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
+def script_digest(path=None):
+    """SHA-256 of the audit script on disk, or None if it cannot be read.
+
+    Everything else in this module authenticates DATA. The baseline is sealed so
+    it cannot be rewritten, receipts survive it being deleted, heartbeats show
+    observation was happening. Not one of them says anything about the program
+    that produced any of it — and the program lives on the machine being
+    assessed. Delete the check that would report a backdoor port and every one
+    of those defences keeps working perfectly, indefinitely, over a report that
+    has simply stopped looking. Recording the digest is what makes that edit
+    visible in the off-host record rather than invisible forever.
+
+    The limit is severe, and stating it is most of the point: THE SCRIPT HASHES
+    ITSELF. A modified script reports whatever digest it likes, including the
+    original's, and nothing here can tell. This is exactly the weakness the
+    provenance section calls self-reported — a witness testifying about itself —
+    and it belongs in that class rather than being dressed up as an integrity
+    guarantee. It is the same shape as the router hostname check asking the
+    gateway to confirm its own identity, and it is not fixable from in here: any
+    check the script runs on itself is a check the attacker has already edited.
+
+    What it does catch is a modification that did not anticipate being watched —
+    an unreviewed edit, a file swapped by someone who did not read it, drift
+    between two machines meant to run the same audit, a half-finished upgrade.
+    Against an adversary who knows this line exists it is worth nothing.
+
+    It also covers only this file. The interpreter, the standard library and
+    anything else on the host are outside it.
+    """
+    try:
+        with open(path or os.path.abspath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def baseline_receipt(record):
     """The minimum that proves a run happened, and nothing more.
 
@@ -1410,6 +1451,10 @@ def baseline_receipt(record):
         "prev": record.get("prev"),
         "keyed": record.get("keyed"),
         "chain": chain_id(),
+        # Copied from the record rather than recomputed, so the receipt attests
+        # to the program that actually wrote that baseline, not to whatever is
+        # on disk by the time the receipt is published.
+        "code": record.get("code"),
     }
 
 
@@ -1504,7 +1549,7 @@ def compare_with_receipts(record, receipts):
     run 7, and a local baseline claiming run 1 gives it away.
 
     Returns {status, detail}. Statuses: ok, no_receipts, history_truncated,
-    seal_mismatch.
+    seal_mismatch, keyed_downgrade.
     """
     # Only this chain's receipts, plus every receipt that predates chains.
     #
@@ -1532,11 +1577,36 @@ def compare_with_receipts(record, receipts):
     # dropping it would quietly disable the check for them, which is worse than
     # the collision being fixed.
     mine = chain_id()
-    receipts = [r for r in (receipts or []) if r.get("chain") in (None, mine)]
+    # Heartbeats share this sink but say nothing about baselines. Counting them
+    # would let a log holding only monitor liveness report that the baseline
+    # "agrees with 40 off-host receipt(s)" when not one of them is about a run.
+    receipts = [r for r in (receipts or [])
+                if r.get("kind") != "heartbeat" and r.get("chain") in (None, mine)]
 
     if not receipts:
         return {"status": "no_receipts",
                 "detail": "No off-host receipts to compare against."}
+
+    # Keyed-ness is sticky, and this is the only place that can hold it to that.
+    #
+    # An unkeyed seal is one a compromised host can recompute at will, so the
+    # cheapest forgery available to an attacker without the passphrase is not to
+    # break the key but to strip it: replace the baseline with an unkeyed record
+    # carrying whatever state they like, and extend the chain one step as unkeyed.
+    # verify_baseline cannot catch this — the same attacker rewrites the local
+    # history to agree that the run was unkeyed, and an unkeyed seal that matches
+    # its own contents verifies. The receipts are the one record they cannot
+    # overwrite, and they still say the chain was keyed. If any receipt here was
+    # keyed while the local baseline now is not, the key has been removed, and
+    # everything the current baseline claims is attacker-controlled.
+    if any(r.get("keyed") for r in receipts) and not (record or {}).get("keyed"):
+        return {"status": "keyed_downgrade",
+                "detail": "The off-host receipts record this chain as sealed with a "
+                          "passphrase, but the local baseline is now unkeyed. An "
+                          "unkeyed seal is one a compromised host can forge, so the "
+                          "key was stripped to rewrite the baseline undetected. Treat "
+                          "the current baseline as attacker-controlled and re-seal "
+                          "from a trusted state."}
 
     highest = max((r.get("seq") or 0) for r in receipts)
     local_seq = (record or {}).get("seq") or 0
@@ -1633,6 +1703,203 @@ def diff_snapshots(old, new):
     return events
 
 
+# ---------------------------------------------------------------------------
+# Observation windows
+#
+# Everything above detects a change by comparing two polls. That is worth
+# exactly as much as the monitor's own continuity, and nothing was recording it.
+#
+# Two consequences, both demonstrated rather than theorised. The loop kept its
+# reference snapshot in memory only, so stopping the process and starting it
+# again re-baselined into whatever world it woke up in: poison the ARP cache and
+# the resolver while it is down, and the restart adopts the attacker's MAC and
+# DNS as normal and never alerts on them again — not during the gap, but ever.
+# And because nothing recorded when the monitor was up, "no alerts this week"
+# was indistinguishable from "nothing was watching this week".
+#
+# That second one is the same shape as the problem receipts were added for. A
+# missing local baseline could not be told apart from a genuine first run, so
+# the fix was an off-host record of what had happened. A missing observation
+# cannot be told apart from a quiet network, so the fix is an off-host record of
+# when observation was happening. Neither prevents anything; both make the
+# absence legible afterwards.
+#
+# What a heartbeat proves is narrow, and overstating it would defeat the point:
+# it says the process was alive and could reach the sink at that moment. It does
+# NOT say the checks were meaningful. An attacker who owns the host can keep
+# heartbeats flowing while feeding the monitor whatever it likes. This detects a
+# STOPPED monitor, not a SUBVERTED one.
+# ---------------------------------------------------------------------------
+
+# The last snapshot, persisted so a restart resumes its comparison instead of
+# starting a new one. Named *_FILE so the test sandbox redirects it by name.
+MONITOR_STATE_FILE = os.path.join(BASELINE_DIR, "monitor_state.json")
+
+# How often liveness is published. Every poll would mean 1440 sink writes a day
+# to say nothing; this bounds it. The cost is that a gap is only resolvable to
+# within one heartbeat interval, which observation_gaps reports rather than
+# rounds away.
+HEARTBEAT_INTERVAL = 900
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _parse_stamp(value):
+    """Parse an ISO timestamp to an aware datetime, or None if unusable.
+
+    Anything unreadable is None rather than an exception: these stamps come from
+    a log an attacker may have appended to, and a crash on a malformed line
+    would turn the evidence trail into a denial of service.
+    """
+    try:
+        stamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+
+
+def _format_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    hours, minutes = divmod(seconds // 60, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h" if hours else f"{days}d"
+
+
+def load_monitor_state():
+    """Return (snapshot, observed_at) from the last poll, or (None, None).
+
+    (None, None) means no monitor has ever run here, which is a genuine start
+    and not a gap. A restart that finds state resumes against it, so the window
+    while the process was down is compared rather than silently adopted.
+    """
+    try:
+        with open(MONITOR_STATE_FILE) as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None, None
+    if not isinstance(saved, dict):
+        return None, None
+    return saved.get("snapshot"), _parse_stamp(saved.get("observed_at"))
+
+
+def save_monitor_state(snapshot, at=None):
+    """Persist the reference snapshot so the next start has something to diff."""
+    try:
+        _write_json_atomic(MONITOR_STATE_FILE, {
+            "snapshot": snapshot,
+            "observed_at": (at or _utcnow()).isoformat(),
+        })
+    except OSError:
+        # A monitor that cannot persist its reference still watches correctly
+        # within this process; it just cannot survive a restart. Refusing to run
+        # would trade a partial loss for a total one.
+        pass
+
+
+def monitor_heartbeat(destination=None, token=None, interval=None, at=None):
+    """Publish one proof that observation was happening at this moment.
+
+    Deliberately the same shape and the same channel as a baseline receipt: it
+    is routine bookkeeping, not something a person is meant to read, and it
+    needs exactly the append-only property receipts need. It carries no
+    snapshot — liveness is the whole claim, and shipping the neighbour table
+    every quarter hour would leak the network's shape to the sink.
+    """
+    payload = {
+        "kind": "heartbeat",
+        "chain": chain_id(),
+        "interval": interval if interval is not None else MONITOR_INTERVAL,
+        "at": (at or _utcnow()).isoformat(),
+        # A long-running monitor is the deployment where an edited script has
+        # the most time to go unnoticed, so liveness carries the same attestation
+        # a baseline does.
+        "code": script_digest(),
+    }
+    destination = resolve_sink(destination)
+    if not destination:
+        return {"published": False, "mode": "heartbeat",
+                "detail": "No off-host sink configured, so nothing records that the "
+                          "monitor was running. A silent week and a stopped monitor "
+                          "will look the same."}
+    try:
+        if destination.startswith(("http://", "https://")):
+            return _publish_https(payload, destination,
+                                  token or os.environ.get(SINK_TOKEN_ENV), "heartbeat")
+        return _publish_path(payload, destination, "heartbeat")
+    except Exception as e:                      # noqa: BLE001 - reported, not raised
+        return {"published": False, "mode": "heartbeat",
+                "detail": f"Could not publish the heartbeat to {destination}: {e}"}
+
+
+def read_heartbeats(source):
+    """Heartbeats from a receipt log, oldest first. Baseline receipts are skipped."""
+    return [r for r in read_receipts(source)
+            if isinstance(r, dict) and r.get("kind") == "heartbeat"
+            and r.get("chain") in (None, chain_id())]
+
+
+def observation_gaps(heartbeats, interval=HEARTBEAT_INTERVAL, now=None):
+    """Windows during which nothing was watching. Returns [{start, end, seconds}].
+
+    A gap is a gap whether the monitor was killed, crashed, or the machine was
+    simply off. Distinguishing those is not something this log can do, and
+    guessing would put a reassuring explanation on the one record that exists to
+    stop reassuring explanations.
+
+    The trailing window — between the last heartbeat and now — counts. It is the
+    one an attacker is inside right now, and reporting only closed gaps would
+    hide exactly the case that matters most.
+    """
+    stamps = sorted(s for s in (_parse_stamp(h.get("at")) for h in heartbeats or [])
+                    if s is not None)
+    if not stamps:
+        return []
+    # One missed heartbeat is a slow disk or a busy Pi; the allowance is what
+    # keeps this from crying wolf on every hiccup.
+    threshold = max(interval * 2, interval + 60)
+    gaps = []
+    for earlier, later in zip(stamps, stamps[1:]):
+        elapsed = (later - earlier).total_seconds()
+        if elapsed > threshold:
+            gaps.append({"start": earlier.isoformat(), "end": later.isoformat(),
+                         "seconds": elapsed})
+    trailing = ((now or _utcnow()) - stamps[-1]).total_seconds()
+    if trailing > threshold:
+        gaps.append({"start": stamps[-1].isoformat(), "end": None,
+                     "seconds": trailing})
+    return gaps
+
+
+def describe_observation_gaps(gaps):
+    """A risk-tagged line naming when nobody was watching, or None if nobody was.
+
+    Silent when observation was continuous, so a healthy monitor adds no noise —
+    the same bargain describe_comparison_coverage makes.
+    """
+    if not gaps:
+        return None
+    open_gap = [g for g in gaps if g.get("end") is None]
+    longest = max(g["seconds"] for g in gaps)
+    risk = "HIGH" if open_gap else "REVIEW"
+    if open_gap:
+        tail = (f"including one still open ({_format_duration(open_gap[0]['seconds'])} "
+                "with no heartbeat) — the monitor is not running now")
+    else:
+        tail = f"the longest {_format_duration(longest)}"
+    return (f"  [{risk:6}] Observation coverage: {len(gaps)} window(s) with no "
+            f"monitoring, {tail}. Changes made and reverted inside those windows "
+            "left no trace. Nothing is reported about them, which is not the same "
+            "as nothing having happened.")
+
+
 def resolve_alert_sink(explicit=None):
     return explicit or os.environ.get(ALERT_ENV) or None
 
@@ -1662,13 +1929,24 @@ def send_alert(event, destination=None, token=None):
 
 
 def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
-                sleeper=time.sleep, printer=print):
+                sleeper=time.sleep, printer=print,
+                heartbeat_interval=HEARTBEAT_INTERVAL, clock=None):
     """Poll the cheap checks and alert on change.
 
     `iterations=None` runs until interrupted; a number bounds it, which is what
     makes this testable without waiting. Returns every event raised.
+
+    The reference snapshot is loaded from disk and written back every poll, so
+    stopping and restarting the process resumes the comparison rather than
+    beginning a new one. Keeping it in memory alone meant a restart adopted
+    whatever it woke up to — poison the ARP cache and the resolver while the
+    monitor is down and the restart silently made the attacker the new normal,
+    permanently. A restart across a real gap now compares over it and says so.
     """
-    previous = None
+    # A callable, not an instant: the loop reads it once per poll. The
+    # pure-function siblings (observation_gaps, describe_baseline_freshness)
+    # take a datetime under the name `now`, so this one is named for what it is.
+    clock = clock or _utcnow
     raised = []
     count = 0
     printer(f"Monitoring every {interval}s. Watching the gateway, its MAC, IPv6 "
@@ -1676,16 +1954,61 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     if not resolve_alert_sink(alert_to):
         printer("  Note: no alert destination set. Findings will print here only — "
                 f"set {ALERT_ENV} so they leave this machine.")
+    if not resolve_sink():
+        printer("  Note: no receipt sink set, so nothing off-host will record that "
+                f"this monitor ran. Set {SINK_ENV} — otherwise a week with no "
+                "alerts and a monitor that was never running look identical.")
+
+    previous, observed_at = load_monitor_state()
+    started = clock()
+    # A gap is measured against the promise the monitor makes: it said it would
+    # look every `interval` seconds. One missed poll is a slow machine; beyond
+    # that, nobody was watching.
+    gap_after = interval * 2 + 60
+    resumed_gap = None
+    if previous is not None and observed_at is not None:
+        down = (started - observed_at).total_seconds()
+        if down > gap_after:
+            resumed_gap = down
+            event = {
+                "severity": "REVIEW", "kind": "observation_gap",
+                "detail": f"Monitoring resumed after {_format_duration(down)} with "
+                          f"nothing watching (last poll {observed_at.isoformat()}). "
+                          "A change made and undone inside that window left no trace, "
+                          "so the comparison below is across the gap, not of it."}
+            raised.append(event)
+            printer(f"  [{event['severity']:6}] {event['detail']}")
+            result = send_alert(event, alert_to)
+            if not result["published"]:
+                printer(f"           (not delivered: {result['detail']})")
+
+    last_heartbeat = None
     try:
         while iterations is None or count < iterations:
+            polled_at = clock()
             snapshot = monitor_snapshot()
             for event in diff_snapshots(previous, snapshot):
+                if resumed_gap is not None:
+                    # The finding is real, but it was not witnessed happening,
+                    # and the reader is entitled to know which of those they have.
+                    event = dict(event, across_gap=True)
+                    event["detail"] += (" Observed across a "
+                                        f"{_format_duration(resumed_gap)} window with "
+                                        "no monitoring, so when it happened is unknown.")
                 raised.append(event)
                 printer(f"  [{event['severity']:6}] {event['detail']}")
                 result = send_alert(event, alert_to)
                 if not result["published"]:
                     printer(f"           (not delivered: {result['detail']})")
+
             previous = snapshot
+            resumed_gap = None          # only the first comparison spans the gap
+            save_monitor_state(snapshot, polled_at)
+            if (last_heartbeat is None
+                    or (polled_at - last_heartbeat).total_seconds() >= heartbeat_interval):
+                monitor_heartbeat(interval=interval, at=polled_at)
+                last_heartbeat = polled_at
+
             count += 1
             if iterations is None or count < iterations:
                 sleeper(interval)
@@ -1694,12 +2017,64 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     return raised
 
 
+def code_attestations(receipts):
+    """(digest, when) for every receipt that recorded one, oldest first.
+
+    Both channels are read: a baseline receipt stamps `published_at`, a
+    heartbeat stamps `at`. Monitor deployments may publish nothing but
+    heartbeats for weeks, and those are exactly the runs where an edited script
+    has the longest to go unnoticed.
+    """
+    found = []
+    for r in receipts or ():
+        if not isinstance(r, dict):
+            continue
+        digest = r.get("code")
+        if not digest:
+            continue                 # predates attestation; not a change
+        found.append((digest, r.get("published_at") or r.get("at") or ""))
+    return sorted(found, key=lambda pair: pair[1])
+
+
+def code_changes(receipts):
+    """Points in the off-host record where the attesting script changed."""
+    seen = code_attestations(receipts)
+    changes = []
+    for (before, _), (after, when) in zip(seen, seen[1:]):
+        if before != after:
+            changes.append({"from": before, "to": after, "at": when})
+    return changes
+
+
+def describe_code_attestation(receipts):
+    """A line on whether the audit program itself has changed, or None.
+
+    Silent when nothing off-host has attested anything, so a deployment without
+    a sink gains no line about a record it is not keeping.
+    """
+    seen = code_attestations(receipts)
+    if not seen:
+        return None
+    changes = code_changes(receipts)
+    caveat = ("Self-reported: the script hashes itself, so this catches an edit "
+              "that did not expect to be watched, not one that did.")
+    if not changes:
+        return (f"  [INFO  ] Audit code: sha256 {seen[-1][0][:12]}… unchanged across "
+                f"{len(seen)} off-host record(s). {caveat}")
+    last = changes[-1]
+    return (f"  [REVIEW] Audit code: the script's digest changed at "
+            f"{last['at'] or 'an unrecorded time'} ({last['from'][:12]}… → "
+            f"{last['to'][:12]}…), {len(changes)} time(s) on record. If you did not "
+            f"update the tool, something edited it. {caveat}")
+
+
 def describe_receipt_status(report):
     risk = {
         "ok": "OK",
         "no_receipts": "REVIEW",
         "history_truncated": "HIGH",
         "seal_mismatch": "HIGH",
+        "keyed_downgrade": "HIGH",
     }.get(report.get("status"), "REVIEW")
     return f"  [{risk:6}] Off-host receipts: {report.get('detail', '')}"
 
@@ -1819,6 +2194,171 @@ def describe_comparison_coverage(old, new):
     return (f"  [INFO  ] Comparison coverage: the baseline lists devices on "
             f"{', '.join(unswept)}, which this run did not sweep, so nothing "
             "there is reported as gone.")
+
+
+# ---------------------------------------------------------------------------
+# Evidence provenance
+#
+# Every finding in this report rests on something, and what it rests on is not
+# always independent of what it describes. The report prints as one flat list,
+# which quietly implies the lines are equally well founded. They are not, and
+# the gap is not academic: a clean result obtained by asking the device under
+# suspicion is not a clean result. It is that device's answer.
+#
+# Four classes, ordered by how much a compromised gateway can do about them:
+#
+#   OBSERVED       this machine's own kernel and OS state — the ARP cache, the
+#                  routing table, its interfaces, its firewall, its own
+#                  listening sockets. A gateway cannot edit any of it. A
+#                  compromised HOST can, which is the entire reason DEPLOYMENT
+#                  .md argues for running this from a second machine.
+#   MEASURED       something this tool did over the network and watched the
+#                  result of: a TCP connect, a TLS handshake, a DHCP offer
+#                  arriving, a Router Advertisement on the link. Someone in the
+#                  path can interfere, but they have to act, and acting is what
+#                  most of the rest of this tool is looking for.
+#   SELF_REPORTED  the device being assessed said so. UPnP mappings are the
+#                  router's own list of the holes it has punched; DSL stats and
+#                  admin banners come off its own pages. A compromised router
+#                  omits whatever it likes.
+#   RESOLVER_DEPENDENT
+#                  answered through DNS. On a home network the resolver usually
+#                  IS the gateway, so a question about the router gets answered
+#                  by the router.
+#
+# This is deliberately NOT a severity axis, and reading it as one gets it
+# backwards. A self-reported finding of an open port or an active mapping is
+# excellent evidence — the router volunteered something against its own
+# interest. What carries no weight is specifically the CLEAN self-reported
+# result, for the same reason an unkeyed seal verifies without being
+# forgery-proof: the check passed, and passing was always available to an
+# attacker. Absence of evidence, from a witness with a motive, is not evidence
+# of absence.
+# ---------------------------------------------------------------------------
+
+OBSERVED = "observed"
+MEASURED = "measured"
+SELF_REPORTED = "self_reported"
+RESOLVER_DEPENDENT = "resolver_dependent"
+THIRD_PARTY = "third_party"
+
+# state key -> (class, what the finding actually rests on, human label)
+#
+# Two entries do not correspond to a state key of their own, because one
+# measurement can rest on two different grounds at once. The device list is a
+# read of this machine's own ARP cache; the vendor names attached to it came
+# from an HTTP call to a service on the internet, over the network being
+# audited. Same key, same printed table, two answers to "what if this is
+# wrong", so they are listed apart rather than averaged into one.
+EVIDENCE = {
+    "gateway":             (OBSERVED, "this machine's routing table", "Default gateway"),
+    "dns":                 (OBSERVED, "this machine's resolver configuration", "DNS settings"),
+    "devices":             (OBSERVED, "this machine's ARP and neighbour caches", "Connected devices"),
+    "arp_spoof":           (OBSERVED, "repeated reads of this machine's ARP cache", "ARP spoofing check"),
+    "firewall":            (OBSERVED, "this machine's firewall configuration", "Firewall status"),
+    "sharing":             (OBSERVED, "this machine's sharing service configuration", "Sharing services"),
+    "listening":           (OBSERVED, "this machine's own listening sockets", "Listening services"),
+    "wifi":                (OBSERVED, "this machine's Wi-Fi association", "Wi-Fi security"),
+
+    "router_open_ports":   (MEASURED, "TCP connections this tool opened to the gateway", "Router port scan"),
+    "upstream_open_ports": (MEASURED, "TCP connections this tool opened to the modem", "Upstream port scan"),
+    "router_tls":          (MEASURED, "the certificate the gateway presented", "Router TLS"),
+    "ipv6":                (MEASURED, "Router Advertisements seen on the link", "IPv6 routers"),
+    "evil_twin":           (MEASURED, "beacons seen on the air", "Evil twin check"),
+    # How many servers answered is a fact about the wire. What they offered is
+    # not: the gateway, DNS and static routes in an offer are values the server
+    # chose to send, and a rogue that answers alone still reads as the only one.
+    "dhcp":                (MEASURED, "which servers answered a DHCP request on the wire", "Rogue DHCP check"),
+    "interception":        (MEASURED, "how a crafted query came back", "Interception checks"),
+
+    "upnp":                (SELF_REPORTED, "the gateway's own list of its port mappings", "UPnP port mappings"),
+    "dsl":                 (SELF_REPORTED, "the router's own admin page", "DSL line stats"),
+    "default_creds":       (SELF_REPORTED, "the router's own responses to login attempts", "Default credentials"),
+    "dhcp_offer_contents": (SELF_REPORTED, "the values the answering DHCP server chose to send", "DHCP offer contents"),
+
+    "router_hostname":     (RESOLVER_DEPENDENT, "a reverse DNS answer about the gateway", "Router hostname"),
+
+    "device_vendors":      (THIRD_PARTY, "an HTTP lookup to api.macvendors.com, over this network", "Device vendor names"),
+}
+
+_EVIDENCE_TAG = {
+    SELF_REPORTED: "self-reported",
+    RESOLVER_DEPENDENT: "via resolver",
+    THIRD_PARTY: "third party",
+}
+
+# Findings that share a state key with something of a different provenance, and
+# the test for whether this run actually produced them.
+_DERIVED_EVIDENCE = {
+    "device_vendors": lambda state: any(
+        isinstance(d, dict) and d.get("vendor")
+        for d in (state.get("devices") or ())),
+    "dhcp_offer_contents": lambda state: bool(
+        isinstance(state.get("dhcp"), dict) and state["dhcp"].get("responders")),
+}
+
+
+def evidence_for(key):
+    """(class, basis, label) for a state key, or None if it is not a finding."""
+    return EVIDENCE.get(key)
+
+
+def findings_by_evidence(state):
+    """Group the findings actually present in `state` by evidence class."""
+    state = state or {}
+    grouped = {}
+    for key in state:
+        entry = EVIDENCE.get(key)
+        if entry and state.get(key) is not None:
+            grouped.setdefault(entry[0], []).append(key)
+    for key, was_produced in _DERIVED_EVIDENCE.items():
+        try:
+            produced = was_produced(state)
+        except (AttributeError, TypeError):
+            # A malformed state should cost the caller its provenance section,
+            # not the audit it is describing.
+            continue
+        if produced:
+            grouped.setdefault(EVIDENCE[key][0], []).append(key)
+    return {cls: sorted(keys) for cls, keys in grouped.items()}
+
+
+def describe_evidence_basis(state):
+    """The report block naming which findings came from the thing they describe.
+
+    Silent when this run produced none of them, so a report with nothing to
+    qualify gains no paragraph telling the reader that nothing needs qualifying.
+    """
+    grouped = findings_by_evidence(state)
+    dependent = [(cls, key)
+                 for cls in (SELF_REPORTED, RESOLVER_DEPENDENT, THIRD_PARTY)
+                 for key in grouped.get(cls, ())]
+    if not dependent:
+        return None
+
+    independent = len(grouped.get(OBSERVED, ())) + len(grouped.get(MEASURED, ()))
+    width = max(len(EVIDENCE[key][2]) for _cls, key in dependent)
+    lines = ["  Not every finding above rests on the same ground. These came from "
+             "the device",
+             "  they describe, through it, or from someone else entirely:"]
+    for cls, key in dependent:
+        _cls, basis, label = EVIDENCE[key]
+        lines.append(f"    [{_EVIDENCE_TAG[cls]:13}] {label:{width}}  — {basis}")
+    lines.append("")
+    lines.append("  Take seriously anything they admit to: a router listing a port "
+                 "mapping has")
+    lines.append("  volunteered something against its own interest. A CLEAN result "
+                 "from them is")
+    lines.append("  worth much less — it says nothing was volunteered, which is not "
+                 "the same as")
+    lines.append("  there being nothing to find.")
+    if independent:
+        lines.append(f"  The other {independent} finding(s) rest on this machine's own "
+                     "state or on measurements")
+        lines.append("  this tool made itself, which a gateway cannot edit. A "
+                     "compromised HOST can —")
+        lines.append("  that is what running this from a second machine is for.")
+    return "\n".join(lines)
 
 
 def load_labels():
@@ -3144,7 +3684,17 @@ def action_upnp_dump():
         return {"mappings": [], "note": err}
 
     if not mappings:
-        print("  No active UPnP port mappings found.")
+        # "None found" and "none disclosed" are the same output here, and the
+        # difference is the whole question. Every mapping in this list is one
+        # the gateway chose to enumerate about itself; one that has forwarded a
+        # port for an attacker simply leaves it out of the answer, and the tool
+        # has no second source to check that against.
+        print("  The gateway reported no active UPnP port mappings.")
+        print("  That is its own account of its own forwarding table, so it is weak "
+              "evidence:")
+        print("  a router hiding a mapping omits it here and this check cannot tell. "
+              "Ports")
+        print("  reachable from outside are worth confirming from outside.")
         return {"mappings": []}
 
     print(f"  {len(mappings)} active UPnP port mapping(s):")
@@ -3257,11 +3807,25 @@ def probe_default_credentials(gateway):
             (input[type=password], "incorrect password", "invalid credentials",
             "login failed").
 
-    Returns list of (username, password, port, method) tuples.
+    Returns (successes, lockout_note, coverage), where successes is a list of
+    (username, password, port, method) tuples.
+
+    `coverage` records what the sweep actually managed to do, and exists because
+    an empty `successes` had four different meanings collapsed into one. The
+    router refused every guess; or no admin port answered; or ports answered but
+    never presented a Basic Auth challenge or a login form, so nothing was ever
+    submitted; or the OS refused to let this process reach the subnet at all.
+    Only the first is a finding about the router's password. The other three are
+    an absence of testing, and reporting them as a pass says the probe checked
+    something it never touched.
     """
     import base64
     successes = []
     ports_to_try = [80, 8080, 8443, 443]
+    # `attempts` counts credential submissions, not requests: a GET that finds
+    # no login form is reconnaissance, and counting it would restore exactly the
+    # ambiguity this dict exists to remove.
+    coverage = {"attempts": 0, "open": [], "blocked": [], "closed": []}
 
     # Keywords that reliably indicate an authenticated admin session.
     AUTHED_INDICATORS = [
@@ -3337,6 +3901,7 @@ def probe_default_credentials(gateway):
             return False
 
         # Step 2: send credentials
+        coverage["attempts"] += 1
         creds = base64.b64encode(f"{user}:{pwd}".encode()).decode()
         auth_code, body = _fetch(base_url + "/", headers={
             "Authorization": f"Basic {creds}",
@@ -3386,6 +3951,7 @@ def probe_default_credentials(gateway):
                 continue
 
             for pl in payloads:
+                coverage["attempts"] += 1
                 post_code, body = _fetch(
                     base_url + ep,
                     data=pl.encode(),
@@ -3406,8 +3972,19 @@ def probe_default_credentials(gateway):
         for port in ports_to_try:
             scheme = "https" if port in (443, 8443) else "http"
             base = f"{scheme}://{gateway}:{port}"
-            if not check_port(gateway, port, timeout=1.0):
+            # probe_port rather than check_port: the boolean collapses "the OS
+            # refused to let me ask" into "nothing is listening", which is the
+            # exact collapse that let a blocked scheduled run report a clean
+            # bill of health for ports it never reached. Same mistake, same
+            # cost, one function along.
+            reachable = probe_port(gateway, port, timeout=1.0)
+            if reachable is None:
+                coverage["blocked"].append(port)
                 continue
+            if reachable is False:
+                coverage["closed"].append(port)
+                continue
+            coverage["open"].append(port)
 
             found = False
             for user, pwd in DEFAULT_CREDS:
@@ -3426,7 +4003,68 @@ def probe_default_credentials(gateway):
     except LockoutError as e:
         lockout_note = str(e)
 
-    return successes, lockout_note
+    return successes, lockout_note, coverage
+
+
+def credential_coverage_verdict(coverage):
+    """(risk, message) for a sweep that accepted nothing.
+
+    "No default credentials accepted (or admin page not reachable)." was one
+    line for four outcomes, and the parenthetical is the tell: it names the
+    ambiguity and then badges the result OK anyway. Three of the four are an
+    absence of testing, and the reader of a security report is entitled to know
+    the probe never reached the thing it is reassuring them about.
+
+    Only a sweep that actually submitted credentials and had them refused is a
+    finding about the router's password, and only that one is OK.
+
+    One decision, returned rather than printed, because the terminal and the
+    HTML export both render it. The HTML copy had drifted further than the
+    terminal — it dropped even the parenthetical and stated a flat "No default
+    credentials accepted", in the artefact most likely to be read by someone who
+    did not run the probe.
+    """
+    if not coverage:
+        # A record written before coverage was tracked. What the sweep reached
+        # is genuinely unknown, and substituting any of the four verdicts below
+        # would invent a detail — including the "nothing answered" one, which
+        # reads as a fact about the router.
+        return "INFO", ("No default credentials were accepted, but this record does "
+                        "not say what the probe managed to reach, so whether any "
+                        "credential was actually submitted is unknown. Re-run the "
+                        "probe for a verdict that distinguishes the two.")
+
+    attempts = coverage.get("attempts") or 0
+    open_ports = coverage.get("open") or []
+    blocked = coverage.get("blocked") or []
+
+    if attempts:
+        where = ", ".join(str(p) for p in open_ports) or "the admin ports"
+        return "OK", (f"{attempts} credential pair(s) submitted on port(s) {where} "
+                      "and every one was refused.")
+
+    if blocked:
+        return "REVIEW", ("No credentials were tested. "
+                          + local_network_denied_note("The default-credentials probe"))
+
+    if open_ports:
+        where = ", ".join(str(p) for p in open_ports)
+        return "INFO", (f"Port(s) {where} answered but never presented a Basic Auth "
+                        "challenge or a login form, so no credentials were submitted. "
+                        "This is not a finding that the password is strong — nothing "
+                        "was guessed at. The admin UI may use a login this probe "
+                        "cannot drive.")
+
+    return "INFO", ("No admin service answered on ports 80, 8080, 8443 or 443, so no "
+                    "credentials were tested. Nothing here says the router's password "
+                    "is good; it says the probe found nothing to try it against. An "
+                    "admin UI on another port would be missed entirely.")
+
+
+def describe_credential_coverage(coverage):
+    """The terminal line for credential_coverage_verdict."""
+    risk, message = credential_coverage_verdict(coverage)
+    return f"  [{risk:6}] {message}"
 
 
 def action_default_creds():
@@ -3440,7 +4078,7 @@ def action_default_creds():
     print("  NOTE: this sends real login attempts to your router — it is NOT")
     print("  read-only and can trip lockout/rate-limit protection. It aborts")
     print("  automatically if the router signals a lockout.")
-    successes, lockout_note = probe_default_credentials(gateway)
+    successes, lockout_note, coverage = probe_default_credentials(gateway)
 
     if lockout_note:
         print(f"\n  [STOPPED] {lockout_note}")
@@ -3453,20 +4091,37 @@ def action_default_creds():
             print(f"    Port {port} ({method}): {user} / {display_pwd}")
         print("\n  Change your router admin password immediately!")
     elif not lockout_note:
-        print("  [OK] No default credentials accepted (or admin page not reachable).")
+        print(describe_credential_coverage(coverage))
 
-    return {"gateway": gateway, "successes": successes}
+    return {"gateway": gateway, "successes": successes, "coverage": coverage}
 
 
 # ---------------------------------------------------------------------------
 # NEW FEATURE 6: Router hostname check
 # ---------------------------------------------------------------------------
 
-def check_router_hostname(gateway):
+def check_router_hostname(gateway, resolvers=None):
     """
     Perform a reverse DNS lookup on the gateway IP.
     An unexpected or suspicious hostname may indicate a rogue router.
-    Returns dict: {gateway, hostname, suspicious}
+    Returns dict: {gateway, hostname, suspicious, self_attested}
+
+    The lookup goes through whatever resolver this machine is configured to
+    use, and on a home network that is normally the gateway itself — which is
+    the device this check exists to be suspicious of. When that is the case the
+    answer is the router's statement about its own identity, and a rogue one
+    answers it exactly as an honest one would: with something unremarkable, or
+    with nothing at all. The nothing-at-all path is the most likely output on a
+    real home network, and it used to print as a passed check.
+
+    So `self_attested` records who answered. It does not make the finding
+    wrong — a cloud-provider PTR is still worth seeing — but it decides whether
+    a clean result may be reported as OK, in the same way and for the same
+    reason that an unkeyed seal verifies without being called forgery-proof.
+
+    `resolvers` is passed in rather than read here so this stays a pure
+    function of what it is given; callers that do not supply it get
+    self_attested None, meaning "not established" rather than "no".
     """
     try:
         hostname = socket.gethostbyaddr(gateway)[0]
@@ -3475,6 +4130,7 @@ def check_router_hostname(gateway):
     except Exception:
         hostname = None
 
+    self_attested = None if resolvers is None else (gateway in resolvers)
     suspicious = False
     note = ""
     if not hostname:
@@ -3494,7 +4150,8 @@ def check_router_hostname(gateway):
         if not suspicious:
             note = "Hostname looks normal for a home router."
 
-    return {"gateway": gateway, "hostname": hostname, "suspicious": suspicious, "note": note}
+    return {"gateway": gateway, "hostname": hostname, "suspicious": suspicious,
+            "note": note, "self_attested": self_attested}
 
 
 def action_router_hostname():
@@ -3504,11 +4161,28 @@ def action_router_hostname():
         print("  Could not determine gateway.")
         return {}
 
-    result = check_router_hostname(gateway)
+    resolvers = get_dns_servers()
+    result = check_router_hostname(gateway, resolvers)
     print(f"  Gateway IP : {result['gateway']}")
     print(f"  Hostname   : {result['hostname'] or '(none)'}")
-    risk = "HIGH" if result["suspicious"] else "OK"
-    print(f"  [{risk}] {result['note']}")
+
+    if result["suspicious"]:
+        # Still worth reporting at full volume. A router that names a cloud
+        # provider has said something against its own interest, and evidence
+        # from a witness with a motive to lie is strongest when it incriminates.
+        print(f"  [HIGH] {result['note']}")
+    elif result["self_attested"]:
+        # Not OK. The gateway resolved the question about the gateway, so a
+        # rogue one produces this exact output, and printing OK would certify a
+        # check that cannot fail closed.
+        print(f"  [INFO] {result['note']}")
+        print("         This answer came from the gateway itself — it is one of this "
+              "machine's")
+        print("         resolvers, so it was asked to vouch for its own identity. A "
+              "rogue router")
+        print("         answers this the same way yours just did. Not a passed check.")
+    else:
+        print(f"  [OK] {result['note']}")
     return result
 
 
@@ -4080,7 +4754,12 @@ def generate_html_report(state, output_path=None):
             body = f"<p>{risk_badge('HIGH')} Default credentials accepted!</p>" + \
                    table(["Username", "Password", "Port", "Method"], rows)
         else:
-            body = f"<p>{risk_badge('OK')} No default credentials accepted.</p>"
+            # Same verdict as the terminal, from the same function. This branch
+            # used to badge OK unconditionally, which read as "the router
+            # refused every guess" even when the probe never found a login page
+            # to guess at.
+            _risk, _message = credential_coverage_verdict(dc.get("coverage"))
+            body = f"<p>{risk_badge(_risk)} {_esc(_message)}</p>"
         sections_html += section("Default Credentials Probe", body)
 
     # Speed
@@ -4132,11 +4811,48 @@ def generate_html_report(state, output_path=None):
     # Router hostname
     if "router_hostname" in state:
         rh = state["router_hostname"]
-        risk = "HIGH" if rh.get("suspicious") else "OK"
+        if rh.get("suspicious"):
+            risk = "HIGH"
+        elif rh.get("self_attested"):
+            # The gateway answered the question about the gateway. A rogue one
+            # answers it identically, so this cannot be badged as a pass.
+            risk = "INFO"
+        else:
+            risk = "OK"
         body = f"""<p>{risk_badge(risk)} Gateway: {_esc(rh.get('gateway','?'))}</p>
                    <p>Hostname: {_esc(rh.get('hostname') or '(none)')}</p>
                    <p>{_esc(rh.get('note',''))}</p>"""
+        if rh.get("self_attested"):
+            body += ("<p>This answer was served by the gateway itself, which is one "
+                     "of this machine's resolvers — it was asked to vouch for its own "
+                     "identity. A rogue router answers exactly as this one did, so "
+                     "this is <strong>not a passed check</strong>.</p>")
         sections_html += section("Router Hostname Check", body)
+
+    # Evidence provenance.
+    #
+    # The terminal report prints this too, but it matters more here: an exported
+    # file is the artefact most likely to be read by someone who did not run the
+    # audit and cannot see which lines the gateway was trusted for.
+    _grouped = findings_by_evidence(state)
+    _basis_rows = [[EVIDENCE[key][2], _EVIDENCE_TAG[cls], EVIDENCE[key][1]]
+                   for cls in (SELF_REPORTED, RESOLVER_DEPENDENT, THIRD_PARTY)
+                   for key in _grouped.get(cls, ())]
+    if _basis_rows:
+        _independent = len(_grouped.get(OBSERVED, ())) + len(_grouped.get(MEASURED, ()))
+        body = table(["Finding", "Came from", "Specifically"], _basis_rows)
+        body += ("<p>The findings above did not come from an independent source. Take "
+                 "seriously anything they admit to — a router listing a port mapping "
+                 "has volunteered something against its own interest. A <em>clean</em> "
+                 "result from them is worth much less: it says nothing was "
+                 "volunteered, which is not the same as there being nothing to "
+                 "find.</p>")
+        if _independent:
+            body += (f"<p>The other {_independent} finding(s) rest on this machine's "
+                     "own state or on measurements this tool made itself, which a "
+                     "gateway cannot edit. A compromised <strong>host</strong> can, "
+                     "which is what running this from a second machine is for.</p>")
+        sections_html += section("Evidence Provenance", body)
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -4515,6 +5231,17 @@ def action_compare_baseline(state):
     if _sink:
         print(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink))))
+        # Silent unless a monitor has actually run, so an audit-only user gains
+        # no noise from a feature they are not using.
+        _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
+        if _gaps:
+            print(_gaps)
+        # Reads both channels: a monitor-only deployment publishes heartbeats
+        # for weeks without a single baseline receipt, and that is exactly where
+        # an edited script has the longest to go unnoticed.
+        _code = describe_code_attestation(read_receipts(_sink))
+        if _code:
+            print(_code)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:
@@ -4681,6 +5408,17 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     if _sink:
         print(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink))))
+        # Silent unless a monitor has actually run, so an audit-only user gains
+        # no noise from a feature they are not using.
+        _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
+        if _gaps:
+            print(_gaps)
+        # Reads both channels: a monitor-only deployment publishes heartbeats
+        # for weeks without a single baseline receipt, and that is exactly where
+        # an edited script has the longest to go unnoticed.
+        _code = describe_code_attestation(read_receipts(_sink))
+        if _code:
+            print(_code)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:
@@ -4699,6 +5437,11 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
             print("No changes since baseline.")
     else:
         print("No baseline saved yet. Use option 5 after reviewing results.")
+
+    _basis = describe_evidence_basis(state)
+    if _basis:
+        hr("EVIDENCE PROVENANCE")
+        print(_basis)
 
     hr()
     print("Full audit complete. This is a snapshot, not a guarantee.")
