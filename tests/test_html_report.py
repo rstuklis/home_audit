@@ -521,10 +521,31 @@ class TestSecretRedaction:
         assert "Default credentials accepted!" in text
         assert '<span style="background:#e74c3c;' in text
 
-    def test_no_successes_renders_a_clean_result(self, mod, tmp_path):
+    def test_no_successes_without_coverage_does_not_claim_a_clean_result(self, mod,
+                                                                        tmp_path):
+        # This used to badge OK on "No default credentials accepted." alone. A
+        # record with no coverage predates the tracking, so whether anything was
+        # ever submitted is unknown — and unknown must not render as a pass in
+        # the artefact most likely to be read by someone who did not run it.
         text = render(mod, tmp_path, {"default_creds": {"successes": []}})
-        assert "No default credentials accepted." in text
+        assert "is unknown" in text
+        assert '<span style="background:#27ae60;' not in text
+
+    def test_credentials_actually_submitted_and_refused_renders_a_pass(self, mod,
+                                                                      tmp_path):
+        text = render(mod, tmp_path, {"default_creds": {
+            "successes": [],
+            "coverage": {"attempts": 12, "open": [80], "blocked": [], "closed": []}}})
+        assert "every one was refused" in text
         assert '<span style="background:#27ae60;' in text
+
+    def test_a_probe_that_found_nothing_to_try_is_not_a_pass(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"default_creds": {
+            "successes": [],
+            "coverage": {"attempts": 0, "open": [], "blocked": [],
+                         "closed": [80, 8080, 8443, 443]}}})
+        assert "no credentials were tested" in text
+        assert '<span style="background:#27ae60;' not in text
 
     def test_a_password_containing_markup_is_still_withheld(self, mod, tmp_path):
         text = render(mod, tmp_path, {"default_creds": {

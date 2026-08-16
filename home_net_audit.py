@@ -3707,11 +3707,25 @@ def probe_default_credentials(gateway):
             (input[type=password], "incorrect password", "invalid credentials",
             "login failed").
 
-    Returns list of (username, password, port, method) tuples.
+    Returns (successes, lockout_note, coverage), where successes is a list of
+    (username, password, port, method) tuples.
+
+    `coverage` records what the sweep actually managed to do, and exists because
+    an empty `successes` had four different meanings collapsed into one. The
+    router refused every guess; or no admin port answered; or ports answered but
+    never presented a Basic Auth challenge or a login form, so nothing was ever
+    submitted; or the OS refused to let this process reach the subnet at all.
+    Only the first is a finding about the router's password. The other three are
+    an absence of testing, and reporting them as a pass says the probe checked
+    something it never touched.
     """
     import base64
     successes = []
     ports_to_try = [80, 8080, 8443, 443]
+    # `attempts` counts credential submissions, not requests: a GET that finds
+    # no login form is reconnaissance, and counting it would restore exactly the
+    # ambiguity this dict exists to remove.
+    coverage = {"attempts": 0, "open": [], "blocked": [], "closed": []}
 
     # Keywords that reliably indicate an authenticated admin session.
     AUTHED_INDICATORS = [
@@ -3787,6 +3801,7 @@ def probe_default_credentials(gateway):
             return False
 
         # Step 2: send credentials
+        coverage["attempts"] += 1
         creds = base64.b64encode(f"{user}:{pwd}".encode()).decode()
         auth_code, body = _fetch(base_url + "/", headers={
             "Authorization": f"Basic {creds}",
@@ -3836,6 +3851,7 @@ def probe_default_credentials(gateway):
                 continue
 
             for pl in payloads:
+                coverage["attempts"] += 1
                 post_code, body = _fetch(
                     base_url + ep,
                     data=pl.encode(),
@@ -3856,8 +3872,19 @@ def probe_default_credentials(gateway):
         for port in ports_to_try:
             scheme = "https" if port in (443, 8443) else "http"
             base = f"{scheme}://{gateway}:{port}"
-            if not check_port(gateway, port, timeout=1.0):
+            # probe_port rather than check_port: the boolean collapses "the OS
+            # refused to let me ask" into "nothing is listening", which is the
+            # exact collapse that let a blocked scheduled run report a clean
+            # bill of health for ports it never reached. Same mistake, same
+            # cost, one function along.
+            reachable = probe_port(gateway, port, timeout=1.0)
+            if reachable is None:
+                coverage["blocked"].append(port)
                 continue
+            if reachable is False:
+                coverage["closed"].append(port)
+                continue
+            coverage["open"].append(port)
 
             found = False
             for user, pwd in DEFAULT_CREDS:
@@ -3876,7 +3903,68 @@ def probe_default_credentials(gateway):
     except LockoutError as e:
         lockout_note = str(e)
 
-    return successes, lockout_note
+    return successes, lockout_note, coverage
+
+
+def credential_coverage_verdict(coverage):
+    """(risk, message) for a sweep that accepted nothing.
+
+    "No default credentials accepted (or admin page not reachable)." was one
+    line for four outcomes, and the parenthetical is the tell: it names the
+    ambiguity and then badges the result OK anyway. Three of the four are an
+    absence of testing, and the reader of a security report is entitled to know
+    the probe never reached the thing it is reassuring them about.
+
+    Only a sweep that actually submitted credentials and had them refused is a
+    finding about the router's password, and only that one is OK.
+
+    One decision, returned rather than printed, because the terminal and the
+    HTML export both render it. The HTML copy had drifted further than the
+    terminal — it dropped even the parenthetical and stated a flat "No default
+    credentials accepted", in the artefact most likely to be read by someone who
+    did not run the probe.
+    """
+    if not coverage:
+        # A record written before coverage was tracked. What the sweep reached
+        # is genuinely unknown, and substituting any of the four verdicts below
+        # would invent a detail — including the "nothing answered" one, which
+        # reads as a fact about the router.
+        return "INFO", ("No default credentials were accepted, but this record does "
+                        "not say what the probe managed to reach, so whether any "
+                        "credential was actually submitted is unknown. Re-run the "
+                        "probe for a verdict that distinguishes the two.")
+
+    attempts = coverage.get("attempts") or 0
+    open_ports = coverage.get("open") or []
+    blocked = coverage.get("blocked") or []
+
+    if attempts:
+        where = ", ".join(str(p) for p in open_ports) or "the admin ports"
+        return "OK", (f"{attempts} credential pair(s) submitted on port(s) {where} "
+                      "and every one was refused.")
+
+    if blocked:
+        return "REVIEW", ("No credentials were tested. "
+                          + local_network_denied_note("The default-credentials probe"))
+
+    if open_ports:
+        where = ", ".join(str(p) for p in open_ports)
+        return "INFO", (f"Port(s) {where} answered but never presented a Basic Auth "
+                        "challenge or a login form, so no credentials were submitted. "
+                        "This is not a finding that the password is strong — nothing "
+                        "was guessed at. The admin UI may use a login this probe "
+                        "cannot drive.")
+
+    return "INFO", ("No admin service answered on ports 80, 8080, 8443 or 443, so no "
+                    "credentials were tested. Nothing here says the router's password "
+                    "is good; it says the probe found nothing to try it against. An "
+                    "admin UI on another port would be missed entirely.")
+
+
+def describe_credential_coverage(coverage):
+    """The terminal line for credential_coverage_verdict."""
+    risk, message = credential_coverage_verdict(coverage)
+    return f"  [{risk:6}] {message}"
 
 
 def action_default_creds():
@@ -3890,7 +3978,7 @@ def action_default_creds():
     print("  NOTE: this sends real login attempts to your router — it is NOT")
     print("  read-only and can trip lockout/rate-limit protection. It aborts")
     print("  automatically if the router signals a lockout.")
-    successes, lockout_note = probe_default_credentials(gateway)
+    successes, lockout_note, coverage = probe_default_credentials(gateway)
 
     if lockout_note:
         print(f"\n  [STOPPED] {lockout_note}")
@@ -3903,9 +3991,9 @@ def action_default_creds():
             print(f"    Port {port} ({method}): {user} / {display_pwd}")
         print("\n  Change your router admin password immediately!")
     elif not lockout_note:
-        print("  [OK] No default credentials accepted (or admin page not reachable).")
+        print(describe_credential_coverage(coverage))
 
-    return {"gateway": gateway, "successes": successes}
+    return {"gateway": gateway, "successes": successes, "coverage": coverage}
 
 
 # ---------------------------------------------------------------------------
@@ -4566,7 +4654,12 @@ def generate_html_report(state, output_path=None):
             body = f"<p>{risk_badge('HIGH')} Default credentials accepted!</p>" + \
                    table(["Username", "Password", "Port", "Method"], rows)
         else:
-            body = f"<p>{risk_badge('OK')} No default credentials accepted.</p>"
+            # Same verdict as the terminal, from the same function. This branch
+            # used to badge OK unconditionally, which read as "the router
+            # refused every guess" even when the probe never found a login page
+            # to guess at.
+            _risk, _message = credential_coverage_verdict(dc.get("coverage"))
+            body = f"<p>{risk_badge(_risk)} {_esc(_message)}</p>"
         sections_html += section("Default Credentials Probe", body)
 
     # Speed
