@@ -1532,7 +1532,11 @@ def compare_with_receipts(record, receipts):
     # dropping it would quietly disable the check for them, which is worse than
     # the collision being fixed.
     mine = chain_id()
-    receipts = [r for r in (receipts or []) if r.get("chain") in (None, mine)]
+    # Heartbeats share this sink but say nothing about baselines. Counting them
+    # would let a log holding only monitor liveness report that the baseline
+    # "agrees with 40 off-host receipt(s)" when not one of them is about a run.
+    receipts = [r for r in (receipts or [])
+                if r.get("kind") != "heartbeat" and r.get("chain") in (None, mine)]
 
     if not receipts:
         return {"status": "no_receipts",
@@ -1654,6 +1658,199 @@ def diff_snapshots(old, new):
     return events
 
 
+# ---------------------------------------------------------------------------
+# Observation windows
+#
+# Everything above detects a change by comparing two polls. That is worth
+# exactly as much as the monitor's own continuity, and nothing was recording it.
+#
+# Two consequences, both demonstrated rather than theorised. The loop kept its
+# reference snapshot in memory only, so stopping the process and starting it
+# again re-baselined into whatever world it woke up in: poison the ARP cache and
+# the resolver while it is down, and the restart adopts the attacker's MAC and
+# DNS as normal and never alerts on them again — not during the gap, but ever.
+# And because nothing recorded when the monitor was up, "no alerts this week"
+# was indistinguishable from "nothing was watching this week".
+#
+# That second one is the same shape as the problem receipts were added for. A
+# missing local baseline could not be told apart from a genuine first run, so
+# the fix was an off-host record of what had happened. A missing observation
+# cannot be told apart from a quiet network, so the fix is an off-host record of
+# when observation was happening. Neither prevents anything; both make the
+# absence legible afterwards.
+#
+# What a heartbeat proves is narrow, and overstating it would defeat the point:
+# it says the process was alive and could reach the sink at that moment. It does
+# NOT say the checks were meaningful. An attacker who owns the host can keep
+# heartbeats flowing while feeding the monitor whatever it likes. This detects a
+# STOPPED monitor, not a SUBVERTED one.
+# ---------------------------------------------------------------------------
+
+# The last snapshot, persisted so a restart resumes its comparison instead of
+# starting a new one. Named *_FILE so the test sandbox redirects it by name.
+MONITOR_STATE_FILE = os.path.join(BASELINE_DIR, "monitor_state.json")
+
+# How often liveness is published. Every poll would mean 1440 sink writes a day
+# to say nothing; this bounds it. The cost is that a gap is only resolvable to
+# within one heartbeat interval, which observation_gaps reports rather than
+# rounds away.
+HEARTBEAT_INTERVAL = 900
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _parse_stamp(value):
+    """Parse an ISO timestamp to an aware datetime, or None if unusable.
+
+    Anything unreadable is None rather than an exception: these stamps come from
+    a log an attacker may have appended to, and a crash on a malformed line
+    would turn the evidence trail into a denial of service.
+    """
+    try:
+        stamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+
+
+def _format_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    hours, minutes = divmod(seconds // 60, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h" if hours else f"{days}d"
+
+
+def load_monitor_state():
+    """Return (snapshot, observed_at) from the last poll, or (None, None).
+
+    (None, None) means no monitor has ever run here, which is a genuine start
+    and not a gap. A restart that finds state resumes against it, so the window
+    while the process was down is compared rather than silently adopted.
+    """
+    try:
+        with open(MONITOR_STATE_FILE) as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None, None
+    if not isinstance(saved, dict):
+        return None, None
+    return saved.get("snapshot"), _parse_stamp(saved.get("observed_at"))
+
+
+def save_monitor_state(snapshot, at=None):
+    """Persist the reference snapshot so the next start has something to diff."""
+    try:
+        _write_json_atomic(MONITOR_STATE_FILE, {
+            "snapshot": snapshot,
+            "observed_at": (at or _utcnow()).isoformat(),
+        })
+    except OSError:
+        # A monitor that cannot persist its reference still watches correctly
+        # within this process; it just cannot survive a restart. Refusing to run
+        # would trade a partial loss for a total one.
+        pass
+
+
+def monitor_heartbeat(destination=None, token=None, interval=None, at=None):
+    """Publish one proof that observation was happening at this moment.
+
+    Deliberately the same shape and the same channel as a baseline receipt: it
+    is routine bookkeeping, not something a person is meant to read, and it
+    needs exactly the append-only property receipts need. It carries no
+    snapshot — liveness is the whole claim, and shipping the neighbour table
+    every quarter hour would leak the network's shape to the sink.
+    """
+    payload = {
+        "kind": "heartbeat",
+        "chain": chain_id(),
+        "interval": interval if interval is not None else MONITOR_INTERVAL,
+        "at": (at or _utcnow()).isoformat(),
+    }
+    destination = resolve_sink(destination)
+    if not destination:
+        return {"published": False, "mode": "heartbeat",
+                "detail": "No off-host sink configured, so nothing records that the "
+                          "monitor was running. A silent week and a stopped monitor "
+                          "will look the same."}
+    try:
+        if destination.startswith(("http://", "https://")):
+            return _publish_https(payload, destination,
+                                  token or os.environ.get(SINK_TOKEN_ENV), "heartbeat")
+        return _publish_path(payload, destination, "heartbeat")
+    except Exception as e:                      # noqa: BLE001 - reported, not raised
+        return {"published": False, "mode": "heartbeat",
+                "detail": f"Could not publish the heartbeat to {destination}: {e}"}
+
+
+def read_heartbeats(source):
+    """Heartbeats from a receipt log, oldest first. Baseline receipts are skipped."""
+    return [r for r in read_receipts(source)
+            if isinstance(r, dict) and r.get("kind") == "heartbeat"
+            and r.get("chain") in (None, chain_id())]
+
+
+def observation_gaps(heartbeats, interval=HEARTBEAT_INTERVAL, now=None):
+    """Windows during which nothing was watching. Returns [{start, end, seconds}].
+
+    A gap is a gap whether the monitor was killed, crashed, or the machine was
+    simply off. Distinguishing those is not something this log can do, and
+    guessing would put a reassuring explanation on the one record that exists to
+    stop reassuring explanations.
+
+    The trailing window — between the last heartbeat and now — counts. It is the
+    one an attacker is inside right now, and reporting only closed gaps would
+    hide exactly the case that matters most.
+    """
+    stamps = sorted(s for s in (_parse_stamp(h.get("at")) for h in heartbeats or [])
+                    if s is not None)
+    if not stamps:
+        return []
+    # One missed heartbeat is a slow disk or a busy Pi; the allowance is what
+    # keeps this from crying wolf on every hiccup.
+    threshold = max(interval * 2, interval + 60)
+    gaps = []
+    for earlier, later in zip(stamps, stamps[1:]):
+        elapsed = (later - earlier).total_seconds()
+        if elapsed > threshold:
+            gaps.append({"start": earlier.isoformat(), "end": later.isoformat(),
+                         "seconds": elapsed})
+    trailing = ((now or _utcnow()) - stamps[-1]).total_seconds()
+    if trailing > threshold:
+        gaps.append({"start": stamps[-1].isoformat(), "end": None,
+                     "seconds": trailing})
+    return gaps
+
+
+def describe_observation_gaps(gaps):
+    """A risk-tagged line naming when nobody was watching, or None if nobody was.
+
+    Silent when observation was continuous, so a healthy monitor adds no noise —
+    the same bargain describe_comparison_coverage makes.
+    """
+    if not gaps:
+        return None
+    open_gap = [g for g in gaps if g.get("end") is None]
+    longest = max(g["seconds"] for g in gaps)
+    risk = "HIGH" if open_gap else "REVIEW"
+    if open_gap:
+        tail = (f"including one still open ({_format_duration(open_gap[0]['seconds'])} "
+                "with no heartbeat) — the monitor is not running now")
+    else:
+        tail = f"the longest {_format_duration(longest)}"
+    return (f"  [{risk:6}] Observation coverage: {len(gaps)} window(s) with no "
+            f"monitoring, {tail}. Changes made and reverted inside those windows "
+            "left no trace. Nothing is reported about them, which is not the same "
+            "as nothing having happened.")
+
+
 def resolve_alert_sink(explicit=None):
     return explicit or os.environ.get(ALERT_ENV) or None
 
@@ -1683,13 +1880,24 @@ def send_alert(event, destination=None, token=None):
 
 
 def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
-                sleeper=time.sleep, printer=print):
+                sleeper=time.sleep, printer=print,
+                heartbeat_interval=HEARTBEAT_INTERVAL, clock=None):
     """Poll the cheap checks and alert on change.
 
     `iterations=None` runs until interrupted; a number bounds it, which is what
     makes this testable without waiting. Returns every event raised.
+
+    The reference snapshot is loaded from disk and written back every poll, so
+    stopping and restarting the process resumes the comparison rather than
+    beginning a new one. Keeping it in memory alone meant a restart adopted
+    whatever it woke up to — poison the ARP cache and the resolver while the
+    monitor is down and the restart silently made the attacker the new normal,
+    permanently. A restart across a real gap now compares over it and says so.
     """
-    previous = None
+    # A callable, not an instant: the loop reads it once per poll. The
+    # pure-function siblings (observation_gaps, describe_baseline_freshness)
+    # take a datetime under the name `now`, so this one is named for what it is.
+    clock = clock or _utcnow
     raised = []
     count = 0
     printer(f"Monitoring every {interval}s. Watching the gateway, its MAC, IPv6 "
@@ -1697,16 +1905,61 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     if not resolve_alert_sink(alert_to):
         printer("  Note: no alert destination set. Findings will print here only — "
                 f"set {ALERT_ENV} so they leave this machine.")
+    if not resolve_sink():
+        printer("  Note: no receipt sink set, so nothing off-host will record that "
+                f"this monitor ran. Set {SINK_ENV} — otherwise a week with no "
+                "alerts and a monitor that was never running look identical.")
+
+    previous, observed_at = load_monitor_state()
+    started = clock()
+    # A gap is measured against the promise the monitor makes: it said it would
+    # look every `interval` seconds. One missed poll is a slow machine; beyond
+    # that, nobody was watching.
+    gap_after = interval * 2 + 60
+    resumed_gap = None
+    if previous is not None and observed_at is not None:
+        down = (started - observed_at).total_seconds()
+        if down > gap_after:
+            resumed_gap = down
+            event = {
+                "severity": "REVIEW", "kind": "observation_gap",
+                "detail": f"Monitoring resumed after {_format_duration(down)} with "
+                          f"nothing watching (last poll {observed_at.isoformat()}). "
+                          "A change made and undone inside that window left no trace, "
+                          "so the comparison below is across the gap, not of it."}
+            raised.append(event)
+            printer(f"  [{event['severity']:6}] {event['detail']}")
+            result = send_alert(event, alert_to)
+            if not result["published"]:
+                printer(f"           (not delivered: {result['detail']})")
+
+    last_heartbeat = None
     try:
         while iterations is None or count < iterations:
+            polled_at = clock()
             snapshot = monitor_snapshot()
             for event in diff_snapshots(previous, snapshot):
+                if resumed_gap is not None:
+                    # The finding is real, but it was not witnessed happening,
+                    # and the reader is entitled to know which of those they have.
+                    event = dict(event, across_gap=True)
+                    event["detail"] += (" Observed across a "
+                                        f"{_format_duration(resumed_gap)} window with "
+                                        "no monitoring, so when it happened is unknown.")
                 raised.append(event)
                 printer(f"  [{event['severity']:6}] {event['detail']}")
                 result = send_alert(event, alert_to)
                 if not result["published"]:
                     printer(f"           (not delivered: {result['detail']})")
+
             previous = snapshot
+            resumed_gap = None          # only the first comparison spans the gap
+            save_monitor_state(snapshot, polled_at)
+            if (last_heartbeat is None
+                    or (polled_at - last_heartbeat).total_seconds() >= heartbeat_interval):
+                monitor_heartbeat(interval=interval, at=polled_at)
+                last_heartbeat = polled_at
+
             count += 1
             if iterations is None or count < iterations:
                 sleeper(interval)
@@ -4537,6 +4790,11 @@ def action_compare_baseline(state):
     if _sink:
         print(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink))))
+        # Silent unless a monitor has actually run, so an audit-only user gains
+        # no noise from a feature they are not using.
+        _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
+        if _gaps:
+            print(_gaps)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:
@@ -4703,6 +4961,11 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     if _sink:
         print(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink))))
+        # Silent unless a monitor has actually run, so an audit-only user gains
+        # no noise from a feature they are not using.
+        _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
+        if _gaps:
+            print(_gaps)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:

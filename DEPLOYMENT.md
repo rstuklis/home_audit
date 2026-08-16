@@ -92,6 +92,43 @@ Routine bookkeeping and things a person must wake up for usually belong on
 different channels — and an alert printed to a terminal on the host under
 suspicion has been delivered to the adversary and nobody else.
 
+### Silence is not evidence
+
+Every check in the loop catches someone who is in the path **while the loop is
+running**. None of them are worth anything when the process is not running, and
+stopping a process is far cheaper than defeating an ARP check. So the attack on
+a monitor is not evasion, it is switching it off — and you do not need an
+attacker for that. A reboot, a crash, an OOM kill or a `RestartSec` window does
+it just as well.
+
+Two things follow, and the monitor now handles both.
+
+**Its reference point survives a restart.** The last snapshot is persisted to
+`~/.home_net_audit/monitor_state.json`. It used to live in memory only, which
+meant a restart re-baselined into whatever world it woke up in: poison the ARP
+cache and the resolver while the monitor is down, and the restart adopted the
+attacker's MAC and DNS as normal and never alerted on them — not just during the
+gap, but ever. A restart now compares across the downtime and reports what
+changed, flagged as observed across a window nobody was watching.
+
+**It publishes a heartbeat**, on the receipt sink, saying observation was
+happening at that moment. Without one, "no alerts this week" and "nothing was
+watching this week" are the same output, and the reassuring reading is the one
+people take. `--monitor` therefore wants `HOME_NET_AUDIT_SINK` set as much as a
+full audit does; it says so at startup if it is missing. The next audit reads
+those heartbeats back and names any window with no monitoring in it.
+
+Gaps resolve to within one heartbeat interval (15 minutes), which the report
+states rather than rounds away. A gap that is still open — no heartbeat between
+the last one and now — is reported as HIGH rather than REVIEW, because that is
+the one an attacker is inside at the moment you are reading.
+
+What a heartbeat proves is narrow, and it is worth being exact about: **it says
+the process was alive and could reach the sink. It does not say the checks were
+meaningful.** An attacker who owns the host can keep heartbeats flowing while
+feeding the monitor whatever they like. This detects a *stopped* monitor, not a
+*subverted* one.
+
 ### systemd unit
 
 ```ini
@@ -158,6 +195,9 @@ earns.
 - **Endpoint implants.** Empirically the most likely route to a targeted
   individual, and a network monitor cannot see them. Lockdown Mode, prompt
   patching and Apple Threat Notifications matter far more here.
+- **A subverted monitor.** Heartbeats catch a monitor that stopped. They do
+  nothing about one that is still running and lying, because both the checks and
+  the heartbeat come from the same host. Anyone who owns the observer gets both.
 - **Wholesale destruction of the observer.** Receipts survive it; the observer
   does not.
 

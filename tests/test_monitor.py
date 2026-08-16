@@ -165,6 +165,163 @@ class TestAlertsLeaveTheMachine:
         assert mod.resolve_alert_sink() != mod.resolve_sink()
 
 
+class TestObservationSurvivesARestart:
+    """The monitor's reference point must outlive the process holding it.
+
+    Keeping it in memory only meant stopping and starting the monitor
+    re-baselined it into whatever world it woke up in. An attacker who could
+    stop the process — or a reboot, a crash, an OOM kill, a RestartSec window —
+    got the change adopted as normal and never alerted on, then or ever. That is
+    a cheaper attack than defeating any check in the loop, because every check
+    in the loop is worth nothing when the process is not running.
+    """
+
+    def _clock(self, *times):
+        """A clock() returning each time in turn, then holding the last."""
+        seq, state = list(times), {"i": 0}
+
+        def now():
+            value = seq[min(state["i"], len(seq) - 1)]
+            state["i"] += 1
+            return value
+        return now
+
+    def _at(self, hours):
+        from datetime import datetime, timezone
+        return datetime(2026, 8, 16, hours, 0, tzinfo=timezone.utc)
+
+    def _watch(self, mod, monkeypatch, snapshot, **kw):
+        monkeypatch.setattr(mod, "monitor_snapshot", lambda: snapshot)
+        return mod.run_monitor(interval=0, iterations=1, sleeper=lambda _: None,
+                               printer=lambda *a: None, **kw)
+
+    def test_a_change_across_a_restart_is_still_caught(self, mod, monkeypatch):
+        """The core regression: the poisoning must not be absorbed silently."""
+        self._watch(mod, monkeypatch, snap())
+        events = self._watch(mod, monkeypatch, snap(gateway_mac=ATTACKER_MAC,
+                                                    dns=["66.66.66.66"]))
+        assert {e["kind"] for e in events} == {"gateway_mac_changed", "dns_changed"}
+
+    def test_the_very_first_start_reports_no_gap(self, mod, monkeypatch):
+        # Nothing has ever watched here. That is a genuine start, not a lapse,
+        # and calling it one would make the monitor cry wolf on day one.
+        events = self._watch(mod, monkeypatch, snap())
+        assert events == []
+
+    def test_a_prompt_restart_is_not_reported_as_a_gap(self, mod, monkeypatch):
+        # A service restart inside the polling allowance is not a blind window.
+        self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(1)))
+        events = self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(1)))
+        assert [e for e in events if e["kind"] == "observation_gap"] == []
+
+    def test_resuming_after_a_real_gap_says_so(self, mod, monkeypatch):
+        self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(1)))
+        events = self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(5)))
+        gap = [e for e in events if e["kind"] == "observation_gap"]
+        assert len(gap) == 1
+        assert "4h" in gap[0]["detail"]
+
+    def test_a_gap_is_raised_even_when_nothing_changed(self, mod, monkeypatch):
+        """The whole point: silence is only reassuring if someone was watching.
+
+        An unobserved window is worth reporting precisely when it looks clean,
+        because a change made and undone inside it is indistinguishable from
+        nothing having happened.
+        """
+        self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(1)))
+        events = self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(9)))
+        assert [e["kind"] for e in events] == ["observation_gap"]
+
+    def test_a_change_seen_across_a_gap_is_marked_as_unwitnessed(self, mod, monkeypatch):
+        self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(1)))
+        events = self._watch(mod, monkeypatch, snap(gateway_mac=ATTACKER_MAC),
+                             clock=self._clock(self._at(6)))
+        change = [e for e in events if e["kind"] == "gateway_mac_changed"][0]
+        assert change["across_gap"] is True
+        assert "when it happened is unknown" in change["detail"]
+
+    def test_the_gap_alert_leaves_the_machine(self, mod, monkeypatch, tmp_path):
+        target = tmp_path / "alerts.jsonl"
+        self._watch(mod, monkeypatch, snap(), clock=self._clock(self._at(1)))
+        self._watch(mod, monkeypatch, snap(), alert_to=str(target),
+                    clock=self._clock(self._at(7)))
+        assert "observation_gap" in target.read_text(encoding="utf-8")
+
+
+class TestHeartbeatsRecordThatSomeoneWasWatching:
+    """Off-host proof of liveness — the receipt chain's idea, one layer up.
+
+    A missing baseline could not be told from a genuine first run, so receipts
+    recorded what had happened. A missing observation cannot be told from a quiet
+    network, so heartbeats record when observation was happening. Neither
+    prevents anything; both make the absence legible afterwards.
+    """
+
+    def test_the_loop_publishes_liveness_to_the_sink(self, mod, monkeypatch, tmp_path):
+        sink = tmp_path / "receipts"
+        sink.mkdir()
+        monkeypatch.setenv(mod.SINK_ENV, str(sink))
+        monkeypatch.setattr(mod, "monitor_snapshot", lambda: snap())
+        mod.run_monitor(interval=0, iterations=1, sleeper=lambda _: None,
+                        printer=lambda *a: None)
+        assert mod.read_heartbeats(str(sink))
+
+    def test_a_heartbeat_carries_no_snapshot_of_the_network(self, mod, tmp_path):
+        target = tmp_path / "hb.jsonl"
+        mod.monitor_heartbeat(destination=str(target))
+        blob = target.read_text(encoding="utf-8")
+        for secret in (GW, ROUTER_MAC, "192.168.1.42"):
+            assert secret not in blob, f"{secret} was published off-host"
+
+    def test_a_missing_sink_is_reported_not_silently_skipped(self, mod, monkeypatch):
+        monkeypatch.delenv(mod.SINK_ENV, raising=False)
+        result = mod.monitor_heartbeat()
+        assert result["published"] is False
+        assert "look the same" in result["detail"]
+
+    def test_a_hole_in_the_heartbeats_is_found(self, mod):
+        beats = [{"kind": "heartbeat", "at": "2026-08-16T01:00:00+00:00"},
+                 {"kind": "heartbeat", "at": "2026-08-16T05:00:00+00:00"}]
+        gaps = mod.observation_gaps(beats, interval=900,
+                                    now=mod._parse_stamp("2026-08-16T05:05:00+00:00"))
+        assert len(gaps) == 1 and gaps[0]["seconds"] == 4 * 3600
+
+    def test_continuous_heartbeats_report_nothing(self, mod):
+        beats = [{"kind": "heartbeat", "at": f"2026-08-16T01:{m:02d}:00+00:00"}
+                 for m in (0, 15, 30)]
+        gaps = mod.observation_gaps(beats, interval=900,
+                                    now=mod._parse_stamp("2026-08-16T01:35:00+00:00"))
+        assert gaps == []
+        assert mod.describe_observation_gaps(gaps) is None
+
+    def test_a_monitor_that_stopped_and_never_came_back_is_high(self, mod):
+        """The gap an attacker is inside right now, not one they have left."""
+        beats = [{"kind": "heartbeat", "at": "2026-08-16T01:00:00+00:00"}]
+        gaps = mod.observation_gaps(beats, interval=900,
+                                    now=mod._parse_stamp("2026-08-16T09:00:00+00:00"))
+        assert len(gaps) == 1 and gaps[0]["end"] is None
+        line = mod.describe_observation_gaps(gaps)
+        assert "HIGH" in line and "not running now" in line
+
+    def test_a_closed_gap_is_review_rather_than_high(self, mod):
+        gaps = [{"start": "a", "end": "b", "seconds": 7200}]
+        assert "REVIEW" in mod.describe_observation_gaps(gaps)
+
+    def test_a_malformed_heartbeat_line_does_not_crash_the_reader(self, mod):
+        beats = [{"kind": "heartbeat", "at": "not-a-timestamp"},
+                 {"kind": "heartbeat", "at": "2026-08-16T01:00:00+00:00"}]
+        assert mod.observation_gaps(
+            beats, now=mod._parse_stamp("2026-08-16T01:05:00+00:00")) == []
+
+    def test_heartbeats_are_not_counted_as_baseline_receipts(self, mod, tmp_path):
+        """A log of pure liveness says nothing about whether a baseline ran."""
+        sink = tmp_path / "r.jsonl"
+        mod.monitor_heartbeat(destination=str(sink))
+        report = mod.compare_with_receipts({"seq": 1, "seal": "x"},
+                                           mod.read_receipts(str(sink)))
+        assert report["status"] == "no_receipts"
+
+
 class TestMonitorLoop:
     def _readers(self, mod, monkeypatch, macs):
         """Return a run() whose ARP answer changes on each successive poll."""
