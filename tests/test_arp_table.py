@@ -1,7 +1,7 @@
 """Tests for read_arp_table (home_net_audit.py lines 204-220).
 
-The function turns `arp -a` into {ip: mac}. Two things make it fragile enough
-to be worth pinning line by line:
+The function turns `arp -an` into {ip: mac}. Three things make it fragile
+enough to be worth pinning line by line:
 
 1.  macOS prints MAC octets without leading zeros ("1:2:3:4:5:6"), so the raw
     text is never directly comparable to a stored baseline MAC. The parser has
@@ -13,6 +13,11 @@ to be worth pinning line by line:
     made that sort raise ValueError and took the whole audit down. The fix
     pushes every IP through ipaddress.ip_address and drops what fails; the
     tests in TestMalformedIPsAreDropped and TestSortInvariant pin exactly that.
+3.  The MAC has to come from the `at <mac>` column and nowhere else. The parser
+    used to `re.search` for a MAC-shaped token across the whole line while the
+    command resolved names, so the *hostname* — text a stranger chooses by
+    publishing a PTR or mDNS record — was matched first. TestNameColumnIsNotTrusted
+    pins both halves of the fix.
 
 TestDiscoverDevices covers the consumer, discover_devices (lines 293-306),
 because the merge it performs is what gives read_arp_table's output meaning:
@@ -27,7 +32,7 @@ import pytest
 
 from conftest import load_fixture, make_run
 
-ARP_CMD = "arp -a"
+ARP_CMD = "arp -an"
 NEIGH_CMD = "ip neigh show"
 
 TYPICAL = "arp_a_typical.out"
@@ -70,16 +75,62 @@ def one_entry(read_arp, line):
 
 class TestCommandInvoked:
     def test_reads_the_system_arp_cache_then_falls_back_to_iproute(self, read_arp):
-        # `arp -a` first; `ip neigh show` only when it yields nothing, so a
+        # `arp -an` first; `ip neigh show` only when it yields nothing, so a
         # Linux observer sees the same neighbour table by its own name.
         read_arp("")
         assert read_arp.calls == [ARP_CMD, NEIGH_CMD]
+
+    def test_name_resolution_is_disabled(self, read_arp):
+        # -n is load-bearing, not tidiness: see TestNameColumnIsNotTrusted.
+        read_arp("")
+        flags = read_arp.calls[0].split()[1]
+        assert flags.startswith("-") and "n" in flags, \
+            f"arp must be invoked with -n, got {flags!r}"
 
     def test_missing_arp_binary_yields_an_empty_table(self, mod, monkeypatch):
         # The real run() returns "" when the binary is absent or times out;
         # that must read as "no devices known", not as a crash.
         monkeypatch.setattr(mod, "run", make_run({}))
         assert mod.read_arp_table() == {}
+
+
+class TestNameColumnIsNotTrusted:
+    """The name column is attacker-chosen text, and it sits before the MAC.
+
+    With resolution on, `arp -a` puts whatever a PTR or mDNS record claims in
+    column one. The parser searched for a MAC-shaped token anywhere in the line,
+    so a name like "aa:bb:cc:dd:ee:ff.local" was matched in preference to the
+    real address in the `at` column. Naming yourself after the router's genuine
+    MAC therefore pinned gateway_mac to its pre-poison value for good: the
+    monitor's HIGH gateway_mac_changed could never fire, and check_arp_spoofing
+    reported "MAC address stable" throughout an active poisoning.
+    """
+
+    def test_a_mac_shaped_hostname_does_not_become_the_mac(self, read_arp):
+        ip, mac = one_entry(
+            read_arp,
+            "aa:bb:cc:dd:ee:ff.local (192.168.1.1) at de:ad:be:ef:00:01 "
+            "on en0 ifscope [ethernet]",
+        )
+        assert (ip, mac) == ("192.168.1.1", "de:ad:be:ef:00:01")
+
+    def test_a_hostname_carrying_parentheses_cannot_refile_the_row(self, read_arp):
+        # The IP came from the first "(...)" on the line, so a name containing
+        # one filed a real neighbour's MAC under an address of the attacker's
+        # choosing — hiding a new device from diff_baseline.
+        ip, mac = one_entry(
+            read_arp,
+            "evil(10.0.0.9).local (192.168.1.50) at de:ad:be:ef:00:02 "
+            "on en0 ifscope [ethernet]",
+        )
+        assert (ip, mac) == ("192.168.1.50", "de:ad:be:ef:00:02")
+
+    def test_an_incomplete_entry_is_still_dropped(self, read_arp):
+        # "(incomplete)" means the address was never learned. The anchored
+        # pattern must not fall back to anything else on the line.
+        assert read_arp(
+            "spoof:00:11:22:33:44 (192.168.1.20) at (incomplete) on en0 [ethernet]\n"
+        ) == {}
 
 
 class TestMacNormalisation:

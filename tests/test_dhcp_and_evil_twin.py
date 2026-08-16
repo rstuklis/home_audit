@@ -214,6 +214,61 @@ class TestWifiNetworkParsing:
     def test_empty_output_yields_nothing(self, mod):
         assert mod.parse_wifi_networks("") == {}
 
+    def test_the_interface_name_is_not_an_ssid(self, mod):
+        # "en0:" is structure. It used to be accepted as a network name, which
+        # is how BSSIDs ended up filed under it — see TestSsidsEndingInAHeaderWord.
+        assert "en0" not in mod.parse_wifi_networks(SP_TWIN)
+
+
+SP_SSID_ENDING_IN_NETWORKS = """      Interfaces:
+        en0:
+          Current Network Information:
+            HomeNet:
+              BSSID: 3c:22:fb:11:22:33
+              Security: WPA3 Personal
+          Other Local Wi-Fi Networks:
+            AAA Guest Networks:
+              BSSID: aa:bb:cc:dd:ee:ff
+              Security: WPA2 Personal
+"""
+
+SP_OWN_SSID_ENDING_IN_NETWORKS = """      Interfaces:
+        en0:
+          Current Network Information:
+            Wong Networks:
+              BSSID: 3c:22:fb:11:22:33
+              Security: WPA3 Personal
+"""
+
+
+class TestSsidsEndingInAHeaderWord:
+    """The section-header test was a suffix match, and its reject branch leaked.
+
+    Any real SSID ending in "Networks" or "Information" was thrown away — and
+    because the branch left `ssid` pointing at the *previous* network, that
+    network's BSSIDs were then filed under it. Listed first under "Other Local
+    Wi-Fi Networks", a neighbour called "AAA Guest Networks" therefore handed
+    its BSSID to the SSID you are connected to, which is the exact definition
+    check_evil_twin raises a HIGH for. The false BSSID was then written into
+    the baseline, so it persisted.
+    """
+
+    def test_a_neighbours_bssid_is_not_filed_under_the_connected_ssid(self, mod):
+        networks = mod.parse_wifi_networks(SP_SSID_ENDING_IN_NETWORKS)
+        assert "aa:bb:cc:dd:ee:ff" not in networks.get("HomeNet", []), \
+            "a neighbour's BSSID under your own SSID reads as an evil twin"
+
+    def test_such_an_ssid_is_kept_as_its_own_network(self, mod):
+        networks = mod.parse_wifi_networks(SP_SSID_ENDING_IN_NETWORKS)
+        assert networks.get("AAA Guest Networks") == ["aa:bb:cc:dd:ee:ff"]
+
+    def test_your_own_ssid_ending_in_networks_is_still_found(self, mod):
+        # The mirror case: every BSSID landed under "en0", so check_evil_twin
+        # found nothing for the real SSID and reported "No BSSID visible —
+        # grant Location Services", blaming permissions for a parser bug.
+        networks = mod.parse_wifi_networks(SP_OWN_SSID_ENDING_IN_NETWORKS)
+        assert networks == {"Wong Networks": ["3c:22:fb:11:22:33"]}
+
 
 class TestEvilTwinDetection:
     def test_a_second_ap_advertising_your_ssid_is_high(self, mod, monkeypatch):

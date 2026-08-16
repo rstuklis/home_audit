@@ -49,6 +49,31 @@ Receipts carry the run number, seal and chain link — **never** the audit state
 Your MAC addresses and topology do not leave the machine unless you explicitly
 ask for `mode="full"`.
 
+Two constraints on an HTTPS sink, both enforced rather than advisory:
+
+* **Give it the final URL.** Redirects are refused, not followed. urllib's
+  default handler turns a POST into a bodiless GET on a 301/302/303 and copies
+  the `Authorization` header to the new host, so `http://…` redirecting to
+  `https://…` silently dropped every receipt while reporting "accepted", and an
+  on-path redirect would have handed over the token. A redirect is now a failed
+  publish, and it says so.
+* **A token requires `https://`.** Sending a bearer token over plain HTTP is
+  refused outright.
+
+**An HTTPS sink is write-only from this side.** The tool can publish to it but
+cannot read it back, so the check that catches a wiped `~/.home_net_audit` —
+local run number versus the highest receipted one — cannot run against a URL.
+The audit reports that explicitly rather than showing "no receipts to compare
+against", which was the same message it showed for a sink that really was
+empty. To get the comparison, either point `HOME_NET_AUDIT_SINK` at an
+append-only path the host can also read, or compare against the collector's own
+copy out of band.
+
+A failed publish is now printed. It always should have been: a receipt that did
+not leave the machine is the same as never having sent one, and an unmounted
+share or an expired token used to produce months of runs that published nothing
+and said nothing.
+
 ---
 
 ## Sealing the baseline
@@ -87,10 +112,23 @@ It watches the default gateway, **the gateway's MAC** (a change there with the
 IP unchanged is what ARP poisoning looks like), the set of advertising IPv6
 routers, the DNS resolvers, and arrivals in the neighbour table.
 
-Alerts go to a **separate** destination from receipts (`HOME_NET_AUDIT_ALERT`).
-Routine bookkeeping and things a person must wake up for usually belong on
-different channels — and an alert printed to a terminal on the host under
-suspicion has been delivered to the adversary and nobody else.
+Alerts go to a **separate** destination from receipts (`HOME_NET_AUDIT_ALERT`),
+with a **separate** credential (`HOME_NET_AUDIT_ALERT_TOKEN`). Routine
+bookkeeping and things a person must wake up for usually belong on different
+channels — and an alert printed to a terminal on the host under suspicion has
+been delivered to the adversary and nobody else.
+
+The alert channel used to fall back to `HOME_NET_AUDIT_SINK_TOKEN` when no
+alert token was set, which meant pointing `HOME_NET_AUDIT_ALERT` at a chat
+webhook logged the append-only collector's credential at a third party on every
+alert. It no longer does; if you were relying on that fallback, set
+`HOME_NET_AUDIT_ALERT_TOKEN` explicitly.
+
+**An alert that cannot be delivered is queued and retried** on every subsequent
+poll, and named again at HIGH when the loop ends with any still undelivered.
+The adversary an alert describes is in the path by definition and can drop the
+POST while letting heartbeats through, so a single failed attempt used to mean
+the finding existed only in stdout on the compromised host.
 
 ### Silence is not evidence
 
@@ -104,7 +142,11 @@ it just as well.
 Two things follow, and the monitor now handles both.
 
 **Its reference point survives a restart.** The last snapshot is persisted to
-`~/.home_net_audit/monitor_state.json`. It used to live in memory only, which
+`~/.home_net_audit/monitor_state-<chain>.json`, one file per network — carrying
+a home reference on to café Wi-Fi used to raise three false HIGH findings on
+arrival and three more on the way home, which is how a real one stops being
+read. If that file cannot be written, the loop says so at HIGH rather than
+silently re-baselining on every restart. It used to live in memory only, which
 meant a restart re-baselined into whatever world it woke up in: poison the ARP
 cache and the resolver while the monitor is down, and the restart adopted the
 attacker's MAC and DNS as normal and never alerted on them — not just during the

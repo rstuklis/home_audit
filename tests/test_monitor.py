@@ -37,6 +37,21 @@ def snap(**over):
     return base
 
 
+@pytest.fixture(autouse=True)
+def _stub_startup(mod, monkeypatch):
+    """Two things the loop and the snapshot now do that these tests are not about.
+
+    run_monitor selects the baseline for the network it is watching, which reads
+    interfaces and the local IP — TestTheMonitorSelectsItsNetwork covers that on
+    its own. And monitor_snapshot pings the gateway before reading the ARP
+    cache, which goes through subprocess — TestTheSnapshotPingsTheGateway covers
+    that. Both are forbidden by the sandbox, correctly.
+    """
+    monkeypatch.setattr(mod, "use_current_network_baseline",
+                        lambda *a, **k: (None, None))
+    monkeypatch.setattr(mod, "ping", lambda ip: None)
+
+
 class TestChangesThatMeanSomeoneIsInThePath:
     def test_a_changed_gateway_mac_is_high(self, mod):
         """The signature of ARP poisoning: same IP, different hardware."""
@@ -102,15 +117,24 @@ class TestQuietOnAHealthyNetwork:
         assert mod.diff_snapshots(snap(), snap(ipv6_routers=[])) == []
 
 
+def _local_readers():
+    return make_run({
+        "route -n get default": "   gateway: 192.168.1.1\n",
+        "arp -an": f"? ({GW}) at {ROUTER_MAC} on en0 ifscope [ethernet]\n",
+        "ndp -r": "fe80::1%en0 if=en0, flags=O\n",
+        "scutil --dns": "  nameserver[0] : 192.168.1.1\n",
+    })
+
+
 class TestSnapshotIsCheap:
     def test_the_snapshot_runs_only_local_readers(self, mod, monkeypatch):
-        """No port scans, no probes — this loop runs every minute on a Pi."""
-        fake = make_run({
-            "route -n get default": "   gateway: 192.168.1.1\n",
-            "arp -a": f"? ({GW}) at {ROUTER_MAC} on en0 ifscope [ethernet]\n",
-            "ndp -r": "fe80::1%en0 if=en0, flags=O\n",
-            "scutil --dns": "  nameserver[0] : 192.168.1.1\n",
-        })
+        """No port scans, no service probes — this loop runs every minute on a Pi.
+
+        One ping to the gateway is the single exception, and it is not a probe
+        of anything: it is what keeps that one ARP entry from ageing out. See
+        TestTheSnapshotPingsTheGateway.
+        """
+        fake = _local_readers()
         monkeypatch.setattr(mod, "run", fake)
         result = mod.monitor_snapshot()
 
@@ -119,11 +143,35 @@ class TestSnapshotIsCheap:
         assert result["ipv6_routers"] == ["fe80::1%en0"]
         # Nothing expensive was invoked.
         for cmd in fake.calls:
-            assert "ping" not in cmd and "lsof" not in cmd
+            assert "lsof" not in cmd and "system_profiler" not in cmd
 
     def test_a_missing_gateway_does_not_raise(self, mod, monkeypatch):
         monkeypatch.setattr(mod, "run", make_run({}))
         assert mod.monitor_snapshot()["gateway_mac"] is None
+
+
+class TestTheSnapshotPingsTheGateway:
+    """Without it, an ARP entry that has aged out reads as "no MAC".
+
+    check_arp_spoofing has always pinged first; monitor_snapshot did not, so a
+    quiet gateway produced gateway_mac=None on an otherwise healthy poll — and
+    a None in the stored reference is what carry_forward_gateway_mac exists to
+    stop being written. Cheap: one packet to one address already on the link.
+    """
+
+    def test_the_gateway_is_pinged_before_the_arp_cache_is_read(self, mod, monkeypatch):
+        pinged = []
+        monkeypatch.setattr(mod, "run", _local_readers())
+        monkeypatch.setattr(mod, "ping", lambda ip: pinged.append(ip))
+        mod.monitor_snapshot()
+        assert pinged == [GW]
+
+    def test_nothing_is_pinged_when_there_is_no_gateway(self, mod, monkeypatch):
+        pinged = []
+        monkeypatch.setattr(mod, "run", make_run({}))
+        monkeypatch.setattr(mod, "ping", lambda ip: pinged.append(ip))
+        mod.monitor_snapshot()
+        assert pinged == []
 
 
 class TestAlertsLeaveTheMachine:
@@ -322,6 +370,91 @@ class TestHeartbeatsRecordThatSomeoneWasWatching:
         assert report["status"] == "no_receipts"
 
 
+class TestTheCadenceComesFromTheHeartbeats:
+    """The threshold was pinned to the 900s constant, not the real interval.
+
+    Both readers call observation_gaps without an argument, so `interval`
+    defaulted to HEARTBEAT_INTERVAL while actual spacing is max(--interval,
+    900). A monitor running at --interval 3600 therefore had every one of its
+    healthy hourly beats reported as a window with no monitoring — and, if the
+    audit ran more than half an hour after the last one, a HIGH saying the
+    monitor was not running, about a monitor that was. The payload has carried
+    its own interval since the feature landed; nothing read it.
+    """
+
+    @staticmethod
+    def _hourly(count, interval=3600):
+        return [{"kind": "heartbeat", "interval": interval,
+                 "at": f"2026-08-16T{h:02d}:00:00+00:00"} for h in range(count)]
+
+    def test_an_hourly_monitor_is_not_reported_as_down(self, mod):
+        gaps = mod.observation_gaps(
+            self._hourly(10), now=mod._parse_stamp("2026-08-16T09:30:00+00:00"))
+        assert gaps == []
+        assert mod.describe_observation_gaps(gaps) is None
+
+    def test_a_real_gap_at_an_hourly_cadence_is_still_found(self, mod):
+        beats = [{"kind": "heartbeat", "interval": 3600,
+                  "at": "2026-08-16T01:00:00+00:00"},
+                 {"kind": "heartbeat", "interval": 3600,
+                  "at": "2026-08-16T12:00:00+00:00"}]
+        gaps = mod.observation_gaps(
+            beats, now=mod._parse_stamp("2026-08-16T12:30:00+00:00"))
+        assert len(gaps) == 1 and gaps[0]["seconds"] == 11 * 3600
+
+    def test_heartbeats_with_no_recorded_interval_fall_back_to_the_default(self, mod):
+        beats = [{"kind": "heartbeat", "at": "2026-08-16T01:00:00+00:00"},
+                 {"kind": "heartbeat", "at": "2026-08-16T05:00:00+00:00"}]
+        gaps = mod.observation_gaps(
+            beats, now=mod._parse_stamp("2026-08-16T05:05:00+00:00"))
+        assert len(gaps) == 1, "pre-interval heartbeats still use the 900s default"
+
+    def test_an_explicit_interval_still_wins(self, mod):
+        gaps = mod.observation_gaps(self._hourly(3), interval=900,
+                                    now=mod._parse_stamp("2026-08-16T02:05:00+00:00"))
+        assert gaps, "an explicit argument must not be overridden by the payload"
+
+
+class TestAFutureHeartbeatCannotDisableTheCheck:
+    """One entry stamped in 2099 turned the HIGH into a past-tense REVIEW.
+
+    `trailing = now - stamps[-1]` had no upper bound, so a future stamp sorted
+    last, made the trailing window negative, and no open gap was ever appended
+    — permanently, because the sink is append-only by design and the entry can
+    never be removed. A wrong clock (a resumed VM, an RTC-less Pi before NTP)
+    produces exactly the same thing with no attacker involved.
+    """
+
+    @staticmethod
+    def _beats():
+        return [{"kind": "heartbeat", "at": f"2026-08-16T00:{m:02d}:00+00:00"}
+                for m in (0, 15, 30)] + [{"kind": "heartbeat", "at": "2099-01-01T00:00:00+00:00"}]
+
+    def test_a_stopped_monitor_is_still_high(self, mod):
+        gaps = mod.observation_gaps(
+            self._beats(), now=mod._parse_stamp("2026-08-31T00:00:00+00:00"))
+        line = mod.describe_observation_gaps(gaps)
+        assert "HIGH" in line and "not running now" in line
+
+    def test_the_future_stamp_is_reported_in_its_own_right(self, mod):
+        line = mod.describe_clock_anomalies(
+            self._beats(), now=mod._parse_stamp("2026-08-31T00:00:00+00:00"))
+        assert line is not None and "future" in line
+        assert "2099" in line
+
+    def test_an_honest_log_reports_no_anomaly(self, mod):
+        beats = [{"kind": "heartbeat", "at": "2026-08-16T00:00:00+00:00"}]
+        assert mod.describe_clock_anomalies(
+            beats, now=mod._parse_stamp("2026-08-16T00:05:00+00:00")) is None
+
+    def test_small_clock_skew_is_tolerated(self, mod):
+        # A heartbeat a minute ahead is a clock nudge, not a forged entry.
+        beats = [{"kind": "heartbeat", "at": "2026-08-16T00:01:00+00:00"}]
+        now = mod._parse_stamp("2026-08-16T00:00:00+00:00")
+        assert mod.describe_clock_anomalies(beats, now=now) is None
+        assert mod.observation_gaps(beats, now=now) == []
+
+
 class TestMonitorLoop:
     def _readers(self, mod, monkeypatch, macs):
         """Return a run() whose ARP answer changes on each successive poll."""
@@ -410,3 +543,210 @@ class TestMonitorLoop:
                                  sleeper=interrupt_after_change,
                                  printer=lambda *a: None)
         assert [e["kind"] for e in events] == ["gateway_mac_changed"]
+
+
+class TestABlankPollDoesNotBecomeTheReference:
+    """good → None → attacker used to slip through with nothing raised.
+
+    diff_snapshots is right to decline the comparison when either side is None.
+    The bug was persisting that None anyway: poll 2 was skipped because the new
+    MAC was missing, poll 3 was skipped because the *old* one now was, and the
+    attacker's MAC was written to disk as the new normal. The HIGH never fired,
+    then or ever. An attacker can force the blank poll by flooding until
+    `arp -an` exceeds run()'s timeout and read_arp_table returns {}.
+    """
+
+    def test_a_blank_mac_does_not_hide_the_next_change(self, mod, monkeypatch):
+        state = self._seq(mod, monkeypatch, [ROUTER_MAC, None, ATTACKER_MAC])
+
+        def tick(_):
+            state["i"] += 1
+
+        events = mod.run_monitor(interval=0, iterations=3, sleeper=tick,
+                                 printer=lambda *a: None)
+        assert "gateway_mac_changed" in [e["kind"] for e in events]
+
+    def test_an_unreadable_mac_is_reported_rather_than_stored(self, mod, monkeypatch):
+        state = self._seq(mod, monkeypatch, [ROUTER_MAC, None])
+
+        def tick(_):
+            state["i"] += 1
+
+        events = mod.run_monitor(interval=0, iterations=2, sleeper=tick,
+                                 printer=lambda *a: None)
+        assert [e["kind"] for e in events] == ["gateway_mac_unreadable"]
+
+    def test_the_carried_value_is_the_last_one_actually_seen(self, mod):
+        snapshot, note = mod.carry_forward_gateway_mac(
+            snap(gateway_mac=None), snap(gateway_mac=ROUTER_MAC))
+        assert snapshot["gateway_mac"] == ROUTER_MAC
+        assert note["severity"] == "REVIEW"
+
+    def test_a_first_poll_with_no_mac_carries_nothing(self, mod):
+        snapshot, note = mod.carry_forward_gateway_mac(snap(gateway_mac=None), None)
+        assert snapshot["gateway_mac"] is None
+        assert note is None
+
+    def _seq(self, mod, monkeypatch, macs):
+        """run() whose ARP answer changes per poll; None means an empty table."""
+        seq, state = list(macs), {"i": 0}
+
+        def fake_run(cmd, timeout=10):
+            joined = " ".join(cmd)
+            if "arp -a" in joined:
+                mac = seq[min(state["i"], len(seq) - 1)]
+                if mac is None:
+                    return ""
+                return f"? ({GW}) at {mac} on en0 ifscope [ethernet]\n"
+            if "route -n get default" in joined:
+                return f"   gateway: {GW}\n"
+            return ""
+
+        monkeypatch.setattr(mod, "run", fake_run)
+        return state
+
+
+class TestUndeliveredAlertsAreQueuedNotDropped:
+    """The adversary an alert names is in-path and can drop the alert POST.
+
+    The loop printed "(not delivered: ...)" to stdout — on the host under
+    suspicion, the one place an alert is worth nothing — and then adopted the
+    change as the new normal. Nothing retried, nothing spooled, and heartbeats
+    kept flowing, so no coverage gap was reported either.
+    """
+
+    def _flaky_sink(self, mod, monkeypatch, fail_first):
+        sent, state = [], {"n": 0}
+
+        def fake_send(event, destination=None, token=None):
+            state["n"] += 1
+            if state["n"] <= fail_first:
+                return {"published": False, "detail": "sink down"}
+            sent.append(event)
+            return {"published": True, "detail": "ok"}
+
+        monkeypatch.setattr(mod, "send_alert", fake_send)
+        return sent
+
+    def test_an_alert_that_failed_is_retried_on_the_next_poll(self, mod, monkeypatch):
+        state = TestMonitorLoop()._readers(mod, monkeypatch, [ROUTER_MAC, ATTACKER_MAC])
+        sent = self._flaky_sink(mod, monkeypatch, fail_first=1)
+
+        def tick(_):
+            state["i"] += 1
+
+        mod.run_monitor(interval=0, iterations=3, sleeper=tick,
+                        printer=lambda *a: None)
+        assert [e["kind"] for e in sent] == ["gateway_mac_changed"], \
+            "the queued alert must go out once the sink recovers"
+
+    def test_a_permanently_undelivered_alert_is_high_at_the_end(self, mod, monkeypatch):
+        state = TestMonitorLoop()._readers(mod, monkeypatch, [ROUTER_MAC, ATTACKER_MAC])
+        self._flaky_sink(mod, monkeypatch, fail_first=99)
+        lines = []
+
+        def tick(_):
+            state["i"] += 1
+
+        mod.run_monitor(interval=0, iterations=2, sleeper=tick,
+                        printer=lambda *a: lines.append(" ".join(str(x) for x in a)))
+        assert any("never left this machine" in l for l in lines)
+        assert any("HIGH" in l for l in lines)
+
+
+class TestTheMonitorSelectsItsNetwork:
+    """Heartbeats were published under a chain nothing ever read back.
+
+    chain_id() is sha256(basename(BASELINE_FILE)), and main dispatches --monitor
+    before any per-network selection happens — so the monitor beat under
+    sha256("baseline.json") while every reader ran after selection had repointed
+    it to baseline-<key>.json. read_heartbeats returned [], observation_gaps
+    returned [], and describe_observation_gaps returned None: the same value it
+    returns for "observation was continuous". A monitor dead for a fortnight
+    printed nothing at all, in every per-network deployment.
+    """
+
+    def test_the_loop_selects_the_current_networks_baseline_first(self, mod, monkeypatch):
+        called = []
+        monkeypatch.setattr(mod, "use_current_network_baseline",
+                            lambda *a, **k: called.append(True) or (None, None))
+        monkeypatch.setattr(mod, "monitor_snapshot", lambda: snap())
+        mod.run_monitor(interval=0, iterations=1, sleeper=lambda _: None,
+                        printer=lambda *a: None)
+        assert called, "the monitor must select before anything reads chain_id()"
+
+    def test_heartbeats_are_readable_under_the_selected_chain(self, mod, monkeypatch, tmp_path):
+        sink = tmp_path / "receipts"
+        sink.mkdir()
+        monkeypatch.setenv(mod.SINK_ENV, str(sink))
+        monkeypatch.setattr(mod, "monitor_snapshot", lambda: snap())
+
+        # Selection repoints BASELINE_FILE exactly as the real one does.
+        def select(*a, **k):
+            mod.select_network_baseline("192.168.1.0/24")
+            return None, None
+
+        monkeypatch.setattr(mod, "use_current_network_baseline", select)
+        mod.run_monitor(interval=0, iterations=1, sleeper=lambda _: None,
+                        printer=lambda *a: None)
+        # The audit reads back after the same selection, so the chains match.
+        assert mod.read_heartbeats(str(sink)), \
+            "a heartbeat nobody can read back is the same as no heartbeat"
+
+
+class TestMonitorStateIsPerNetwork:
+    """One global file made every network change look like three HIGH findings.
+
+    Carrying a home reference on to café Wi-Fi raised gateway_changed,
+    gateway_mac_changed — whose text reads "while its IP stayed the same …
+    ARP poisoning", which is simply false when the IP changed in the same batch
+    — and dns_changed, then the mirror image on the way home. Three false HIGHs
+    per move is how a real one stops being read.
+    """
+
+    def test_two_networks_do_not_share_a_reference(self, mod, monkeypatch):
+        mod.select_network_baseline("192.168.1.0/24")
+        assert mod.save_monitor_state(snap()) is True
+        home = mod.load_monitor_state()[0]
+
+        mod.select_network_baseline("10.0.0.0/24")
+        away = mod.load_monitor_state()[0]
+
+        assert home is not None
+        assert away is None, "another network's snapshot is not a reference"
+
+    def test_returning_to_a_network_finds_its_own_reference(self, mod):
+        mod.select_network_baseline("192.168.1.0/24")
+        mod.save_monitor_state(snap())
+        mod.select_network_baseline("10.0.0.0/24")
+        mod.save_monitor_state(snap(gateway="10.0.0.1"))
+        mod.select_network_baseline("192.168.1.0/24")
+        assert mod.load_monitor_state()[0]["gateway"] == GW
+
+
+class TestAnUnwritableReferenceIsNotSilent:
+    """A monitor that cannot persist re-baselines on every restart.
+
+    save_monitor_state swallowed OSError with a bare `pass` and returned
+    nothing, and load_monitor_state maps every failure to (None, None), which
+    run_monitor treats as a genuine first run. So a root-owned state file meant
+    every restart silently adopted whatever it woke up to, with no message —
+    across an eight-hour poisoning window, `[]`.
+    """
+
+    def test_a_failed_write_is_reported(self, mod, monkeypatch):
+        assert mod.save_monitor_state(snap()) is True
+        monkeypatch.setattr(mod, "_write_json_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+        assert mod.save_monitor_state(snap()) is False
+
+    def test_the_loop_says_so_once(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "monitor_snapshot", lambda: snap())
+        monkeypatch.setattr(mod, "_write_json_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only")))
+        lines = []
+        mod.run_monitor(interval=0, iterations=3, sleeper=lambda _: None,
+                        printer=lambda *a: lines.append(" ".join(str(x) for x in a)))
+        warnings = [l for l in lines if "re-baseline" in l]
+        assert len(warnings) == 1, "say it once, not once per poll"
+        assert "HIGH" in warnings[0]

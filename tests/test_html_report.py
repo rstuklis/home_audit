@@ -30,6 +30,25 @@ def render(mod, tmp_path, state, name="report.html"):
     return out.read_text(encoding="utf-8")
 
 
+def render_path(mod, tmp_path, state, name="report.html"):
+    """Generate a report into tmp_path and return its path, for stat() checks."""
+    out = tmp_path / name
+    return mod.generate_html_report(state, str(out))
+
+
+def row_or_text(text, heading):
+    """Return just the section whose <h2> is `heading`.
+
+    Asserting on the whole document would pass on a badge belonging to some
+    other section, which is exactly the confusion these tri-state tests exist
+    to rule out.
+    """
+    m = re.search(rf"<h2>{re.escape(heading)}</h2>(.*?)(?=<div class=\"section\"|\Z)",
+                  text, re.S)
+    assert m, f"no section headed {heading!r}"
+    return m.group(1)
+
+
 def row_cells(text, first_cell):
     """Return the <td> texts of the table row whose first cell is `first_cell`."""
     for tr in re.finditer(r"<tr[^>]*>(.*?)</tr>", text, re.S):
@@ -806,19 +825,183 @@ class TestSectionSelection:
         assert cells[1] == mod.PORTS_OF_INTEREST[23][0]
         assert cells[3] == mod.PORTS_OF_INTEREST[23][2]
 
-    def test_a_dhcp_server_ip_is_interpolated_without_escaping(self, mod, tmp_path):
-        # home_net_audit.py:1766 interpolates responders[0]['ip'] raw, unlike
-        # every other single-value interpolation in this function. Not xfailed:
-        # that IP comes from a recvfrom() peer address (line 741), so it is
-        # always a dotted quad and cannot carry markup. The payload has to go
-        # into the field itself for this to be a tripwire — asserting on a
-        # dotted quad would hold identically with or without _esc(), since
-        # escaping leaves "192.168.1.1" unchanged. This flips red the day
-        # someone adds _esc() there, which is exactly the point.
+    def test_a_dhcp_server_ip_is_escaped_like_every_other_value(self, mod, tmp_path):
+        """This was the one bare interpolation left in the function.
+
+        It was deliberate and defensible at the time: the IP comes from a
+        recvfrom() peer address, so a live run can only ever put a dotted quad
+        there. The tripwire that used to sit here pinned that reasoning.
+
+        It is escaped now because "where the value comes from" is not the whole
+        story once it has been through the baseline. generate_html_report is
+        called with state loaded from baseline.json, which is hand-editable
+        file on disk that this module elsewhere assumes an attacker may have
+        written — _split in diff_baseline is built entirely around surviving
+        exactly that. An argument that holds for the live path and not the
+        round-tripped one is not worth the single remaining exception.
+        """
         text = render(mod, tmp_path, {"dhcp": {"responders": [
             {"ip": PAYLOAD, "offered_ip": "192.168.1.87"}]}})
-        assert f"One DHCP server: {PAYLOAD}" in text
-        assert ESCAPED_PAYLOAD not in text
+        assert PAYLOAD not in text
+        assert ESCAPED_PAYLOAD in text
+
+
+class TestEveryCheckFamilyReachesTheFile:
+    """Six families were populated by the audit and rendered nowhere.
+
+    generate_html_report carried fifteen hand-written `if "<key>" in state`
+    sections while action_full_audit populated twenty-one keys. The evil-twin
+    check, IPv6 router advertisements, DNS interception, the trust store, the
+    router certificate and the upstream modem's ports appeared in none of them
+    — and four of those can return HIGH.
+
+    So a run with a rogue Router Advertisement and intercepted port 53 printed
+    two HIGH findings in the terminal and produced a file containing neither,
+    while the provenance footer still counted them among the findings resting
+    on "measurements this tool made itself". This file is the artefact people
+    forward to someone else; it was the one that lied.
+    """
+
+    @pytest.mark.parametrize("state,heading,expected", [
+        ({"evil_twin": {"ssid": "HomeNet", "risk": "HIGH", "bssids": ["aa:bb:cc:dd:ee:ff"],
+                        "unexpected": ["aa:bb:cc:dd:ee:ff"],
+                        "note": "advertised by a second AP"}},
+         "Evil Twin Check", "advertised by a second AP"),
+        ({"ipv6": {"risk": "HIGH", "routers": ["fe80::bad%en0"],
+                   "note": "a rogue Router Advertisement"}},
+         "IPv6 Router Advertisements", "rogue Router Advertisement"),
+        ({"interception": {"dns_interception": {"risk": "HIGH",
+                                                "note": "10.0.0.9 answered a DNS query"}}},
+         "Interception Checks", "answered a DNS query"),
+        ({"interception": {"trust_store": {"risk": "HIGH", "entries": ["Corporate Proxy Root CA"],
+                                           "note": "an added root certificate"}}},
+         "Interception Checks", "Corporate Proxy Root CA"),
+        ({"router_tls": {"present": True, "sha256": "a" * 64}},
+         "Router Certificate", "a" * 64),
+        ({"upstream_open_ports": [23]},
+         "Upstream Modem Ports", "faces the internet"),
+        ({"dsl": {"downstream_kbps": 17000, "upstream_kbps": 1000,
+                  "downstream_snr_db": 9, "upstream_snr_db": 8}},
+         "DSL Line", "17000"),
+    ], ids=["evil_twin", "ipv6", "dns_interception", "trust_store",
+            "router_tls", "upstream_ports", "dsl"])
+    def test_the_section_is_rendered(self, mod, tmp_path, state, heading, expected):
+        text = render(mod, tmp_path, state)
+        assert f"<h2>{heading}</h2>" in text
+        assert expected in text
+
+    def test_a_high_finding_is_badged_high_in_the_file(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"ipv6": {"risk": "HIGH", "routers": ["fe80::bad%en0"],
+                                               "note": "rogue RA"}})
+        assert "HIGH" in row_or_text(text, "IPv6 Router Advertisements")
+
+    def test_an_unrendered_risk_bearing_key_is_reported_not_dropped(self, mod, tmp_path):
+        # The guard that stops this recurring: a future check whose section
+        # nobody wrote shows up as a finding about the report itself.
+        text = render(mod, tmp_path, {"some_new_check": {"risk": "HIGH", "note": "x"}})
+        assert "<h2>Not Included In This Report</h2>" in text
+        assert "some_new_check" in text
+
+    def test_a_rendered_key_does_not_trigger_the_guard(self, mod, tmp_path):
+        text = render(mod, tmp_path, dict(RICH_STATE))
+        assert "<h2>Not Included In This Report</h2>" not in text
+
+    def test_bookkeeping_keys_do_not_trigger_the_guard(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"gateway": "192.168.1.1",
+                                      "carried_forward": ["devices"],
+                                      "measured_at": {"devices": "2026-08-01"}})
+        assert "<h2>Not Included In This Report</h2>" not in text
+
+    def test_an_ssid_in_an_unrendered_section_is_still_escaped(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"evil_twin": {"ssid": PAYLOAD, "risk": "HIGH",
+                                                    "bssids": [], "unexpected": [],
+                                                    "note": ""}})
+        assert PAYLOAD not in text
+        assert ESCAPED_PAYLOAD in text
+
+
+class TestArpSpoofTriState:
+    """`spoofing_suspected` is len(macs_seen) > 1 — False for two different things.
+
+    Stable and never-observed both came out False and both badged green OK. And
+    action_arp_spoof_check returns a bare {} when the gateway cannot be
+    determined, which callers store unconditionally, so `"arp_spoof" in state`
+    was true and a green OK rendered next to "Gateway: ?" for a check that never
+    ran. The terminal has always returned early before its [OK] line.
+    """
+
+    def test_multiple_macs_is_high(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"arp_spoof": {
+            "gateway": "192.168.1.1", "macs_seen": ["a", "b"],
+            "spoofing_suspected": True}})
+        assert "HIGH" in row_or_text(text, "ARP Spoofing Check")
+
+    def test_one_mac_seen_is_ok(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"arp_spoof": {
+            "gateway": "192.168.1.1", "macs_seen": ["a4:83:e7:01:01:01"],
+            "spoofing_suspected": False}})
+        section = row_or_text(text, "ARP Spoofing Check")
+        assert "OK" in section and "HIGH" not in section
+
+    def test_no_macs_at_all_is_review_not_ok(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"arp_spoof": {
+            "gateway": "192.168.1.1", "macs_seen": [], "spoofing_suspected": False}})
+        section = row_or_text(text, "ARP Spoofing Check")
+        assert "REVIEW" in section
+        assert "nothing was compared" in section
+
+    def test_an_empty_result_dict_is_review(self, mod, tmp_path):
+        # What action_arp_spoof_check returns when there is no gateway at all.
+        text = render(mod, tmp_path, {"arp_spoof": {}})
+        assert "REVIEW" in row_or_text(text, "ARP Spoofing Check")
+
+
+class TestRogueDhcpReportsWhetherItRan:
+    """Binding port 68 needs root, so this is the default non-sudo outcome.
+
+    action_rogue_dhcp returns {"responders": [], "error": ...} for the
+    permission and Local-Network-denial paths, and the report read only
+    `responders` — rendering "No DHCP responses captured." That is a statement
+    about the network, made by a check that never sent a packet. The "error"
+    key had two producers in the module and no consumer anywhere.
+    """
+
+    def test_a_check_that_could_not_run_says_so(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"dhcp": {
+            "responders": [], "error": "Needs root to bind port 68"}})
+        section = row_or_text(text, "Rogue DHCP Check")
+        assert "REVIEW" in section
+        assert "Needs root" in section
+        assert "No DHCP responses captured" not in section
+
+    def test_a_genuine_empty_result_still_reads_as_clean(self, mod, tmp_path):
+        text = render(mod, tmp_path, {"dhcp": {"responders": []}})
+        assert "No DHCP responses captured" in row_or_text(text, "Rogue DHCP Check")
+
+
+class TestReportFilePermissions:
+    """The same data the baseline is protected at 0600 for.
+
+    MACs, topology, hostnames, the SSID and which credential/port/method
+    combinations the router accepted — written 0644 into a 0755 directory,
+    readable by every account on the machine. _secure_dir was reachable only
+    from a baseline or history write, so `--html-report --no-save-baseline`
+    never called it at all.
+    """
+
+    def test_the_report_is_not_world_readable(self, mod, tmp_path):
+        path = render_path(mod, tmp_path, {"gateway": "192.168.1.1"})
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+    def test_the_reports_directory_is_not_world_readable(self, mod, tmp_path):
+        path = render_path(mod, tmp_path, {"gateway": "192.168.1.1"})
+        assert oct(os.stat(os.path.dirname(path)).st_mode & 0o777) == "0o700"
+
+    def test_an_existing_world_readable_report_is_tightened(self, mod, tmp_path):
+        path = render_path(mod, tmp_path, {"gateway": "192.168.1.1"})
+        os.chmod(path, 0o644)
+        mod.generate_html_report({"gateway": "192.168.1.1"}, output_path=path)
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
 
 
 class TestRiskBadgeColours:

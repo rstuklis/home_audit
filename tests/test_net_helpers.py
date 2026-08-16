@@ -27,6 +27,47 @@ FLAT = ipaddress.ip_network("192.168.0.0/16")
 NORMAL_MAC = "a4:83:e7:1b:9c:2d"
 
 
+class TestRunDecodesDefensively:
+    """`run` is the choke point nearly every check funnels through.
+
+    Some of what it reads carries bytes a stranger chose: the ARP table splices
+    in resolver-derived hostnames, and mDNSResponder passes high bytes through
+    unescaped. Strict UTF-8 raised UnicodeDecodeError — a ValueError, so not in
+    the (TimeoutExpired, FileNotFoundError, OSError) guard — out of `run`
+    itself. That killed a --monitor loop, which catches only KeyboardInterrupt,
+    and aborted a full audit partway, before the firewall, sharing, listening,
+    UPnP and DHCP checks and the baseline save had run.
+    """
+
+    def test_undecodable_output_does_not_raise(self, mod, monkeypatch):
+        def fake_run(cmd, capture_output=None, text=None, errors=None, timeout=None):
+            assert errors, "run() must pass an errors= policy to subprocess"
+            raw = b"? (192.168.1.1) at \xff\xfe:01 on en0\n"
+            class Out:
+                stdout = raw.decode("utf-8", errors)
+                stderr = ""
+            return Out()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        assert mod.run(["arp", "-an"]) != ""
+
+    def test_the_decoded_text_is_still_parsable(self, mod, monkeypatch):
+        # Replacement characters must not swallow the rest of the line: the
+        # good rows around a hostile one still have to reach the parser.
+        def fake_run(cmd, capture_output=None, text=None, errors=None, timeout=None):
+            raw = (b"\xff\xfe.local (192.168.1.1) at de:ad:be:ef:00:01 on en0\n"
+                   b"? (192.168.1.2) at aa:bb:cc:dd:ee:01 on en0\n")
+            class Out:
+                stdout = raw.decode("utf-8", errors)
+                stderr = ""
+            return Out()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        table = mod._read_arp_bsd()
+        assert table == {"192.168.1.1": "de:ad:be:ef:00:01",
+                         "192.168.1.2": "aa:bb:cc:dd:ee:01"}
+
+
 class TestIsRealHost:
     @pytest.mark.parametrize(
         "subnet, ip, mac, expected",
@@ -873,3 +914,66 @@ class TestPing:
         fake = install_fake_ping(monkeypatch, returncode=1)
         mod.ping("192.168.85.24")
         assert len(fake.commands) == 1
+
+
+class TestSweepSizeIsBounded:
+    """`--subnet 10.0.0.0/8` meant 16.7 million ping subprocesses.
+
+    discover_devices materialises list(subnet.hosts()) and hands every address
+    to a 50-worker pool running one ping each. It is self-inflicted and
+    interruptible, but it is also pointless: discovery resolves neighbours
+    through the ARP cache, which holds on-link entries only, so nothing beyond
+    the local prefix could be seen however long it ran.
+    """
+
+    def test_a_slash_eight_is_refused(self, mod, capsys):
+        result = mod.resolve_subnets(["10.0.0.0/8"], None, [], None)
+        assert result == []
+        out = capsys.readouterr().out
+        assert "10.0.0.0/8" in out
+        assert "on-link" in out
+
+    def test_a_normal_home_subnet_is_untouched(self, mod):
+        assert mod.resolve_subnets(["192.168.1.0/24"], None, [], None) == [
+            ipaddress.ip_network("192.168.1.0/24")
+        ]
+
+    def test_the_limit_admits_a_slash_twenty(self, mod):
+        # 4096 addresses — already far past any home network, and the point at
+        # which the sweep takes minutes rather than seconds.
+        assert mod.resolve_subnets(["10.1.0.0/20"], None, [], None) == [
+            ipaddress.ip_network("10.1.0.0/20")
+        ]
+
+    def test_an_oversized_subnet_does_not_take_the_valid_ones_with_it(self, mod):
+        result = mod.resolve_subnets(
+            ["192.168.1.0/24", "10.0.0.0/8", "192.168.2.0/24"], None, [], None)
+        assert result == [ipaddress.ip_network("192.168.1.0/24"),
+                          ipaddress.ip_network("192.168.2.0/24")]
+
+
+class TestIsOnlink:
+    """Guards anything that must not leave the LAN.
+
+    Off-link is not a connectivity question here: the packet would very likely
+    be delivered, via the default route, to a device belonging to someone else.
+    The DSL stats request carries the modem password in a plain http query
+    string, so "where does this actually go" is the whole question.
+    """
+
+    IFACES = [("en0", "192.168.87.24", ipaddress.ip_network("192.168.87.0/24"))]
+
+    def test_an_address_on_an_interface_subnet_is_onlink(self, mod):
+        assert mod.is_onlink("192.168.87.1", self.IFACES) is True
+
+    def test_an_address_on_another_network_is_not(self, mod):
+        assert mod.is_onlink("192.168.1.1", self.IFACES) is False
+
+    def test_no_interfaces_at_all_is_not_permission(self, mod):
+        # Unknown must not read as yes: the whole point is the case where
+        # nobody checked.
+        assert mod.is_onlink("192.168.1.1", []) is False
+        assert mod.is_onlink("192.168.1.1", None) is False
+
+    def test_junk_is_not_onlink(self, mod):
+        assert mod.is_onlink("not-an-address", self.IFACES) is False
