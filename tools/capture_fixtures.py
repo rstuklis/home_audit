@@ -39,10 +39,14 @@ COMMANDS = {
     "netstat_rn":               ["netstat", "-rn"],
     "ifconfig_a":               ["ifconfig", "-a"],
     "scutil_dns":               ["scutil", "--dns"],
-    # `arp -a`, not `-an`: the audit resolves names here, so a capture with -n
-    # would document a command nothing runs. It costs a redaction step — the
-    # name column is then full of the LAN's device names.
-    "arp_a_typical":            ["arp", "-a"],
+    # `arp -an`, not `-a`. This flipped back: the audit used to resolve names
+    # here, and the capture followed it. Then the resolved name turned out to
+    # be attacker-chosen text sitting in the column *before* the MAC, which a
+    # search for a MAC-shaped token found first — so the audit stopped
+    # resolving, and the capture follows again. Keep the two in step; the test
+    # that compares this table against the audit's own source is what noticed
+    # both times.
+    "arp_a_typical":            ["arp", "-an"],
     "ndp_a":                    ["ndp", "-an"],
     "ndp_r":                    ["ndp", "-rn"],
     "lsof_tcp_listen":          ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
@@ -431,12 +435,18 @@ class Redactor:
                       text, flags=re.MULTILINE)
 
     def arp(self, text):
-        """Replace the name column of `arp -a`.
+        """Replace the name column of an ARP table.
 
         "living-room-tv.lan" and "rebeccas-iphone" name the household's
         devices, and the second has no suffix for the generic hostname pattern
         to key off. The parser reads the address from the parentheses and
         ignores this column entirely, so nothing is lost.
+
+        The audit now captures with `-n`, so this column should arrive as `?`
+        and this step should find nothing to do. It stays because it costs
+        nothing and an unresolved column is not something to *rely* on: a
+        capture taken by hand, or on a system that resolves anyway, would
+        otherwise carry the household's device names into a committed fixture.
         """
         def sub(m):
             name = m.group("name")

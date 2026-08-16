@@ -15,6 +15,8 @@ import socket
 import urllib.error
 import urllib.request
 
+import pytest
+
 
 DESC_XML = """<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -57,17 +59,25 @@ class _FakeSsdpSocket:
     recvfrom yields the queued reply once, then raises socket.timeout so the
     discovery loop terminates exactly as it would against a real router that
     answered once.
+
+    `replies` may instead be a list of (text, addr) pairs, which is how the
+    several-responders case is driven — SSDP is a broadcast question and the
+    gateway is not necessarily the one that answers first.
     """
     def __init__(self, reply):
-        self._reply = reply
-        self._sent = False
+        if reply is None:
+            self._queue = []
+        elif isinstance(reply, str):
+            self._queue = [(reply, ("192.168.1.1", 1900))]
+        else:
+            self._queue = list(reply)
     def settimeout(self, t): pass
     def sendto(self, data, addr): pass
     def recvfrom(self, n):
-        if self._reply is None or self._sent:
+        if not self._queue:
             raise socket.timeout()
-        self._sent = True
-        return self._reply.encode(), ("192.168.1.1", 1900)
+        text, addr = self._queue.pop(0)
+        return text.encode(), addr
     def close(self): pass
 
 
@@ -118,6 +128,90 @@ class TestDiscoveryFailure:
         mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
         assert mappings == []
         assert "control URL" in err
+
+
+SSDP_ATTACKER = ("HTTP/1.1 200 OK\r\n"
+                 "LOCATION: http://192.168.1.50:5000/desc.xml\r\n"
+                 "ST: urn:schemas-upnp-org:service:WANIPConnection:1\r\n\r\n")
+
+
+class TestOnlyTheGatewayIsBelieved:
+    """SSDP is a broadcast question; anyone on the link may answer it.
+
+    The loop used to discard the sender address and take the first LOCATION it
+    saw. MX: 2 tells a conforming router to *wait* before replying, so an
+    attacker who answers instantly wins the race by design — and then serves a
+    description naming themselves. Their empty mapping list was reported as the
+    gateway's, under an evidence label reading "the gateway's own list", while
+    the real router forwarded a port to them.
+    """
+
+    def test_a_faster_stranger_does_not_replace_the_gateway(self, mod, monkeypatch):
+        fetched = []
+
+        def http(url, req):
+            fetched.append(url)
+            return DESC_XML
+
+        _wire(monkeypatch, mod, [
+            (SSDP_ATTACKER, ("192.168.1.50", 1900)),     # answers first
+            (SSDP_OK, ("192.168.1.1", 1900)),            # the actual gateway
+        ], http)
+        mod.get_upnp_port_mappings("192.168.1.1")
+        assert fetched, "the gateway's own reply must still be followed"
+        assert not any("192.168.1.50" in u for u in fetched), \
+            "a non-gateway responder must never be fetched"
+
+    def test_a_lone_stranger_is_reported_as_no_upnp_device(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, [(SSDP_ATTACKER, ("192.168.1.50", 1900))],
+              lambda u, r: pytest.fail(f"must not fetch {u}"))
+        mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
+        assert mappings == []
+        assert "No UPnP device" in err
+
+
+class TestUrlsFromTheWireAreConstrained:
+    """Both URLs here are read out of a document a LAN device wrote.
+
+    Unchecked, LOCATION could name any scheme urllib's default opener
+    understands — file: and ftp: among them — and an absolute <controlURL>
+    could aim a hundred SOAP POSTs at any host on the internet. Neither is a
+    UPnP feature; both were reachable by answering one broadcast.
+    """
+
+    @pytest.mark.parametrize("location", [
+        "file:///etc/passwd",
+        "ftp://192.168.1.1/desc.xml",
+        "http://evil.example/desc.xml",
+    ], ids=["file", "ftp", "off-host"])
+    def test_a_location_that_is_not_http_on_the_gateway_is_not_followed(
+            self, mod, monkeypatch, location):
+        reply = ("HTTP/1.1 200 OK\r\n"
+                 f"LOCATION: {location}\r\n\r\n")
+        _wire(monkeypatch, mod, [(reply, ("192.168.1.1", 1900))],
+              lambda u, r: pytest.fail(f"must not fetch {u}"))
+        mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
+        assert mappings == []
+        assert "not followed" in err.lower()
+
+    def test_an_absolute_control_url_off_the_gateway_is_not_followed(self, mod, monkeypatch):
+        desc = ("<root><service>"
+                "<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>"
+                "<controlURL>http://evil.example/ctl</controlURL>"
+                "</service></root>")
+        posted = []
+
+        def http(url, req):
+            if url.endswith("desc.xml"):
+                return desc
+            posted.append(url)
+            return ""
+
+        _wire(monkeypatch, mod, SSDP_OK, http)
+        mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
+        assert posted == [], "no SOAP request may leave for a host we were told about"
+        assert mappings == []
+        assert "not followed" in err.lower()
 
 
 class TestMappingParse:

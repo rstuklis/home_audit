@@ -268,3 +268,186 @@ class TestAnEmptyResultIsNotAutomaticallyAPass:
         # A baseline written before coverage existed still has to render.
         assert mod.describe_credential_coverage(None)
         assert mod.describe_credential_coverage({})
+
+
+class TestATruncatedSweepIsNotAPass:
+    """A sweep that stopped early says nothing about the router's password.
+
+    probe_default_credentials returns (successes, lockout_note, coverage), and
+    action_default_creds returned only {gateway, successes, coverage} — so
+    `lockout_note` never crossed the boundary. The terminal hid the coverage
+    line behind `elif not lockout_note`, and the HTML report called
+    credential_coverage_verdict(coverage) unconditionally, whose first live
+    branch was `if attempts:`. A router that starts rate-limiting after eight
+    guesses therefore rendered a green "8 credential pair(s) submitted on
+    port(s) 80 and every one was refused", and the sealed baseline kept saying
+    it — with no mention that the sweep aborted, that most of DEFAULT_CREDS was
+    never tried, or that the admin account may now be locked.
+    """
+
+    def test_the_abort_is_recorded_inside_coverage(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, lambda req: (429, ""))
+        _s, note, coverage = mod.probe_default_credentials("192.168.1.1")
+        assert note is not None
+        assert coverage["aborted"] == note, \
+            "the report only ever sees coverage, so the abort has to live there"
+
+    def test_a_truncated_sweep_is_not_badged_ok(self, mod):
+        line = mod.describe_credential_coverage(
+            {"attempts": 8, "open": [80], "blocked": [], "closed": [],
+             "aborted": "router signalled lockout/rate-limit (HTTP 429)"})
+        assert "[OK" not in line
+        assert "[REVIEW" in line
+        assert "stopped early" in line
+
+    def test_the_message_warns_about_the_account_being_locked(self, mod):
+        _risk, message = mod.credential_coverage_verdict(
+            {"attempts": 8, "open": [80], "aborted": "rate-limited"})
+        assert "locked" in message
+        assert "never tried" in message
+
+    def test_the_terminal_still_prints_the_verdict_after_a_lockout(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, lambda req: (429, ""))
+        monkeypatch.setattr(mod, "get_default_gateway", lambda: "192.168.1.1")
+        lines = []
+        monkeypatch.setattr("builtins.print",
+                            lambda *a, **k: lines.append(" ".join(map(str, a))))
+        mod.action_default_creds()
+        printed = "\n".join(lines)
+        assert "[STOPPED]" in printed
+        assert "stopped early" in printed, \
+            "the coverage verdict used to be suppressed on exactly this path"
+
+    def test_an_uncompleted_sweep_still_reports_ok_when_it_finished(self, mod):
+        # The clean case must stay clean, or the fix is just noise.
+        line = mod.describe_credential_coverage(
+            {"attempts": 8, "open": [80], "blocked": [], "closed": [],
+             "aborted": None})
+        assert "[OK" in line
+
+
+class TestADroppedConnectionIsNotARefusal:
+    """`attempts` was incremented before the request, not after.
+
+    _fetch returns (None, "") from a bare `except Exception`, so a router that
+    silently drops connections after repeated failures — no 429, no lockout
+    phrase, nothing for LockoutError to catch — produced a counted "attempt"
+    that was never submitted and never refused. The verdict then reported those
+    as credentials the router had rejected.
+    """
+
+    def test_a_dropped_request_is_not_counted_as_an_attempt(self, mod, monkeypatch):
+        _wire(monkeypatch, mod,
+              lambda req: urllib.error.URLError("connection reset"))
+        _s, _n, coverage = mod.probe_default_credentials("192.168.1.1")
+        assert coverage["attempts"] == 0
+        assert coverage["unanswered"] > 0
+
+    def test_a_router_that_only_drops_is_not_badged_ok(self, mod, monkeypatch):
+        _wire(monkeypatch, mod,
+              lambda req: urllib.error.URLError("connection reset"))
+        _s, _n, coverage = mod.probe_default_credentials("192.168.1.1")
+        line = mod.describe_credential_coverage(coverage)
+        assert "[OK" not in line
+        assert "no response at all" in line
+
+    def test_a_basic_auth_challenge_that_then_drops_is_not_an_attempt(self, mod, monkeypatch):
+        state = {"n": 0}
+
+        def handler(req):
+            state["n"] += 1
+            if req.get_header("Authorization") is None:
+                return (401, "")
+            raise urllib.error.URLError("connection reset")
+
+        _wire(monkeypatch, mod, handler)
+        _s, _n, coverage = mod.probe_default_credentials("192.168.1.1")
+        assert coverage["attempts"] == 0
+
+
+class TestTheSweepDoesNotFanOutPerCredential:
+    """10 endpoints x 4 payloads x 16 pairs = 640 POSTs per port.
+
+    Times four open ports, 2560 — while the menu announced "Testing 16 common
+    credential pairs", which is the number the user consented to. The
+    time.sleep(0.05) calls paced only the outer loop, so 40 POSTs per pair went
+    back to back, and a router that locks silently is not caught by
+    LockoutError at all. The first pair now discovers which (endpoint, payload)
+    shapes this router answers; the rest reuse only those.
+    """
+
+    def test_the_request_count_does_not_scale_with_the_credential_list(
+            self, mod, monkeypatch):
+        posts = []
+
+        def handler(req):
+            if _is_post(req):
+                posts.append(req.full_url)
+            return (200, LOGIN_PAGE)
+
+        _wire(monkeypatch, mod, handler)
+        mod.probe_default_credentials("192.168.1.1")
+        # Without the shape cache this was len(DEFAULT_CREDS) * 40.
+        assert len(posts) < len(mod.DEFAULT_CREDS) * 10, \
+            f"{len(posts)} POSTs for {len(mod.DEFAULT_CREDS)} credential pairs"
+
+    def test_every_credential_pair_is_still_submitted(self, mod, monkeypatch):
+        bodies = []
+
+        def handler(req):
+            if _is_post(req):
+                bodies.append(req.data.decode())
+            return (200, LOGIN_PAGE)
+
+        _wire(monkeypatch, mod, handler)
+        mod.probe_default_credentials("192.168.1.1")
+        joined = "\n".join(bodies)
+        for user, _pwd in mod.DEFAULT_CREDS:
+            assert user in joined, f"{user} was never tried"
+
+    def test_a_working_login_is_still_found_after_the_shape_is_cached(
+            self, mod, monkeypatch):
+        # The last pair in the list must still be able to succeed.
+        last_user, last_pwd = mod.DEFAULT_CREDS[-1]
+
+        def handler(req):
+            if not _is_post(req):
+                return (200, LOGIN_PAGE)
+            body = req.data.decode()
+            if urllib.parse.quote(last_user) in body:
+                return (200, ADMIN_PAGE)
+            return (200, LOGIN_PAGE)
+
+        _wire(monkeypatch, mod, handler)
+        successes, _n, _c = mod.probe_default_credentials("192.168.1.1")
+        assert successes, "the cached shape must still be able to succeed"
+        assert successes[0][0] == last_user
+
+
+class TestTheArpPollIsGuarded:
+    """The only subprocess call site in the file with no timeout and no guard.
+
+    A Linux observer with iproute2 but no iputils raised FileNotFoundError
+    straight out of action_full_audit, taking roughly nine later checks, the
+    baseline save and the report with it. ping() also picks the flag that means
+    "give up quickly" per platform — -t is a TTL on Linux, so this loop was
+    sending TTL-1 probes there and seeing nothing beyond the first hop.
+    """
+
+    def test_the_poll_goes_through_ping(self, mod, monkeypatch):
+        pinged = []
+        monkeypatch.setattr(mod, "ping", lambda ip: pinged.append(ip))
+        monkeypatch.setattr(mod, "read_arp_table", lambda: {"192.168.1.1": "aa:bb:cc:dd:ee:ff"})
+        monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+        mod.check_arp_spoofing("192.168.1.1", polls=3, interval=0)
+        assert pinged == ["192.168.1.1"] * 3
+
+    def test_a_missing_ping_binary_does_not_abort_the_audit(self, mod, monkeypatch):
+        def no_ping(cmd, **kw):
+            raise FileNotFoundError("ping")
+        monkeypatch.setattr(mod.subprocess, "run", no_ping)
+        monkeypatch.setattr(mod, "read_arp_table", lambda: {})
+        monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+        result = mod.check_arp_spoofing("192.168.1.1", polls=2, interval=0)
+        assert result["macs_seen"] == []
+        assert result["spoofing_suspected"] is False

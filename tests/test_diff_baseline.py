@@ -410,6 +410,90 @@ class TestNoChangeIsSilent:
         assert mod.diff_baseline(empty, dict(empty)) == []
 
 
+class TestTheGatewayAndItsMacAreCompared:
+    """The audit was blind to the change it most needs to see.
+
+    Both `gateway` and `arp_spoof` are sealed into every baseline, and neither
+    was ever diffed. That mattered because check_arp_spoofing's verdict is
+    `len(macs_seen) > 1` across five polls in about six seconds: a poisoner who
+    is simply already in place yields exactly one MAC and earns "[OK] MAC
+    address stable across all polls". So a full audit run against an actively
+    poisoned network printed that line, then "No changes since baseline".
+
+    The monitor has had this comparison since it was written. The audit is the
+    entry point most people actually run.
+    """
+
+    def test_a_stable_but_different_gateway_mac_is_reported(self, mod):
+        old = {"arp_spoof": {"macs_seen": [LAPTOP], "spoofing_suspected": False}}
+        new = {"arp_spoof": {"macs_seen": [INTRUDER], "spoofing_suspected": False}}
+        notes = mod.diff_baseline(old, new)
+        assert any("Gateway MAC CHANGED" in n for n in notes)
+        assert any(INTRUDER in n for n in notes)
+
+    def test_an_unchanged_gateway_mac_is_silent(self, mod):
+        state = {"arp_spoof": {"macs_seen": [LAPTOP], "spoofing_suspected": False}}
+        assert mod.diff_baseline(state, dict(state)) == []
+
+    def test_a_changed_gateway_address_is_reported(self, mod):
+        notes = mod.diff_baseline({"gateway": "192.168.1.1"},
+                                  {"gateway": "192.168.1.99"})
+        assert any("Default gateway CHANGED" in n for n in notes)
+
+    def test_a_run_that_did_not_measure_the_mac_is_not_a_change(self, mod):
+        # An unmeasured side must never read as a difference — the same rule the
+        # port comparison follows, for the same reason.
+        old = {"arp_spoof": {"macs_seen": [LAPTOP]}}
+        assert mod.diff_baseline(old, {"arp_spoof": {}}) == []
+        assert mod.diff_baseline({"arp_spoof": {}}, old) == []
+
+    def test_a_missing_gateway_on_either_side_is_not_a_change(self, mod):
+        assert mod.diff_baseline({"gateway": "192.168.1.1"}, {}) == []
+        assert mod.diff_baseline({}, {"gateway": "192.168.1.1"}) == []
+
+
+class TestRouterCertificateIsCarriedForward:
+    """check_tls returns a well-formed dict when the handshake fails.
+
+    {"present": False, "sha256": None} passed the "is not None" test as a
+    measurement and overwrote a real fingerprint. diff_baseline then skips the
+    certificate comparison — correctly, it refuses to compare against an
+    unknown — so a certificate that changed during the outage was never
+    reported, and the next successful run re-established a baseline from the
+    new one. The same shape as the ten-device incident, on a different key.
+    """
+
+    GOOD = {"present": True, "sha256": "a" * 64, "cert_bytes": 900}
+    FAILED = {"present": False, "sha256": None}
+
+    def test_a_failed_handshake_does_not_overwrite_a_fingerprint(self, mod):
+        merged = mod.carry_forward_unmeasured(
+            {"router_tls": self.FAILED}, previous={"router_tls": self.GOOD})
+        assert merged["router_tls"]["sha256"] == "a" * 64
+        assert "router_tls" in merged["carried_forward"]
+
+    def test_a_real_reading_replaces_the_carried_one(self, mod):
+        fresh = {"present": True, "sha256": "b" * 64, "cert_bytes": 900}
+        merged = mod.carry_forward_unmeasured(
+            {"router_tls": fresh}, previous={"router_tls": self.GOOD})
+        assert merged["router_tls"]["sha256"] == "b" * 64
+        assert "router_tls" not in merged.get("carried_forward", [])
+
+    def test_a_change_across_a_failed_run_is_still_caught(self, mod):
+        # The point of carrying: the comparison survives the outage.
+        old = {"router_tls": self.GOOD}
+        blocked = mod.carry_forward_unmeasured({"router_tls": self.FAILED},
+                                               previous=old)
+        recovered = {"router_tls": {"present": True, "sha256": "c" * 64}}
+        notes = mod.diff_baseline(blocked, recovered)
+        assert any("certificate CHANGED" in n for n in notes)
+
+    def test_nothing_is_carried_when_there_was_never_a_reading(self, mod):
+        merged = mod.carry_forward_unmeasured({"router_tls": self.FAILED},
+                                              previous={"router_tls": self.FAILED})
+        assert merged.get("carried_forward") in (None, [])
+
+
 class TestCombinedChanges:
     def test_each_simultaneous_change_gets_its_own_note(self, mod):
         old = {

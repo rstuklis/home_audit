@@ -53,7 +53,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -93,8 +93,37 @@ RESOLV_CONF_FILE = "/etc/resolv.conf"
 
 # Baseline record format. 1 = the original bare state dict with no integrity
 # data at all; 2 = the sealed, chained record written by save_baseline below.
+# What lookup_vendor returns instead of a vendor for a randomised address.
+# A constant because it is not a name: the display code has to be able to
+# tell it apart from one, or a device the tool could not identify is
+# presented as identified.
+PRIVATE_MAC_VENDOR = "(randomized/private MAC)"
+
 BASELINE_FORMAT = 2
 KDF_ITERATIONS = 200_000
+# Upper bound on the iteration count read back out of a baseline. The number in
+# the file is whatever the file says, and PBKDF2 does exactly as much work as it
+# is asked to: 10**12 iterations is not a malformed value that raises, it is a
+# hang, in the one function whose job is to say the baseline was tampered with.
+KDF_ITERATIONS_MAX = 10_000_000
+
+# The largest subnet this tool will sweep. A /20 is 4096 addresses, which is
+# already far past anything a home network uses and takes minutes; a /8 is 16.7
+# million pings, one subprocess each.
+MAX_SWEEP_ADDRESSES = 4096
+
+# Bounds on the default-credential sweep's fan-out.
+#
+# It used to be 10 endpoints x 4 payloads x 16 credential pairs = 640 POSTs per
+# port, 2560 across four open ports, against a menu prompt that said "Testing 16
+# common credential pairs". Those are real login attempts on the user's own
+# router, and a router that locks silently — no 429, no lockout phrase — is not
+# caught by LockoutError at all, so the volume itself was the hazard.
+#
+# Endpoints carrying an actual password field are tried first; past the first
+# few, an endpoint is being POSTed to on no evidence beyond "it returned 200".
+MAX_LOGIN_ENDPOINTS = 3
+MAX_LOGIN_SHAPES = 3
 
 # Environment variable holding the baseline passphrase for unattended runs.
 # Less safe than being prompted — it is readable by anything in the process's
@@ -109,7 +138,14 @@ SINK_TOKEN_ENV = "HOME_NET_AUDIT_SINK_TOKEN"
 # Where monitor-mode alerts go. Separate from the receipt sink on purpose: a
 # receipt is routine bookkeeping, an alert is something a person needs to see,
 # and they usually belong on different channels.
+#
+# Which is exactly why the alert channel needs its own credential. send_alert
+# used to fall back to SINK_TOKEN_ENV, so pointing ALERT_ENV at a chat webhook
+# logged the append-only collector's bearer token at a third party on every
+# alert — the token whose whole purpose is that the audited host cannot use it
+# to rewrite what it already published.
 ALERT_ENV = "HOME_NET_AUDIT_ALERT"
+ALERT_TOKEN_ENV = "HOME_NET_AUDIT_ALERT_TOKEN"
 MONITOR_INTERVAL = 60
 
 # Default named networks. Stored/overridden in ~/.home_net_audit/networks.json.
@@ -189,9 +225,17 @@ def run(cmd, timeout=10, merge_stderr=False):
     answer there — `security dump-trust-settings` prefixes its result with
     SecTrustSettingsCopyCertificates:, which is error-style, and reading only
     stdout would turn a clean trust store into "could not read".
+
+    errors="replace" is load-bearing, not defensive dressing. Some of this
+    output carries bytes a stranger chose: `arp -a` splices in resolver-derived
+    hostnames, and mDNSResponder passes high bytes through unescaped. Strict
+    UTF-8 would raise UnicodeDecodeError — a ValueError, so not caught below —
+    out of the one function nearly every check funnels through, killing a
+    monitor loop or aborting an audit before the later checks ever ran.
     """
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             errors="replace", timeout=timeout)
         if merge_stderr:
             return (out.stdout or "") + (out.stderr or "")
         return out.stdout
@@ -414,19 +458,27 @@ def read_arp_table():
 
 
 def _read_arp_bsd():
-    out = run(["arp", "-a"])
+    # -n keeps arp(8) from resolving names, and the pattern below reads the MAC
+    # only from the "at <mac>" column. Both halves matter: with resolution on,
+    # the hostname is column one, and a search for a MAC-shaped token anywhere
+    # in the line finds *it* first. Anyone able to publish a PTR or mDNS name
+    # could therefore choose what this function reported as a neighbour's MAC —
+    # naming themselves after the router's real MAC pins gateway_mac to the
+    # pre-poison value forever, so the change is never detected. A forged name
+    # containing "(a.b.c.d)" refiled the row under another IP as well.
+    out = run(["arp", "-an"])
     table = {}
     for line in out.splitlines():
-        ip_m = re.search(r"\(([\d.]+)\)", line)
-        mac_m = re.search(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", line)
-        if ip_m and mac_m:
+        row = re.search(r"\(([\d.]+)\)\s+at\s+"
+                        r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})", line)
+        if row:
             # Validate/normalise the IP so a malformed capture (e.g. leading
             # zeros) can't later crash sorted(..., key=ipaddress.ip_address).
             try:
-                ip = str(ipaddress.ip_address(ip_m.group(1)))
+                ip = str(ipaddress.ip_address(row.group(1)))
             except ValueError:
                 continue
-            raw = mac_m.group(1).split(":")
+            raw = row.group(2).split(":")
             mac = ":".join(f"{int(x, 16):02x}" for x in raw)
             table[ip] = mac
     return table
@@ -854,7 +906,7 @@ def lookup_vendor(mac):
     if mac == "unknown":
         return ""
     if is_randomized_mac(mac):
-        return "(randomized/private MAC)"
+        return PRIVATE_MAC_VENDOR
     prefix = ":".join(mac.split(":")[:3])
     try:
         req = urllib.request.Request("https://api.macvendors.com/" + mac,
@@ -946,18 +998,42 @@ def probe_dns_interception(target="192.0.2.1", timeout=2):
     device on the path is transparently answering port 53 regardless of what
     the resolver configuration says, which is exactly the case reading
     `scutil --dns` cannot reveal.
+
+    Three states, not two. A send that never left the machine is not evidence
+    that nothing is intercepting — it is evidence of nothing at all, and used
+    to be reported as the clean result. Every sibling probe here keeps that
+    distinction (probe_port, check_rogue_dhcp, the SSDP sweep); this one now
+    does too.
+
+    The reply is checked before it is believed. connect() makes the kernel drop
+    datagrams from anyone but the target, and the transaction id is random per
+    call and must match: otherwise a stray or sprayed packet arriving on the
+    ephemeral port raised a HIGH naming a responder of the sender's choosing.
     """
+    qid = int.from_bytes(os.urandom(2), "big")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
-        sock.sendto(build_dns_query(), (target, 53))
-        data, addr = sock.recvfrom(512)
-    except (socket.timeout, OSError):
-        return {"intercepted": False, "responder": None, "risk": "OK",
-                "note": f"No answer from {target}, which is the correct result — "
-                        "port 53 is not being transparently redirected."}
+        try:
+            sock.connect((target, 53))
+            sock.send(build_dns_query(qid=qid))
+        except OSError as exc:
+            return {"intercepted": None, "responder": None, "risk": "REVIEW",
+                    "note": f"The query to {target} could not be sent ({exc.strerror or exc}), "
+                            "so nothing was learned either way. This check has not run."}
+        try:
+            data, addr = sock.recvfrom(512)
+        except (socket.timeout, OSError):
+            return {"intercepted": False, "responder": None, "risk": "OK",
+                    "note": f"No answer from {target}, which is the correct result — "
+                            "port 53 is not being transparently redirected."}
     finally:
         sock.close()
+
+    if len(data) < 12 or int.from_bytes(data[:2], "big") != qid:
+        return {"intercepted": False, "responder": None, "risk": "OK",
+                "note": f"No valid DNS answer from {target}, which is the correct "
+                        "result — port 53 is not being transparently redirected."}
 
     return {"intercepted": True, "responder": addr[0], "risk": "HIGH",
             "note": f"{addr[0]} answered a DNS query addressed to {target}, an "
@@ -1054,7 +1130,15 @@ def _write_json_atomic(path, obj, mode=0o600):
 
 
 def read_history():
-    """Return the append-only chain of past baseline seals, oldest first."""
+    """Return the append-only chain of past baseline seals, oldest first.
+
+    Every consumer indexes into these entries as dicts, so anything else on a
+    line is dropped here rather than at each call site. `json.loads` returns a
+    perfectly valid `0` or `null` for a line reading "0" or "null", and that
+    reached verify_baseline as an AttributeError and save_baseline as a
+    TypeError — a one-byte edit anyone who can write this file could make, and
+    the crash lands exactly where the tamper warning would have printed.
+    """
     entries = []
     try:
         with open(HISTORY_FILE) as f:
@@ -1063,10 +1147,14 @@ def read_history():
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-    except FileNotFoundError:
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except OSError:
+        # Not just FileNotFoundError: an unreadable history is "no chain I can
+        # see", the same as an absent one, and must not abort the audit.
         return []
     return entries
 
@@ -1114,14 +1202,32 @@ def resolve_passphrase(prompt=False):
 # corruption the port keys were added to prevent, in the one section where a
 # false alarm is loudest. --no-discovery says "do not spend the time looking",
 # never "there is nothing there".
+#
+# router_tls belongs here for the same reason and was missing. check_tls returns
+# {"present": False, "sha256": None} when the handshake fails — a dict, so it
+# passed the "is not None" test as a measurement and wrote itself over a real
+# fingerprint. diff_baseline then skips the certificate comparison, because it
+# correctly refuses to compare against an unknown, so a router certificate that
+# changed during the outage was never reported: not on that run, and not after
+# the next successful one re-established a baseline from the new cert.
 CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports",
-                      "devices", "scanned_subnets")
+                      "devices", "scanned_subnets", "router_tls")
 
 # The two keys that record one measurement between them: what was found, and
 # where it was possible to find anything. They are measured together or not at
 # all, so they carry together — pairing a fresh device list with a stale
 # coverage list would state that this run swept ground it never touched.
 SWEEP_KEYS = ("devices", "scanned_subnets")
+
+
+def tls_measured(state):
+    """Whether `state` holds a real certificate reading.
+
+    The presence of the key says nothing: a failed handshake produces a
+    perfectly well-formed dict whose sha256 is None. The fingerprint is the
+    measurement, so its absence is what "not measured" means here.
+    """
+    return (state.get("router_tls") or {}).get("sha256") is not None
 
 
 def swept_anywhere(state):
@@ -1195,6 +1301,8 @@ def carry_forward_unmeasured(state, previous=None):
         # permanent, because the wiped list becomes the new reference point.
         if key in SWEEP_KEYS:
             measured = swept_anywhere(state)
+        elif key == "router_tls":
+            measured = tls_measured(state)
         else:
             measured = state.get(key) is not None
         if measured:
@@ -1203,7 +1311,8 @@ def carry_forward_unmeasured(state, previous=None):
             # A run that swept but recorded no coverage list predates
             # scanned_subnets. Leaving the key absent is right: carrying the
             # previous run's coverage would attach it to this run's devices.
-        elif previous.get(key) is not None:
+        elif (tls_measured(previous) if key == "router_tls"
+              else previous.get(key) is not None):
             carried.append(key)
             # The origin of the reading, not the run that inherited it. Falling
             # back to the previous state's own timestamp covers a baseline saved
@@ -1270,12 +1379,22 @@ def save_baseline(state, passphrase=None):
 
 
 def load_baseline_record():
-    """Return the raw baseline record, whatever format it is in, or None."""
+    """Return the raw baseline record, whatever format it is in, or None.
+
+    None means "nothing usable here", which is all most callers need.
+    verify_baseline needs the distinction between never-written and
+    unreadable, and gets it from baseline_file_exists() below.
+    """
     try:
         with open(BASELINE_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
+
+
+def baseline_file_exists():
+    """Whether a baseline file is present, regardless of whether it parses."""
+    return os.path.exists(BASELINE_FILE)
 
 
 def load_baseline(passphrase=None):
@@ -1298,19 +1417,49 @@ def verify_baseline(passphrase=None):
     """Check the baseline's seal and its position in the chain.
 
     Returns {status, keyed, detail}. Statuses:
-      absent        no baseline saved yet
-      legacy        pre-integrity baseline; nothing to verify
-      ok            seal recomputes and the chain agrees
-      unverifiable  sealed with a passphrase that was not supplied
-      modified      the seal does not match the contents
-      rolled_back   valid record, but older than the chain has already recorded
-      chain_missing the record claims history that is not there
+      absent         no baseline saved yet, and no chain either
+      legacy         pre-integrity baseline; nothing to verify
+      record_missing the chain records runs but the baseline is gone or unreadable
+      downgraded     the chain records sealed runs but this record carries no seal
+      ok             seal recomputes and the chain agrees
+      unverifiable   sealed with a passphrase that was not supplied
+      modified       the seal does not match the contents
+      rolled_back    valid record, but older than the chain has already recorded
+      chain_missing  the record claims history that is not there
+
+    The chain is read *first*, and that ordering is the point. Both cheap
+    attacks on this file work by making the record stop looking like a sealed
+    record at all — delete it, truncate it to "{", or drop the "format" key —
+    and every one of those used to short-circuit to `absent` or `legacy` before
+    the chain was ever consulted. Both statuses are benign-looking, both let
+    the run continue, and the unconditional save that follows then wrote a
+    fresh seal chained onto the attacker's record. The chain is the thing they
+    cannot forge without the passphrase, so it decides what the record's shape
+    means: with no chain, an unsealed baseline is history; with one, it is a
+    downgrade.
     """
+    history = read_history()
     record = load_baseline_record()
+
     if record is None:
+        if history:
+            last = history[-1]
+            how = "cannot be read" if baseline_file_exists() else "is gone"
+            return {"status": "record_missing", "keyed": False,
+                    "detail": f"The seal chain records {len(history)} run(s), the most "
+                              f"recent numbered {last.get('seq')}, but the baseline itself "
+                              f"{how}. Removing or corrupting it is how a changed network "
+                              "is made to look like a first run."}
         return {"status": "absent", "keyed": False,
                 "detail": "No baseline saved yet."}
+
     if not isinstance(record, dict) or record.get("format") != BASELINE_FORMAT:
+        if history:
+            return {"status": "downgraded", "keyed": False,
+                    "detail": f"The baseline carries no format-{BASELINE_FORMAT} seal, but "
+                              f"the chain records {len(history)} sealed run(s). A genuine "
+                              "legacy baseline predates the chain and cannot coexist with "
+                              "one, so this record has been replaced with an unsealed one."}
         return {"status": "legacy", "keyed": False,
                 "detail": "Baseline predates integrity checking and is unauthenticated. "
                           "Re-save it to start a verifiable chain."}
@@ -1322,14 +1471,31 @@ def verify_baseline(passphrase=None):
 
     key = None
     if keyed:
-        kdf = record.get("kdf") or {}
+        # Every one of these values is read back out of the file being checked,
+        # so each is validated before it reaches PBKDF2. Unvalidated, a salt of
+        # 123 or an iteration count of "200000" raised TypeError, 0 raised
+        # ValueError, a kdf of [1,2] raised AttributeError, and 10**12 simply
+        # hung — all of them uncaught, all of them out of the function whose
+        # answer was about to be "this baseline has been altered".
+        kdf = record.get("kdf")
+        malformed = {"status": "modified", "keyed": True,
+                     "detail": "Key derivation parameters are malformed, which is "
+                               "itself a modification: they are covered by the seal."}
+        if not isinstance(kdf, dict):
+            return malformed
+        salt_hex = kdf.get("salt", "")
+        iterations = kdf.get("iterations", KDF_ITERATIONS)
+        if not isinstance(salt_hex, str):
+            return malformed
+        if isinstance(iterations, bool) or not isinstance(iterations, int):
+            return malformed
+        if not 1 <= iterations <= KDF_ITERATIONS_MAX:
+            return malformed
         try:
-            salt = bytes.fromhex(kdf.get("salt", ""))
-        except ValueError:
-            return {"status": "modified", "keyed": True,
-                    "detail": "Key derivation parameters are malformed."}
-        key = derive_baseline_key(passphrase, salt,
-                                  kdf.get("iterations", KDF_ITERATIONS))
+            salt = bytes.fromhex(salt_hex)
+            key = derive_baseline_key(passphrase, salt, iterations)
+        except (TypeError, ValueError, OverflowError):
+            return malformed
 
     expected = seal_payload({k: v for k, v in record.items() if k != "seal"}, key)
     if not hmac.compare_digest(expected, str(record.get("seal", ""))):
@@ -1509,19 +1675,81 @@ def _publish_path(payload, destination, mode):
             "detail": f"Receipt appended to {destination}."}
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect instead of quietly following it.
+
+    urllib's default handler turns a POST into a bodiless GET on 301, 302 and
+    303, and copies every header except content-length and content-type to the
+    new host. Two things followed from that, both silent:
+
+    * `http://collector/receipts` redirecting to https — which is close to
+      universal — dropped the receipt body on every publish while this function
+      returned "Receipt accepted (HTTP 200)". The sink stayed empty, so the one
+      check that survives a wiped ~/.home_net_audit was never armed.
+    * An on-path attacker redirecting to their own host collected the sink
+      token, which is the credential for the append-only log itself.
+
+    A redirect is not something this transport should paper over: the
+    destination the user configured is the destination, or the publish failed.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"{msg}: refusing to follow a redirect to {newurl}. Point the sink "
+            "at its final URL — following it would send the body, and the "
+            "token, somewhere the configuration did not name.",
+            headers, fp)
+
+
 def _publish_https(payload, url, token, mode):
+    if token and not url.startswith("https://"):
+        # A bearer token over plain http is readable by anyone on the path,
+        # starting with the LAN this tool is auditing.
+        return {"published": False, "mode": mode,
+                "detail": f"Refusing to send the sink token to {url}: it is not https. "
+                          "Use an https sink, or clear the token."}
     headers = {"Content-Type": "application/json", "User-Agent": "home_net_audit"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=canonical_json(payload), headers=headers)
-    with urllib.request.urlopen(req, timeout=10) as r:
+    opener = urllib.request.build_opener(_NoRedirects)
+    with opener.open(req, timeout=10) as r:
         code = r.getcode()
+        final = r.geturl()
+    if final != url:
+        return {"published": False, "mode": mode,
+                "detail": f"The receipt ended up at {final}, not the configured {url}. "
+                          "Treating that as unpublished."}
     return {"published": True, "mode": mode,
             "detail": f"Receipt accepted by {url} (HTTP {code})."}
 
 
+def receipt_sink_is_readable(source):
+    """Whether receipts can be read back from `source` at all.
+
+    An https sink is write-only from here: publishing branches on the scheme
+    but reading does not, so read_receipts falls through to open() and gets
+    FileNotFoundError. Returning [] for that is indistinguishable from "the
+    sink is empty", which is the difference between "nothing has been
+    published" and "I cannot see what was published" — and the second must
+    never be reported as the first, because the whole point of the sink is to
+    contradict a local baseline that claims to be a first run.
+    """
+    return not str(source).startswith(("http://", "https://"))
+
+
 def read_receipts(source):
-    """Read back a receipt log to compare against. Returns [] if unreadable."""
+    """Read back a receipt log to compare against. Returns [] if unreadable.
+
+    Non-dict lines are dropped here rather than at each call site: every
+    consumer indexes into these entries as objects, and a single line reading
+    `null` in a shared sink used to reach compare_with_receipts as an
+    AttributeError — no verdict, no diff, no baseline saved, no report, on
+    every run. read_heartbeats and code_attestations already guarded; this is
+    the same guard, moved to where the entries are produced.
+    """
+    if not receipt_sink_is_readable(source):
+        return []
     if os.path.isdir(source):
         source = os.path.join(source, "receipts.jsonl")
     entries = []
@@ -1532,15 +1760,17 @@ def read_receipts(source):
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
     except OSError:
         return []
     return entries
 
 
-def compare_with_receipts(record, receipts):
+def compare_with_receipts(record, receipts, sink=None):
     """Check the local baseline against the off-host record of what ran.
 
     This is what catches the attack local sealing cannot: wiping
@@ -1548,8 +1778,12 @@ def compare_with_receipts(record, receipts):
     indistinguishable from a genuine first run — but the receipt log still shows
     run 7, and a local baseline claiming run 1 gives it away.
 
-    Returns {status, detail}. Statuses: ok, no_receipts, history_truncated,
-    seal_mismatch, keyed_downgrade.
+    Returns {status, detail}. Statuses: ok, no_receipts, sink_unreadable,
+    chain_unknown, unpublished_runs, history_truncated, seal_mismatch,
+    seal_conflict, keyed_downgrade.
+
+    `sink` is optional and used only to tell "nothing was published" apart from
+    "I cannot read what was published from here".
     """
     # Only this chain's receipts, plus every receipt that predates chains.
     #
@@ -1580,10 +1814,31 @@ def compare_with_receipts(record, receipts):
     # Heartbeats share this sink but say nothing about baselines. Counting them
     # would let a log holding only monitor liveness report that the baseline
     # "agrees with 40 off-host receipt(s)" when not one of them is about a run.
-    receipts = [r for r in (receipts or [])
-                if r.get("kind") != "heartbeat" and r.get("chain") in (None, mine)]
+    baseline_receipts = [r for r in (receipts or []) if r.get("kind") != "heartbeat"]
+    receipts = [r for r in baseline_receipts if r.get("chain") in (None, mine)]
 
     if not receipts:
+        if sink is not None and not receipt_sink_is_readable(sink):
+            return {"status": "sink_unreadable",
+                    "detail": f"Receipts are published to {sink}, which this tool can "
+                              "write to but not read back. The truncation check cannot "
+                              "run, so a wiped local baseline would not be contradicted "
+                              "here. Compare against the collector's own copy."}
+        if baseline_receipts:
+            # Every receipt in the log belongs to some other chain. The chain id
+            # is derived from the baseline filename, which is derived from the
+            # subnet — so a renumbering rogue DHCP server moves it, drops every
+            # receipt this machine ever published, and used to leave a REVIEW
+            # saying there was nothing to compare against while a fresh chain
+            # was sealed at seq 1 under the attacker's numbering.
+            chains = {r.get("chain") for r in baseline_receipts}
+            return {"status": "chain_unknown",
+                    "detail": f"The sink holds {len(baseline_receipts)} receipt(s), but "
+                              f"none for this baseline's chain ({mine}); they belong to "
+                              f"{len(chains)} other chain(s). Either this is a network "
+                              "the tool has not audited before, or the subnet changed "
+                              "underneath it — which is something a rogue DHCP server "
+                              "can do deliberately to orphan the evidence."}
         return {"status": "no_receipts",
                 "detail": "No off-host receipts to compare against."}
 
@@ -1618,12 +1873,39 @@ def compare_with_receipts(record, receipts):
                           "truncated or deleted — the strongest single indicator "
                           "available that something removed the evidence."}
 
+    if local_seq > highest:
+        # The local record claims runs the sink never saw. Either publishing has
+        # been failing silently, or the baseline was fabricated locally — and a
+        # seq ahead of every receipt is the strongest signal available for the
+        # second. This used to fall straight through to "ok", asserting
+        # agreement about runs the receipts had no knowledge of.
+        return {"status": "unpublished_runs",
+                "detail": f"This machine's baseline is at run {local_seq} but the "
+                          f"off-host receipts stop at run {highest}. "
+                          f"{local_seq - highest} run(s) were never published — check "
+                          "whether the sink is reachable, because until it is, nothing "
+                          "off this machine can contradict the local record."}
+
     match = [r for r in receipts if r.get("seq") == local_seq]
-    if match and record and match[-1].get("seal") != record.get("seal"):
-        return {"status": "seal_mismatch",
-                "detail": f"Run {local_seq} was recorded off-host with a different "
-                          "seal than the copy on this machine. The local baseline "
-                          "has been replaced since it was published."}
+    if match:
+        seals = {r.get("seal") for r in match}
+        if len(seals) > 1:
+            # An append-only sink lets the host add lines but not remove them,
+            # so two different seals for one run means one of them was written
+            # to bury the other. Reading match[-1] — the newest, i.e. the one an
+            # attacker can append — made that forgery the reference.
+            return {"status": "seal_conflict",
+                    "detail": f"Run {local_seq} appears in the receipt log more than "
+                              "once with different seals. An append-only sink cannot "
+                              "lose a line, so a second one was added to cover the "
+                              "first. Treat the local baseline as untrusted."}
+        # match[0], not match[-1]: the first receipt for a seq is the one
+        # published when the run happened.
+        if record and match[0].get("seal") != record.get("seal"):
+            return {"status": "seal_mismatch",
+                    "detail": f"Run {local_seq} was recorded off-host with a different "
+                              "seal than the copy on this machine. The local baseline "
+                              "has been replaced since it was published."}
 
     return {"status": "ok",
             "detail": f"Local baseline agrees with {len(receipts)} off-host receipt(s)."}
@@ -1646,8 +1928,15 @@ def compare_with_receipts(record, receipts):
 # ---------------------------------------------------------------------------
 
 def monitor_snapshot():
-    """The cheap half of the audit: what an attacker has to change to redirect you."""
+    """The cheap half of the audit: what an attacker has to change to redirect you.
+
+    The gateway is pinged first, as check_arp_spoofing does. Without it an entry
+    that has aged out of the ARP cache reads as gateway_mac=None, and a None in
+    the reference is worse than useless — see carry_forward_gateway_mac.
+    """
     gateway = get_default_gateway()
+    if gateway:
+        ping(gateway)
     arp = read_arp_table()
     return {
         "gateway": gateway,
@@ -1656,6 +1945,34 @@ def monitor_snapshot():
         "dns": get_dns_servers(),
         "neighbours": sorted(arp),
     }
+
+
+def carry_forward_gateway_mac(snapshot, previous):
+    """Keep the last MAC actually observed, rather than storing a blank.
+
+    diff_snapshots correctly declines to compare when either side is None. That
+    is the right call per-poll and the wrong thing to then persist: the sequence
+    good → None → attacker skips both comparisons and quietly installs the
+    attacker's MAC as the new reference, so the HIGH gateway_mac_changed never
+    fires — not for that transition, and not afterwards. An attacker can force
+    the blank poll by flooding until `arp -an` exceeds run()'s timeout.
+
+    Returns (snapshot, note). The note is a REVIEW event when the MAC could not
+    be read at all, because "I could not see the gateway" is itself worth
+    saying out loud rather than papering over.
+    """
+    if snapshot.get("gateway_mac") or not previous:
+        return snapshot, None
+    carried = previous.get("gateway_mac")
+    if not carried:
+        return snapshot, None
+    snapshot = dict(snapshot, gateway_mac=carried)
+    return snapshot, {
+        "severity": "REVIEW", "kind": "gateway_mac_unreadable",
+        "detail": f"The gateway's MAC could not be read this poll; keeping the last "
+                  f"observed value ({carried}) as the reference. A blank reading is "
+                  "not evidence that nothing changed, and storing it would have "
+                  "hidden the next change."}
 
 
 def diff_snapshots(old, new):
@@ -1733,6 +2050,10 @@ def diff_snapshots(old, new):
 
 # The last snapshot, persisted so a restart resumes its comparison instead of
 # starting a new one. Named *_FILE so the test sandbox redirects it by name.
+#
+# This is the pre-per-network path, kept because a deployment that has been
+# running has state here; monitor_state_file() returns the per-network one that
+# is actually used, and falls back to this when it is the only thing present.
 MONITOR_STATE_FILE = os.path.join(BASELINE_DIR, "monitor_state.json")
 
 # How often liveness is published. Every poll would mean 1440 sink writes a day
@@ -1740,6 +2061,14 @@ MONITOR_STATE_FILE = os.path.join(BASELINE_DIR, "monitor_state.json")
 # within one heartbeat interval, which observation_gaps reports rather than
 # rounds away.
 HEARTBEAT_INTERVAL = 900
+
+# How far ahead of now a heartbeat may be stamped before it is discarded as
+# unusable. The sink is append-only by design, so an entry dated 2099 can never
+# be removed — and one was enough to disable the check permanently: it sorted
+# last, made the trailing window negative, and turned the HIGH "the monitor is
+# not running now" into a past-tense REVIEW for good. A wrong clock (a resumed
+# VM, an RTC-less Pi before NTP) produces the same thing with no attacker.
+HEARTBEAT_SKEW = 300
 
 
 def _utcnow():
@@ -1773,6 +2102,32 @@ def _format_duration(seconds):
     return f"{days}d {hours}h" if hours else f"{days}d"
 
 
+def monitor_state_file():
+    """The state path for the currently selected network.
+
+    One global file was wrong in both directions. Carrying a home reference on
+    to café Wi-Fi produced a HIGH gateway_changed, a HIGH gateway_mac_changed
+    whose text says "while its IP stayed the same … ARP poisoning" — factually
+    false, the IP changed in the same batch — and a HIGH dns_changed, then the
+    mirror image on the way home. Three false HIGHs per move is how a real one
+    stops being read. And in the other direction, a reference from a different
+    network is not a reference at all, so a genuine change on this one had
+    nothing meaningful to be compared against.
+
+    Keyed off the same chain id the receipts use, so the two agree about which
+    network they are describing.
+
+    Falls back to the pre-per-network path only when that is the only state
+    present, so an already-running monitor keeps its reference across the
+    upgrade instead of re-baselining — which is the very thing this module
+    treats as an attack when it happens by accident.
+    """
+    per_network = os.path.join(BASELINE_DIR, f"monitor_state-{chain_id()}.json")
+    if not os.path.exists(per_network) and os.path.exists(MONITOR_STATE_FILE):
+        return MONITOR_STATE_FILE
+    return per_network
+
+
 def load_monitor_state():
     """Return (snapshot, observed_at) from the last poll, or (None, None).
 
@@ -1781,9 +2136,13 @@ def load_monitor_state():
     while the process was down is compared rather than silently adopted.
     """
     try:
-        with open(MONITOR_STATE_FILE) as f:
+        with open(monitor_state_file()) as f:
             saved = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
+        return None, None
+    except (json.JSONDecodeError, OSError):
+        # Present but unusable is not the same as absent, and the caller needs
+        # to be able to say so rather than silently re-baselining.
         return None, None
     if not isinstance(saved, dict):
         return None, None
@@ -1791,17 +2150,22 @@ def load_monitor_state():
 
 
 def save_monitor_state(snapshot, at=None):
-    """Persist the reference snapshot so the next start has something to diff."""
+    """Persist the reference snapshot so the next start has something to diff.
+
+    Returns True on success. A monitor that cannot persist its reference still
+    watches correctly within this process; it just cannot survive a restart, and
+    every restart then re-baselines into whatever world it wakes up in. That is
+    worth continuing through and not worth doing silently, which is why this
+    reports rather than either raising or swallowing.
+    """
     try:
-        _write_json_atomic(MONITOR_STATE_FILE, {
+        _write_json_atomic(monitor_state_file(), {
             "snapshot": snapshot,
             "observed_at": (at or _utcnow()).isoformat(),
         })
+        return True
     except OSError:
-        # A monitor that cannot persist its reference still watches correctly
-        # within this process; it just cannot survive a restart. Refusing to run
-        # would trade a partial loss for a total one.
-        pass
+        return False
 
 
 def monitor_heartbeat(destination=None, token=None, interval=None, at=None):
@@ -1846,7 +2210,7 @@ def read_heartbeats(source):
             and r.get("chain") in (None, chain_id())]
 
 
-def observation_gaps(heartbeats, interval=HEARTBEAT_INTERVAL, now=None):
+def observation_gaps(heartbeats, interval=None, now=None):
     """Windows during which nothing was watching. Returns [{start, end, seconds}].
 
     A gap is a gap whether the monitor was killed, crashed, or the machine was
@@ -1857,11 +2221,28 @@ def observation_gaps(heartbeats, interval=HEARTBEAT_INTERVAL, now=None):
     The trailing window — between the last heartbeat and now — counts. It is the
     one an attacker is inside right now, and reporting only closed gaps would
     hide exactly the case that matters most.
+
+    `interval` defaults to what the heartbeats themselves recorded, not to the
+    module constant. Both readers called this without an argument, so the
+    threshold was pinned to 900s while real spacing is max(--interval, 900) —
+    and a monitor running at --interval 3600 had every one of its healthy
+    hourly beats reported as a window with no monitoring, plus a HIGH claiming
+    it was not running. The payload has carried its own interval all along.
     """
-    stamps = sorted(s for s in (_parse_stamp(h.get("at")) for h in heartbeats or [])
-                    if s is not None)
+    heartbeats = [h for h in (heartbeats or []) if isinstance(h, dict)]
+    now = now or _utcnow()
+    stamps = sorted(s for s in (_parse_stamp(h.get("at")) for h in heartbeats)
+                    if s is not None and s <= now + timedelta(seconds=HEARTBEAT_SKEW))
     if not stamps:
         return []
+    if interval is None:
+        recorded = [h.get("interval") for h in heartbeats
+                    if isinstance(h.get("interval"), (int, float))
+                    and not isinstance(h.get("interval"), bool)
+                    and h.get("interval") > 0]
+        # The largest recorded cadence, so a monitor that was restarted with a
+        # longer interval is not judged against its old one.
+        interval = max(recorded) if recorded else HEARTBEAT_INTERVAL
     # One missed heartbeat is a slow disk or a busy Pi; the allowance is what
     # keeps this from crying wolf on every hiccup.
     threshold = max(interval * 2, interval + 60)
@@ -1871,11 +2252,31 @@ def observation_gaps(heartbeats, interval=HEARTBEAT_INTERVAL, now=None):
         if elapsed > threshold:
             gaps.append({"start": earlier.isoformat(), "end": later.isoformat(),
                          "seconds": elapsed})
-    trailing = ((now or _utcnow()) - stamps[-1]).total_seconds()
+    trailing = (now - stamps[-1]).total_seconds()
     if trailing > threshold:
         gaps.append({"start": stamps[-1].isoformat(), "end": None,
                      "seconds": trailing})
     return gaps
+
+
+def describe_clock_anomalies(heartbeats, now=None):
+    """Report heartbeats stamped in the future, or None if there are none.
+
+    observation_gaps discards them so one bad entry cannot disable the coverage
+    check, but discarding quietly would hide the reason the log is wrong. Either
+    the clock on the monitoring host is wrong, or someone appended an entry to a
+    log that by design cannot have entries removed.
+    """
+    now = now or _utcnow()
+    ahead = [s for s in (_parse_stamp(h.get("at")) for h in (heartbeats or [])
+                         if isinstance(h, dict))
+             if s is not None and s > now + timedelta(seconds=HEARTBEAT_SKEW)]
+    if not ahead:
+        return None
+    return (f"  [REVIEW] Heartbeat clock: {len(ahead)} heartbeat(s) are stamped in the "
+            f"future, the furthest at {max(ahead).isoformat()}. They are excluded from "
+            "the coverage check. Either this host's clock is wrong, or entries were "
+            "added to a log that cannot have entries removed.")
 
 
 def describe_observation_gaps(gaps):
@@ -1920,8 +2321,11 @@ def send_alert(event, destination=None, token=None):
     payload = dict(event, at=datetime.now(timezone.utc).isoformat())
     try:
         if destination.startswith(("http://", "https://")):
+            # ALERT_TOKEN_ENV, never SINK_TOKEN_ENV: the alert destination is a
+            # different endpoint by design, and the receipt sink's credential
+            # has no business travelling there.
             return _publish_https(payload, destination,
-                                  token or os.environ.get(SINK_TOKEN_ENV), "alert")
+                                  token or os.environ.get(ALERT_TOKEN_ENV), "alert")
         return _publish_path(payload, destination, "alert")
     except Exception as e:                      # noqa: BLE001 - reported, not raised
         return {"published": False,
@@ -1947,6 +2351,16 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     # pure-function siblings (observation_gaps, describe_baseline_freshness)
     # take a datetime under the name `now`, so this one is named for what it is.
     clock = clock or _utcnow
+    # Select the baseline for the network this monitor is actually watching,
+    # before anything reads chain_id(). Without this the monitor published every
+    # heartbeat under sha256("baseline.json") while the audit read them back
+    # under sha256("baseline-<key>.json"), so read_heartbeats returned nothing,
+    # observation_gaps returned nothing, and describe_observation_gaps returned
+    # None — the same value it returns for "observation was continuous". A
+    # monitor dead for a fortnight printed absolutely nothing. The feature was
+    # inert in every per-network deployment, which is all of them since
+    # per-network baselines landed.
+    use_current_network_baseline()
     raised = []
     count = 0
     printer(f"Monitoring every {interval}s. Watching the gateway, its MAC, IPv6 "
@@ -1958,6 +2372,36 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
         printer("  Note: no receipt sink set, so nothing off-host will record that "
                 f"this monitor ran. Set {SINK_ENV} — otherwise a week with no "
                 "alerts and a monitor that was never running look identical.")
+
+    # Undelivered alerts are queued and retried, not dropped after one attempt.
+    #
+    # The loop used to print "(not delivered: ...)" to stdout — on the host
+    # under suspicion, which is the one place an alert is worth nothing — and
+    # then adopt the change as the new normal anyway. The adversary an alert
+    # describes is in-path by definition and can drop the alert POST while
+    # letting heartbeats through, so nothing else reported the loss either.
+    undelivered = []
+    state_warned = False
+    heartbeat_warned = False
+
+    def _deliver(event):
+        result = send_alert(event, alert_to)
+        if not result["published"]:
+            undelivered.append(event)
+            printer(f"           (not delivered, queued: {result['detail']})")
+        return result
+
+    def _retry_undelivered():
+        if not undelivered:
+            return
+        still = []
+        for event in undelivered:
+            if not send_alert(event, alert_to)["published"]:
+                still.append(event)
+        delivered = len(undelivered) - len(still)
+        if delivered:
+            printer(f"           ({delivered} queued alert(s) delivered)")
+        undelivered[:] = still
 
     previous, observed_at = load_monitor_state()
     started = clock()
@@ -1978,15 +2422,18 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                           "so the comparison below is across the gap, not of it."}
             raised.append(event)
             printer(f"  [{event['severity']:6}] {event['detail']}")
-            result = send_alert(event, alert_to)
-            if not result["published"]:
-                printer(f"           (not delivered: {result['detail']})")
+            _deliver(event)
 
     last_heartbeat = None
     try:
         while iterations is None or count < iterations:
             polled_at = clock()
             snapshot = monitor_snapshot()
+            snapshot, carried = carry_forward_gateway_mac(snapshot, previous)
+            if carried:
+                raised.append(carried)
+                printer(f"  [{carried['severity']:6}] {carried['detail']}")
+                _deliver(carried)
             for event in diff_snapshots(previous, snapshot):
                 if resumed_gap is not None:
                     # The finding is real, but it was not witnessed happening,
@@ -1997,23 +2444,40 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                                         "no monitoring, so when it happened is unknown.")
                 raised.append(event)
                 printer(f"  [{event['severity']:6}] {event['detail']}")
-                result = send_alert(event, alert_to)
-                if not result["published"]:
-                    printer(f"           (not delivered: {result['detail']})")
+                _deliver(event)
 
             previous = snapshot
             resumed_gap = None          # only the first comparison spans the gap
-            save_monitor_state(snapshot, polled_at)
+            _retry_undelivered()
+            if not save_monitor_state(snapshot, polled_at) and not state_warned:
+                state_warned = True
+                printer("  [HIGH  ] The reference snapshot could not be written to "
+                        f"{monitor_state_file()}. This process still compares poll to "
+                        "poll, but every restart will re-baseline against whatever it "
+                        "wakes up to — including an attacker already in place.")
             if (last_heartbeat is None
                     or (polled_at - last_heartbeat).total_seconds() >= heartbeat_interval):
-                monitor_heartbeat(interval=interval, at=polled_at)
-                last_heartbeat = polled_at
+                # last_heartbeat only advances on a delivered beat. Advancing it
+                # regardless meant an unreachable sink produced no heartbeat and
+                # no retry until the next interval, so the coverage record —
+                # the thing that says the monitor was running — silently thinned
+                # out while the monitor was in fact running perfectly well.
+                beat = monitor_heartbeat(interval=interval, at=polled_at)
+                if beat.get("published"):
+                    last_heartbeat = polled_at
+                elif not heartbeat_warned:
+                    heartbeat_warned = True
+                    printer(f"  [REVIEW] Heartbeat not published: {beat.get('detail', '')}")
 
             count += 1
             if iterations is None or count < iterations:
                 sleeper(interval)
     except KeyboardInterrupt:
         printer("\nStopped.")
+    if undelivered:
+        printer(f"  [HIGH  ] {len(undelivered)} alert(s) never left this machine. "
+                "They are listed above and nowhere else — if this host is the one "
+                "under suspicion, treat them as unreported.")
     return raised
 
 
@@ -2068,12 +2532,32 @@ def describe_code_attestation(receipts):
             f"update the tool, something edited it. {caveat}")
 
 
+def describe_publish_result(receipt):
+    """One line for the terminal when a receipt could not leave the machine.
+
+    Returns None when it did, so callers can `if line: print(line)`.
+
+    publish_receipt's docstring has always said the caller must surface this —
+    "a receipt that silently failed to leave the machine is the same as never
+    having sent one" — and no caller did. An unmounted sink or an expired token
+    produced months of runs that published nothing and said nothing, while the
+    comparison against those absent receipts reported everything in order.
+    """
+    if not receipt or receipt.get("published"):
+        return None
+    return f"  [REVIEW] Receipt not published: {receipt.get('detail', '')}"
+
+
 def describe_receipt_status(report):
     risk = {
         "ok": "OK",
         "no_receipts": "REVIEW",
+        "sink_unreadable": "REVIEW",
+        "chain_unknown": "REVIEW",
+        "unpublished_runs": "REVIEW",
         "history_truncated": "HIGH",
         "seal_mismatch": "HIGH",
+        "seal_conflict": "HIGH",
         "keyed_downgrade": "HIGH",
     }.get(report.get("status"), "REVIEW")
     return f"  [{risk:6}] Off-host receipts: {report.get('detail', '')}"
@@ -2089,6 +2573,11 @@ def describe_baseline_integrity(report):
         "modified": "HIGH",
         "rolled_back": "HIGH",
         "chain_missing": "HIGH",
+        # Both are the same claim as chain_missing seen from the other side —
+        # the chain and the record disagree about whether this machine has ever
+        # sealed a baseline — so they carry the same weight.
+        "record_missing": "HIGH",
+        "downgraded": "HIGH",
     }.get(report.get("status"), "REVIEW")
     return f"  [{risk:6}] Baseline integrity: {report.get('detail', '')}"
 
@@ -2795,6 +3284,16 @@ def diff_baseline(old, new):
             f"Device(s) moved to a different subnet: {'; '.join(moved)}. A device "
             "that changes subnet keeps its MAC, so it is not reported as an "
             "arrival or a departure above.")
+    # Only on a rise, and deliberately so. A falling count is the most ordinary
+    # thing on a home network — phones sleep and drop off the table — and
+    # reporting it would fire on most runs while saying nothing.
+    #
+    # The known blind spot this leaves: one household phone leaving as an
+    # intruder joins nets to no change in the count, and nothing is said. That
+    # is not fixable by reporting falls, because with a rotating identifier
+    # there is no signal to recover — an address seen this run and not last is
+    # equally consistent with a new device and with the same device having
+    # re-randomised. The count is the only claim these addresses support.
     if devices_measured and len(new_private) > len(old_private):
         notes.append(
             f"{len(new_private)} device(s) using rotating private addresses, up "
@@ -2859,6 +3358,28 @@ def diff_baseline(old, new):
         notes.append(f"IPv6 router(s) no longer advertising: {sorted(old_ra - new_ra)}")
     if set(old.get("dns", [])) != set(new.get("dns", [])):
         notes.append(f"DNS servers CHANGED: was {old.get('dns')}, now {new.get('dns')}")
+
+    # The gateway and its MAC are sealed into every baseline and were never
+    # compared, which left the audit blind to the one change it most needs to
+    # see. check_arp_spoofing's verdict is len(macs_seen) > 1 over five polls in
+    # about six seconds, so a poisoner who is simply *there* — already in place,
+    # steady state — yields one MAC and prints "[OK] MAC address stable". The
+    # monitor has this comparison; the audit did not, so a full audit run
+    # against an actively poisoned network reported "no changes since baseline".
+    old_gw, new_gw = old.get("gateway"), new.get("gateway")
+    if old_gw and new_gw and old_gw != new_gw:
+        notes.append(
+            f"Default gateway CHANGED: was {old_gw}, now {new_gw}. Everything this "
+            "machine sends off-link now goes somewhere else.")
+
+    old_macs = set((old.get("arp_spoof") or {}).get("macs_seen") or [])
+    new_macs = set((new.get("arp_spoof") or {}).get("macs_seen") or [])
+    if old_macs and new_macs and old_macs != new_macs:
+        notes.append(
+            f"Gateway MAC CHANGED: was {sorted(old_macs)}, now {sorted(new_macs)}. "
+            "A stable MAC that is stable at a DIFFERENT value than the baseline is "
+            "what an ARP poisoner who was already in place before this run looks "
+            "like — the per-run 'stable across all polls' check cannot see it.")
     return notes
 
 
@@ -3164,6 +3685,27 @@ def _parse_connected_wifi_block(text):
     return None, ""
 
 
+# Section titles in `system_profiler SPAirPortDataType` output — structure,
+# not network names. Matched exactly, and interface names by shape.
+#
+# The previous suffix test ("...Networks", "...Information") was wrong twice
+# over. It rejected any real SSID ending in the same word — a neighbour called
+# "AAA Guest Networks" — and, worse, the reject branch left `ssid` pointing at
+# the *previous* network, so the rejected network's BSSIDs were filed under it.
+# Listed first under "Other Local Wi-Fi Networks", such a neighbour handed its
+# BSSID to the connected SSID and raised a false evil-twin HIGH, which was then
+# written into the baseline. The mirror case — the user's own SSID ending in
+# "Networks" — filed every BSSID under "en0" instead, so check_evil_twin found
+# nothing for the real SSID and blamed Location Services for a parser bug.
+WIFI_SECTION_HEADERS = frozenset({
+    "Wi-Fi",
+    "Software Versions",
+    "Interfaces",
+    "Current Network Information",
+    "Other Local Wi-Fi Networks",
+})
+
+
 def parse_wifi_networks(text):
     """Return {ssid: [bssid, ...]} across every network system_profiler lists.
 
@@ -3179,8 +3721,12 @@ def parse_wifi_networks(text):
             continue
         if stripped.endswith(":") and ":" not in stripped[:-1]:
             candidate = stripped[:-1].strip()
-            if candidate and not candidate.endswith("Networks") \
-                    and not candidate.endswith("Information"):
+            if (not candidate or candidate in WIFI_SECTION_HEADERS
+                    or re.fullmatch(r"en\d+", candidate)):
+                # A section header ends the previous network. Leaving `ssid` set
+                # is what misattributed the next BSSIDs.
+                ssid = None
+            else:
                 ssid = candidate
                 networks.setdefault(ssid, [])
             continue
@@ -3345,12 +3891,18 @@ def parse_dhcp_options(data):
     Counting responders was never the whole story. A single, perfectly ordinary
     DHCP server can hand out a poisoned gateway, resolver or static route, and
     the count stays at one the entire time.
+
+    RFC 2131 fixes the magic cookie at byte 236, and that is where it is read
+    from. Searching for it instead handed the sender control of where parsing
+    began: `sname` (44) and `file` (108) are free-form bytes they fill in, so a
+    decoy cookie there followed by an 0xff terminator ended the option walk
+    before it reached offset 236. The audit then reported the benign gateway
+    from the decoy while the client applied the poisoned one that follows.
     """
-    magic = data.find(b"\x63\x82\x53\x63")
-    if magic < 0:
+    if len(data) < 240 or data[236:240] != b"\x63\x82\x53\x63":
         return {}
     options = {}
-    i = magic + 4
+    i = 240
     while i < len(data):
         code = data[i]
         if code == 255:                 # end
@@ -3491,7 +4043,10 @@ def check_rogue_dhcp(timeout=4):
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                data, addr = sock.recvfrom(1024)
+                # 4096, not 1024: a large OFFER was truncated mid-options, so
+                # anything past the first kilobyte was invisible to the
+                # poisoning check below while the OS client still applied it.
+                data, addr = sock.recvfrom(4096)
                 server_ip = addr[0]
                 # Parse offered IP from yiaddr (bytes 16-20 of response)
                 if len(data) >= 20:
@@ -3550,6 +4105,22 @@ def action_rogue_dhcp():
 # NEW FEATURE 3: UPnP port mapping dump
 # ---------------------------------------------------------------------------
 
+def _upnp_url_points_at(url, gateway):
+    """True if `url` is an http(s) URL whose host is exactly `gateway`.
+
+    Both URLs this function guards are read out of a document a device on the
+    LAN wrote. Unchecked, LOCATION could name any scheme urllib's default
+    opener understands — file: and ftp: among them — and an absolute
+    <controlURL> could aim a hundred SOAP POSTs at any host on the internet.
+    Neither is a UPnP feature; both were reachable by answering one broadcast.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and parts.hostname == gateway
+
+
 def get_upnp_port_mappings(gateway):
     """
     Discover the UPnP (Universal Plug and Play) control URL via SSDP
@@ -3577,7 +4148,17 @@ def get_upnp_port_mappings(gateway):
         deadline = time.time() + 3
         while time.time() < deadline:
             try:
-                data, _ = sock.recvfrom(4096)
+                # The sender's address is the whole point of reading it. SSDP is
+                # a broadcast question and anyone on the link may answer; taking
+                # the first reply meant an attacker beat the router by design,
+                # since MX: 2 tells a conforming device to wait before
+                # responding. They then served a description document naming
+                # themselves, and the audit reported *their* (empty) mapping
+                # list as "the gateway's own list" while the real router quietly
+                # forwarded a port. Only the gateway's answer counts.
+                data, addr = sock.recvfrom(4096)
+                if addr[0] != gateway:
+                    continue
                 text = data.decode("utf-8", "ignore")
                 loc_m = re.search(r"(?i)LOCATION:\s*(\S+)", text)
                 if loc_m:
@@ -3596,6 +4177,11 @@ def get_upnp_port_mappings(gateway):
         if ssdp_refused:
             return [], local_network_denied_note("SSDP discovery")
         return [], "No UPnP device found via SSDP (router may have UPnP disabled)"
+
+    if not _upnp_url_points_at(location, gateway):
+        return [], (f"The UPnP reply from {gateway} pointed at {location}, which is "
+                    "not an http(s) address on the gateway itself. Not followed, so "
+                    "port mappings were not read.")
 
     # Step 2: Fetch the device description XML to find the control URL
     try:
@@ -3617,6 +4203,9 @@ def get_upnp_port_mappings(gateway):
 
     ctrl_path = ctrl_m.group(1).strip()
     ctrl_url = ctrl_path if ctrl_path.startswith("http") else base_url + ctrl_path
+    if not _upnp_url_points_at(ctrl_url, gateway):
+        return [], (f"The UPnP description named a control URL at {ctrl_url}, which is "
+                    "not on the gateway. Not followed, so port mappings were not read.")
 
     # Step 3: GetGenericPortMappingEntry in a loop
     mappings = []
@@ -3674,7 +4263,12 @@ def action_upnp_dump():
     gateway = get_default_gateway()
     if not gateway:
         print("  Could not determine gateway. Skipping UPnP check.")
-        return {"mappings": [], "error": "No gateway"}
+        # "note", like every other early return here. This alone said "error",
+        # which the report does not read, so a run that never sent an SSDP
+        # packet rendered as "No UPnP port mappings found." — plus a provenance
+        # row crediting the gateway for an answer it was never asked for.
+        return {"mappings": [],
+                "note": "UPnP was not queried: the gateway could not be determined."}
 
     print(f"  Querying UPnP on gateway {gateway} via SSDP...")
     mappings, err = get_upnp_port_mappings(gateway)
@@ -3724,9 +4318,16 @@ def check_arp_spoofing(gateway, polls=5, interval=1.5):
     macs_seen = set()
     print(f"  Polling ARP cache for gateway {gateway} ({polls}× every {interval}s)...")
     for i in range(polls):
-        # Force a fresh ARP entry by pinging the gateway
-        subprocess.run(["ping", "-c", "1", "-t", "1", gateway],
-                       capture_output=True)
+        # Force a fresh ARP entry by pinging the gateway.
+        #
+        # Through ping(), not a bare subprocess.run. This was the only call site
+        # in the file with neither a timeout nor a try/except, so on a Linux
+        # observer with iproute2 but no iputils it raised FileNotFoundError
+        # straight out of action_full_audit — taking roughly nine later checks,
+        # the baseline save and the report with it. ping() also picks the
+        # deadline flag that means "give up quickly" on the platform it is on;
+        # -t is a TTL on Linux, so this loop was sending TTL-1 probes there.
+        ping(gateway)
         arp = read_arp_table()
         mac = arp.get(gateway)
         if mac and mac != "ff:ff:ff:ff:ff:ff":
@@ -3825,7 +4426,17 @@ def probe_default_credentials(gateway):
     # `attempts` counts credential submissions, not requests: a GET that finds
     # no login form is reconnaissance, and counting it would restore exactly the
     # ambiguity this dict exists to remove.
-    coverage = {"attempts": 0, "open": [], "blocked": [], "closed": []}
+    #
+    # `unanswered` counts requests that got no response at all, and `aborted`
+    # holds the lockout note if the sweep stopped early. Both exist because
+    # "attempts" alone let two different truncated sweeps render as the clean
+    # verdict: one where the router started dropping connections (each drop was
+    # counted as an attempt that was refused), and one where LockoutError ended
+    # the sweep entirely (the note never crossed the function boundary, so the
+    # HTML report called credential_coverage_verdict on a coverage dict with no
+    # record that anything had gone wrong).
+    coverage = {"attempts": 0, "open": [], "blocked": [], "closed": [],
+                "unanswered": 0, "aborted": None}
 
     # Keywords that reliably indicate an authenticated admin session.
     AUTHED_INDICATORS = [
@@ -3884,6 +4495,11 @@ def probe_default_credentials(gateway):
             except Exception:
                 code, body = e.code, ""
         except Exception:
+            # No response at all. The caller must not count this as a credential
+            # that was submitted and refused — a router that silently drops
+            # connections after N failures produces exactly this, and counting
+            # it turned a defended router into "every one was refused".
+            coverage["unanswered"] += 1
             return None, ""
         if code == 429 or any(k in body.lower() for k in LOCKOUT_INDICATORS):
             raise LockoutError(f"router signalled lockout/rate-limit (HTTP {code})")
@@ -3901,18 +4517,33 @@ def probe_default_credentials(gateway):
             return False
 
         # Step 2: send credentials
-        coverage["attempts"] += 1
         creds = base64.b64encode(f"{user}:{pwd}".encode()).decode()
         auth_code, body = _fetch(base_url + "/", headers={
             "Authorization": f"Basic {creds}",
             "User-Agent": "home_net_audit",
         })
+        if auth_code is None:
+            # Counted as unanswered by _fetch, not as a refusal.
+            return False
+        coverage["attempts"] += 1
 
         if auth_code in (401, 403):
             return False  # rejected
 
         # Step 3: verify the response body is an admin page, not a login form
         return _body_is_authed(body)
+
+    # The (endpoint, payload) shapes that this router actually responds to,
+    # learned once per base URL and reused for every later credential pair.
+    #
+    # Without it the sweep was 10 endpoints × 4 payloads × 16 credential pairs =
+    # 640 POSTs per port, 2560 across four open ports, while the menu announced
+    # "Testing 16 common credential pairs" — the number the user consented to.
+    # The 0.05s sleeps paced only the outer loop, so 40 POSTs per pair went
+    # back to back. A router that locks silently, with no 429 and no lockout
+    # phrase in the body, is not caught by LockoutError at all, so the volume
+    # itself was the hazard.
+    login_shapes = {}
 
     def try_form_login(base_url, user, pwd):
         """
@@ -3937,8 +4568,35 @@ def probe_default_credentials(gateway):
             f"UserName={urllib.parse.quote(user)}&Passwd={urllib.parse.quote(pwd)}&Action=1",
             f"uname={urllib.parse.quote(user)}&upasswd={urllib.parse.quote(pwd)}",
         ]
+        def _post(ep, pl):
+            post_code, body = _fetch(
+                base_url + ep,
+                data=pl.encode(),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "home_net_audit",
+                    "Referer": base_url + ep,
+                },
+            )
+            if post_code is None:
+                return None
+            coverage["attempts"] += 1
+            # Inside the payload loop, not only around the outer one. The old
+            # placement let forty POSTs per credential pair go back to back.
+            time.sleep(0.05)
+            return _body_is_authed(body)
+
+        known = login_shapes.get(base_url)
+        if known is not None:
+            for ep, pl_index in known:
+                if pl_index < len(payloads) and _post(ep, payloads[pl_index]):
+                    return True
+            return False
+
+        # First credential pair only: find which endpoints look like a login and
+        # which payload shapes this router answers, then remember a handful.
+        candidates = []
         for ep in endpoints:
-            # First GET the endpoint — skip if it doesn't exist or has no login form
             get_code, get_body = _fetch(base_url + ep)
             if get_code is None:
                 continue
@@ -3949,22 +4607,29 @@ def probe_default_credentials(gateway):
             # Only POST to pages that actually have a login form (avoids noise)
             if not has_form and get_code not in (200,):
                 continue
+            candidates.append((0 if has_form else 1, ep))
 
-            for pl in payloads:
-                coverage["attempts"] += 1
-                post_code, body = _fetch(
-                    base_url + ep,
-                    data=pl.encode(),
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": "home_net_audit",
-                        "Referer": base_url + ep,
-                    },
-                )
-                if post_code is None:
+        # A router that answers 200 for unknown paths makes every endpoint a
+        # candidate, which is where the fan-out came from. Endpoints carrying an
+        # actual password field are tried first, and the list is capped: past
+        # the first few, an endpoint is being POSTed on no evidence at all, and
+        # the cost of that is real login attempts against the user's router.
+        candidates.sort()
+        candidates = [ep for _rank, ep in candidates[:MAX_LOGIN_ENDPOINTS]]
+
+        discovered = []
+        for ep in candidates:
+            for index, pl in enumerate(payloads):
+                answered = _post(ep, pl)
+                if answered is None:
                     continue
-                if _body_is_authed(body):
+                # The server processed this shape, so it is worth repeating for
+                # the remaining credential pairs. Anything else is not.
+                discovered.append((ep, index))
+                if answered:
+                    login_shapes[base_url] = discovered[:MAX_LOGIN_SHAPES]
                     return True
+        login_shapes[base_url] = discovered[:MAX_LOGIN_SHAPES]
         return False
 
     lockout_note = None
@@ -4002,6 +4667,16 @@ def probe_default_credentials(gateway):
                     time.sleep(0.05)
     except LockoutError as e:
         lockout_note = str(e)
+        # Recorded inside `coverage`, not only returned alongside it.
+        #
+        # action_default_creds returns {gateway, successes, coverage} and drops
+        # lockout_note on the floor, so the HTML report — which calls
+        # credential_coverage_verdict(dc["coverage"]) unconditionally — had no
+        # way to know the sweep had stopped early. Its first live branch is
+        # `if attempts:`, so a router that started rate-limiting after eight
+        # guesses rendered a green "8 credential pair(s) submitted … and every
+        # one was refused", and the sealed baseline kept saying it.
+        coverage["aborted"] = lockout_note
 
     return successes, lockout_note, coverage
 
@@ -4037,6 +4712,26 @@ def credential_coverage_verdict(coverage):
     attempts = coverage.get("attempts") or 0
     open_ports = coverage.get("open") or []
     blocked = coverage.get("blocked") or []
+    aborted = coverage.get("aborted")
+    unanswered = coverage.get("unanswered") or 0
+
+    # Checked before `attempts`, because a truncated sweep is not a verdict
+    # about the password: most of DEFAULT_CREDS was never tried, and the
+    # account may now be locked. This is the branch the terminal reached via
+    # `elif not lockout_note` and the HTML report never reached at all.
+    if aborted:
+        return "REVIEW", (f"The sweep stopped early: {aborted}. "
+                          f"{attempts} credential pair(s) had been submitted and "
+                          "refused before that, but the rest were never tried, so "
+                          "this says nothing about whether the router's password is "
+                          "a default. Check whether the admin account is now locked.")
+
+    if unanswered and not attempts:
+        return "REVIEW", (f"{unanswered} request(s) to the admin port(s) got no "
+                          "response at all, and no credential was ever submitted. A "
+                          "router that drops connections after repeated failures "
+                          "looks exactly like this, so nothing here is a finding "
+                          "about the password.")
 
     if attempts:
         where = ", ".join(str(p) for p in open_ports) or "the admin ports"
@@ -4078,6 +4773,11 @@ def action_default_creds():
     print("  NOTE: this sends real login attempts to your router — it is NOT")
     print("  read-only and can trip lockout/rate-limit protection. It aborts")
     print("  automatically if the router signals a lockout.")
+    # Say what the sweep can actually cost, not just how many pairs it holds.
+    # A form login is tried across several endpoint and payload shapes, so the
+    # first credential pair explores; the rest reuse whatever answered.
+    print("  Each pair may take several requests while the login shape is being")
+    print("  found; after the first pair only the shape that answered is reused.")
     successes, lockout_note, coverage = probe_default_credentials(gateway)
 
     if lockout_note:
@@ -4090,7 +4790,11 @@ def action_default_creds():
             display_pwd = pwd if pwd else "(empty)"
             print(f"    Port {port} ({method}): {user} / {display_pwd}")
         print("\n  Change your router admin password immediately!")
-    elif not lockout_note:
+    else:
+        # Printed even after a lockout. The verdict now knows about the abort —
+        # coverage["aborted"] carries it — so this is the line that says the
+        # sweep was truncated rather than clean, which is exactly what the
+        # reader needs and what `elif not lockout_note` used to withhold.
         print(describe_credential_coverage(coverage))
 
     return {"gateway": gateway, "successes": successes, "coverage": coverage}
@@ -4573,6 +5277,29 @@ def action_firewall_check():
 # NEW FEATURE 10: HTML report export
 # ---------------------------------------------------------------------------
 
+# Every state key generate_html_report knows how to render. Keys carrying a risk
+# rating that are absent from this set are reported as missing rather than
+# dropped — see the end of generate_html_report.
+RENDERED_STATE_KEYS = frozenset({
+    "timestamp", "gateway", "router_open_ports", "upstream_open_ports", "dns",
+    "devices", "scanned_subnets", "wifi", "wifi_bssids", "arp_spoof", "firewall",
+    "sharing", "default_creds", "speed_download_mbps", "speed_upload_mbps",
+    "upnp", "dhcp", "listening", "router_hostname", "evil_twin", "ipv6",
+    "ipv6_routers", "interception", "router_tls", "dsl",
+    # Bookkeeping written by carry_forward_unmeasured, not findings.
+    "carried_forward", "measured_at",
+})
+
+
+def _carries_risk(value):
+    """Whether a state value is (or contains) something with a risk rating."""
+    if isinstance(value, dict):
+        return "risk" in value or any(_carries_risk(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_carries_risk(v) for v in value)
+    return False
+
+
 class _SafeHTML(str):
     """A string already known to be safe HTML — _esc() passes it through unchanged."""
 
@@ -4698,9 +5425,13 @@ def generate_html_report(state, output_path=None):
     if "wifi" in state:
         w = state["wifi"]
         colour = RISK_COLOUR.get(w.get("risk", ""), "")
+        # `or`, not a dict default: check_wifi_security always sets both keys, so
+        # the '?' fallback was dead and an unreadable mode rendered as
+        # "Auth: None" — which is the literal string macOS prints for an OPEN
+        # network, and which this module's own parser treats as exactly that.
         body = f"""<table><tbody>
-          <tr><td><strong>SSID</strong></td><td>{_esc(w.get('ssid','?'))}</td></tr>
-          <tr><td><strong>Auth</strong></td><td>{_esc(w.get('auth','?'))}</td></tr>
+          <tr><td><strong>SSID</strong></td><td>{_esc(w.get('ssid') or 'unknown')}</td></tr>
+          <tr><td><strong>Auth</strong></td><td>{_esc(w.get('auth') or 'unknown (could not be read)')}</td></tr>
           <tr><td><strong>Risk</strong></td><td>{risk_badge(w.get('risk','?'))}</td></tr>
           <tr><td><strong>Note</strong></td><td>{_esc(w.get('note',''))}</td></tr>
         </tbody></table>"""
@@ -4709,11 +5440,26 @@ def generate_html_report(state, output_path=None):
     # ARP spoofing
     if "arp_spoof" in state:
         a = state["arp_spoof"]
-        risk = "HIGH" if a.get("spoofing_suspected") else "OK"
-        body = f"""<p>{risk_badge(risk)} Gateway: {_esc(a.get('gateway','?'))}</p>
-                   <p>MACs seen: {_esc(', '.join(a.get('macs_seen', []) or ['none']))}</p>"""
+        macs = a.get("macs_seen") or []
+        # Three states, not two. spoofing_suspected is len(macs_seen) > 1, which
+        # is False for "stable" and equally False for "never observed" — and
+        # action_arp_spoof_check returns a bare {} when the gateway cannot be
+        # determined at all, which callers still store. So a green OK used to
+        # render beside "Gateway: ?" on a check that never ran. The terminal has
+        # always got this right by returning early before its [OK] line.
+        if a.get("spoofing_suspected"):
+            risk = "HIGH"
+        elif macs:
+            risk = "OK"
+        else:
+            risk = "REVIEW"
+        body = f"""<p>{risk_badge(risk)} Gateway: {_esc(a.get('gateway') or '?')}</p>
+                   <p>MACs seen: {_esc(', '.join(macs) or 'none')}</p>"""
         if a.get("spoofing_suspected"):
             body += "<p style='color:red'><strong>⚠ Multiple MACs detected — possible ARP poisoning!</strong></p>"
+        elif not macs:
+            body += ("<p>No MAC was resolved for the gateway, so nothing was "
+                     "compared. This is not evidence that the gateway is stable.</p>")
         sections_html += section("ARP Spoofing Check", body)
 
     # Firewall
@@ -4791,14 +5537,25 @@ def generate_html_report(state, output_path=None):
     # DHCP
     if "dhcp" in state:
         responders = state["dhcp"].get("responders", [])
-        if len(responders) > 1:
+        # The error is read first, and it has to be: binding port 68 needs root,
+        # so on a normal non-sudo run action_rogue_dhcp returns
+        # {"responders": [], "error": ...} and no packet ever left the machine.
+        # Reading only `responders` rendered that as "No DHCP responses
+        # captured." — a statement about the network, made by a check that did
+        # not run. The key had two producers and no consumer anywhere.
+        error = state["dhcp"].get("error")
+        if error:
+            body = (f"<p>{risk_badge('REVIEW')} {_esc(error)}</p>"
+                    "<p>No DHCP request was sent, so nothing is known about which "
+                    "servers would have answered.</p>")
+        elif len(responders) > 1:
             rows = [[r["ip"], r["offered_ip"]] for r in responders]
             body = f"<p>{risk_badge('HIGH')} Multiple DHCP servers detected!</p>" + \
                    table(["Server IP", "Offered IP"], rows)
         elif responders:
-            body = f"<p>{risk_badge('OK')} One DHCP server: {responders[0]['ip']}</p>"
+            body = f"<p>{risk_badge('OK')} One DHCP server: {_esc(responders[0]['ip'])}</p>"
         else:
-            body = "<p>No DHCP responses captured.</p>"
+            body = f"<p>{risk_badge('OK')} No DHCP responses captured.</p>"
         sections_html += section("Rogue DHCP Check", body)
 
     # Listening services
@@ -4828,6 +5585,113 @@ def generate_html_report(state, output_path=None):
                      "identity. A rogue router answers exactly as this one did, so "
                      "this is <strong>not a passed check</strong>.</p>")
         sections_html += section("Router Hostname Check", body)
+
+    # Evil twin
+    if "evil_twin" in state:
+        t = state["evil_twin"]
+        rows = [[b, "not in baseline" if b in (t.get("unexpected") or []) else ""]
+                for b in (t.get("bssids") or [])]
+        body = (f"<p>{risk_badge(t.get('risk', 'REVIEW'))} SSID: "
+                f"{_esc(t.get('ssid') or 'unknown')}</p>"
+                f"<p>{_esc(t.get('note', ''))}</p>")
+        if rows:
+            body += table(["BSSID", "Status"], rows)
+        sections_html += section("Evil Twin Check", body)
+
+    # IPv6 router advertisements
+    if "ipv6" in state:
+        ra = state["ipv6"]
+        body = (f"<p>{risk_badge(ra.get('risk', 'REVIEW'))} {_esc(ra.get('note', ''))}</p>")
+        routers = ra.get("routers") or []
+        if routers:
+            body += table(["Advertising router"], [[r] for r in routers])
+        sections_html += section("IPv6 Router Advertisements", body)
+
+    # Interception: trust store and the DNS path
+    if "interception" in state:
+        inter = state["interception"]
+        body = ""
+        trust = inter.get("trust_store")
+        if trust:
+            body += (f"<p>{risk_badge(trust.get('risk', 'REVIEW'))} Trust store: "
+                     f"{_esc(trust.get('note', ''))}</p>")
+            entries = trust.get("entries") or []
+            if entries:
+                body += table(["Added root certificate"], [[e] for e in entries])
+        dns_probe = inter.get("dns_interception")
+        if dns_probe:
+            body += (f"<p>{risk_badge(dns_probe.get('risk', 'REVIEW'))} DNS path: "
+                     f"{_esc(dns_probe.get('note', ''))}</p>")
+        if body:
+            sections_html += section("Interception Checks", body)
+
+    # Router certificate
+    if "router_tls" in state:
+        tls = state["router_tls"]
+        digest = tls.get("sha256")
+        if digest:
+            body = (f"<p>{risk_badge('INFO')} Certificate fingerprint: "
+                    f"<code>{_esc(digest)}</code></p>"
+                    "<p>Recorded so a change between runs is visible. The router's "
+                    "admin certificate is self-signed and stable, so a different "
+                    "fingerprint means it was re-issued or something is answering "
+                    "in the router's place.</p>")
+        else:
+            body = (f"<p>{risk_badge('REVIEW')} No certificate was read from the "
+                    "gateway, so there is nothing to compare against next run.</p>")
+        sections_html += section("Router Certificate", body)
+
+    # Upstream modem ports
+    if "upstream_open_ports" in state:
+        ports = state["upstream_open_ports"]
+        if ports is None:
+            body = (f"<p>{risk_badge('REVIEW')} The upstream modem could not be "
+                    "scanned, so nothing is known about which ports it exposes.</p>")
+        elif ports:
+            body = (f"<p>{risk_badge('HIGH')} Open port(s) on the upstream modem: "
+                    f"{_esc(', '.join(str(p) for p in ports))}</p>"
+                    "<p>This device faces the internet directly, so a port open here "
+                    "is exposed more widely than one on the router behind it.</p>")
+        else:
+            body = f"<p>{risk_badge('OK')} No open ports found on the upstream modem.</p>"
+        sections_html += section("Upstream Modem Ports", body)
+
+    # DSL line stats
+    if "dsl" in state:
+        d = state["dsl"]
+        def _val(v, unit):
+            return f"{v}{unit}" if v is not None else "not read"
+        rows = [
+            ["Downstream sync", _val(d.get("downstream_kbps"), " Kbps")],
+            ["Upstream sync", _val(d.get("upstream_kbps"), " Kbps")],
+            ["Downstream SNR", _val(d.get("downstream_snr_db"), " dB")],
+            ["Upstream SNR", _val(d.get("upstream_snr_db"), " dB")],
+        ]
+        sections_html += section("DSL Line", table(["Measurement", "Value"], rows))
+
+    # Nothing that carries a risk may be silently absent from this file.
+    #
+    # The report used to render fifteen hand-written sections while the audit
+    # populated twenty-one keys, and six of those — the evil-twin check, IPv6
+    # router advertisements, DNS interception, the trust store, the router
+    # certificate and the upstream modem's ports — appeared nowhere in it. Four
+    # of them can return HIGH. So a run that printed two HIGH findings in the
+    # terminal produced a file containing no trace of either, while the
+    # provenance footer below still counted them among the findings resting on
+    # "measurements this tool made itself". The file is the artefact people
+    # forward; it was the one that lied.
+    #
+    # A missing section is now a visible finding in the report rather than an
+    # absence, so the next check added cannot go unrendered quietly.
+    _unrendered = sorted(k for k in state
+                         if k not in RENDERED_STATE_KEYS and _carries_risk(state[k]))
+    if _unrendered:
+        sections_html += section("Not Included In This Report", (
+            f"<p>{risk_badge('REVIEW')} This report has no section for "
+            f"{_esc(', '.join(_unrendered))}, and {'they' if len(_unrendered) > 1 else 'it'} "
+            "carried a risk rating in this run. Read the terminal output for "
+            f"{'those' if len(_unrendered) > 1 else 'that'} finding(s) — this file is "
+            "incomplete.</p>"))
 
     # Evidence provenance.
     #
@@ -4887,9 +5751,27 @@ def generate_html_report(state, output_path=None):
 </body>
 </html>"""
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
+    # The same protection the baseline gets, for the same content. This file
+    # holds MACs, topology, hostnames, the SSID and which credential/port/method
+    # combinations the router accepted, and it was written 0644 into a 0755
+    # directory — readable by every account on the machine. _secure_dir was
+    # reachable only from a baseline or history write, so `--html-report
+    # --no-save-baseline` never called it at all.
+    _secure_dir()
+    report_dir = os.path.dirname(output_path)
+    os.makedirs(report_dir, exist_ok=True)
+    try:
+        os.chmod(report_dir, 0o700)
+    except OSError:
+        pass
+    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(html_doc)
+    try:
+        # O_CREAT leaves an existing file's mode alone, so set it explicitly.
+        os.chmod(output_path, 0o600)
+    except OSError:
+        pass
 
     return output_path
 
@@ -5030,11 +5912,17 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             mac = d["mac"]
             name = labels.get(mac.lower(), "")
             vend = d.get("vendor", "")
+            # "(randomized/private MAC)" is what lookup_vendor returns when it
+            # declines to look one up. It reads as a vendor here and suppressed
+            # the "unlabelled" flag, so a device the tool explicitly could not
+            # identify was presented as identified — and left out of the count
+            # that tells the reader how many they still have to account for.
+            identified = name or (vend if vend != PRIVATE_MAC_VENDOR else "")
             display_name = name or vend
             tag = f"  {display_name}" if display_name else ""
-            flag = "" if display_name else "  <-- unlabelled"
+            flag = "" if identified else "  <-- unlabelled"
             print(f"    {d['ip']:<15} {mac}{tag}{flag}")
-            if not display_name:
+            if not identified:
                 unlabelled.append(mac)
             total += 1
 
@@ -5067,6 +5955,24 @@ def onlink_coverage(subnets_to_sweep, interfaces):
     onlink = [net for _, _, net in (interfaces or [])]
     return [str(s) for s in subnets_to_sweep
             if any(s.overlaps(net) for net in onlink)]
+
+
+def is_onlink(address, interfaces):
+    """Whether `address` sits in a subnet this machine has an interface in.
+
+    Used before anything is sent that must not leave the LAN. Off-link is not a
+    connectivity question here — the packet would very likely be delivered, via
+    the default route, to a device belonging to someone else.
+
+    With no interface list at all the answer is False: unknown must not read as
+    permission, since the whole point of the check is the case where nobody
+    checked.
+    """
+    try:
+        addr = ipaddress.ip_address(str(address))
+    except ValueError:
+        return False
+    return any(addr in net for _, _, net in (interfaces or []))
 
 
 def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
@@ -5104,7 +6010,24 @@ def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
         if net not in seen:
             seen.add(net)
             ordered.append(net)
-    return ordered
+
+    # Refuse a sweep too large to finish. discover_devices materialises
+    # list(subnet.hosts()) and hands every address to a 50-worker pool running
+    # one ping subprocess each, so --subnet 10.0.0.0/8 means 16.7 million
+    # processes. It is self-inflicted and interruptible, but it is also
+    # pointless: discovery resolves neighbours through the ARP cache, which
+    # holds on-link entries only, so nothing beyond the local prefix could be
+    # seen however long it ran.
+    kept = []
+    for net in ordered:
+        if net.num_addresses > MAX_SWEEP_ADDRESSES:
+            print(f"  Skipping {net}: {net.num_addresses:,} addresses is past the "
+                  f"{MAX_SWEEP_ADDRESSES:,} this sweep will attempt. ARP discovery "
+                  "cannot see past the on-link prefix anyway — pass the specific "
+                  "subnet you mean.")
+            continue
+        kept.append(net)
+    return kept
 
 
 def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_note=""):
@@ -5134,7 +6057,7 @@ def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_
         for d in all_devices:
             mac = d["mac"]
             if is_randomized_mac(mac) and not labels.get(mac.lower()):
-                d["vendor"] = "(randomized/private MAC)"
+                d["vendor"] = PRIVATE_MAC_VENDOR
             else:
                 d["vendor"] = ""
         for i, d in enumerate(needs_lookup):
@@ -5210,8 +6133,11 @@ def action_save_baseline(state):
     if _net_line:
         print(_net_line)
     passphrase = resolve_passphrase(prompt=True)
-    save_baseline(state, passphrase=passphrase)
+    _record = save_baseline(state, passphrase=passphrase)
     print(f"Baseline saved to {BASELINE_FILE}")
+    _pub = describe_publish_result(_record.get("_receipt"))
+    if _pub:
+        print(_pub)
     if passphrase is None:
         print("  Note: saved unsealed. Set a passphrase (or "
               f"{PASSPHRASE_ENV}) so the baseline cannot be silently rewritten.")
@@ -5230,12 +6156,19 @@ def action_compare_baseline(state):
     _sink = resolve_sink()
     if _sink:
         print(describe_receipt_status(compare_with_receipts(
-            load_baseline_record(), read_receipts(_sink))))
+            load_baseline_record(), read_receipts(_sink), sink=_sink)))
         # Silent unless a monitor has actually run, so an audit-only user gains
         # no noise from a feature they are not using.
-        _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
+        _beats = read_heartbeats(_sink)
+        _gaps = describe_observation_gaps(observation_gaps(_beats))
         if _gaps:
             print(_gaps)
+        # Future-stamped heartbeats are excluded from the coverage check above,
+        # and saying so matters: the sink is append-only, so an entry that
+        # cannot be removed was either mis-stamped by a wrong clock or added.
+        _clock = describe_clock_anomalies(_beats)
+        if _clock:
+            print(_clock)
         # Reads both channels: a monitor-only deployment publishes heartbeats
         # for weeks without a single baseline receipt, and that is exactly where
         # an edited script has the longest to go unnoticed.
@@ -5300,16 +6233,34 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     # DSL stats
     if tplink_password:
         hr("DSL LINE STATS (TP-Link VX420-G2h)")
-        tplink_ip = upstream_ip or "192.168.1.1"
-        dsl, note = tplink_dsl_stats(tplink_ip, tplink_password)
-        if note:
-            print(f"  Note: {note}")
-        fmt = lambda v, u: f"{v}{u}" if v is not None else "n/a"
-        print(f"  Downstream sync : {fmt(dsl['downstream_kbps'], ' Kbps')}")
-        print(f"  Upstream sync   : {fmt(dsl['upstream_kbps'], ' Kbps')}")
-        print(f"  Downstream SNR  : {fmt(dsl['downstream_snr_db'], ' dB')}  (healthy >6 dB)")
-        print(f"  Upstream SNR    : {fmt(dsl['upstream_snr_db'], ' dB')}")
-        state["dsl"] = dsl
+        # The gateway, not a hardcoded 192.168.1.1.
+        #
+        # tplink_dsl_stats puts the modem password in the query string of a
+        # plain http:// GET — base64 first, then MD5 on retry, both replayable.
+        # Defaulting the destination to a literal address meant that on a LAN
+        # numbered anything else, the request left via the default route: over
+        # a split-tunnel VPN, or through a router that forwards RFC1918, it
+        # reaches a stranger's device and lands in their access log. The only
+        # feedback was "Could not retrieve DSL stats — auth failed."
+        tplink_ip = upstream_ip or gateway
+        if not tplink_ip:
+            print("  Skipped: no upstream modem address and no gateway, so there is "
+                  "nowhere on this network to send the request.")
+        elif not is_onlink(tplink_ip, interfaces):
+            print(f"  Skipped: {tplink_ip} is not on any network this machine is "
+                  "joined to, and the modem password would have left the LAN in "
+                  "the clear to get there. Pass --upstream with an on-link address.")
+        else:
+            print(f"  Requesting DSL stats from {tplink_ip} ...")
+            dsl, note = tplink_dsl_stats(tplink_ip, tplink_password)
+            if note:
+                print(f"  Note: {note}")
+            fmt = lambda v, u: f"{v}{u}" if v is not None else "n/a"
+            print(f"  Downstream sync : {fmt(dsl['downstream_kbps'], ' Kbps')}")
+            print(f"  Upstream sync   : {fmt(dsl['upstream_kbps'], ' Kbps')}")
+            print(f"  Downstream SNR  : {fmt(dsl['downstream_snr_db'], ' dB')}  (healthy >6 dB)")
+            print(f"  Upstream SNR    : {fmt(dsl['upstream_snr_db'], ' dB')}")
+            state["dsl"] = dsl
 
     # DNS
     hr("DNS SETTINGS")
@@ -5407,12 +6358,19 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     _sink = resolve_sink()
     if _sink:
         print(describe_receipt_status(compare_with_receipts(
-            load_baseline_record(), read_receipts(_sink))))
+            load_baseline_record(), read_receipts(_sink), sink=_sink)))
         # Silent unless a monitor has actually run, so an audit-only user gains
         # no noise from a feature they are not using.
-        _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
+        _beats = read_heartbeats(_sink)
+        _gaps = describe_observation_gaps(observation_gaps(_beats))
         if _gaps:
             print(_gaps)
+        # Future-stamped heartbeats are excluded from the coverage check above,
+        # and saying so matters: the sink is append-only, so an entry that
+        # cannot be removed was either mis-stamped by a wrong clock or added.
+        _clock = describe_clock_anomalies(_beats)
+        if _clock:
+            print(_clock)
         # Reads both channels: a monitor-only deployment publishes heartbeats
         # for weeks without a single baseline receipt, and that is exactly where
         # an edited script has the longest to go unnoticed.
@@ -5759,8 +6717,11 @@ def main():
         if args.publish_to:
             os.environ[SINK_ENV] = args.publish_to
         passphrase = resolve_passphrase(prompt=args.seal_baseline)
-        save_baseline(state, passphrase=passphrase)
+        _record = save_baseline(state, passphrase=passphrase)
         print(f"\nBaseline saved to {BASELINE_FILE}")
+        _pub = describe_publish_result(_record.get("_receipt"))
+        if _pub:
+            print(_pub)
         if passphrase is None:
             print(f"Note: saved unsealed. Use --seal-baseline or set "
                   f"{PASSPHRASE_ENV} to make it tamper-evident.")

@@ -37,6 +37,35 @@ STATE = {
 }
 
 
+class FakeResponse:
+    """The three things _publish_https reads off a response.
+
+    geturl() is not decoration: the publish is only counted if the URL that
+    answered is the URL that was configured. See TestRedirectsAreRefused.
+    """
+    def __init__(self, url, code=200):
+        self._url = url
+        self._code = code
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def getcode(self): return self._code
+    def geturl(self): return self._url
+
+
+def fake_opener(monkeypatch, handler):
+    """Patch build_opener so `.open(req, timeout=)` runs `handler(req, timeout)`.
+
+    publish_receipt goes through an opener rather than urlopen because it has to
+    install a redirect handler that refuses; the sandbox blocks the real
+    OpenerDirector.open, so tests fake it here.
+    """
+    class _Opener:
+        def open(self, req, timeout=None):
+            return handler(req, timeout)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
+
+
 @pytest.fixture
 def sink(tmp_path, monkeypatch, mod):
     """An off-host sink the audited machine appends to but should not own."""
@@ -211,9 +240,9 @@ class TestPublishFailsLoudlyNotSilently:
         assert mod.verify_baseline(passphrase=PASSPHRASE)["status"] == "ok"
 
     def test_an_http_error_is_reported_not_raised(self, mod, monkeypatch):
-        def boom(*a, **k):
+        def boom(req, timeout=None):
             raise urllib.error.URLError("connection refused")
-        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        fake_opener(monkeypatch, boom)
         report = mod.publish_receipt({"seq": 1, "seal": "a"},
                                      destination="https://collector.example/receipts")
         assert report["published"] is False
@@ -242,18 +271,13 @@ class TestSinkDestinations:
     def test_https_posts_json_with_a_bearer_token(self, mod, monkeypatch):
         seen = {}
 
-        class FakeResponse:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def getcode(self): return 202
-
-        def fake_urlopen(req, timeout=None):
+        def handler(req, timeout=None):
             seen["url"] = req.full_url
             seen["headers"] = {k.lower(): v for k, v in req.headers.items()}
             seen["body"] = json.loads(req.data.decode())
-            return FakeResponse()
+            return FakeResponse(req.full_url, 202)
 
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        fake_opener(monkeypatch, handler)
         report = mod.publish_receipt({"seq": 3, "seal": "abc"},
                                      destination="https://collector.example/r",
                                      token="write-only-token")
@@ -265,34 +289,84 @@ class TestSinkDestinations:
     def test_the_token_is_read_from_the_environment_when_not_passed(self, mod, monkeypatch):
         seen = {}
 
-        class FakeResponse:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def getcode(self): return 200
-
-        def fake_urlopen(req, timeout=None):
+        def handler(req, timeout=None):
             seen["auth"] = req.headers.get("Authorization")
-            return FakeResponse()
+            return FakeResponse(req.full_url)
 
         monkeypatch.setenv(mod.SINK_TOKEN_ENV, "env-token")
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        fake_opener(monkeypatch, handler)
         mod.publish_receipt({"seq": 1, "seal": "a"}, destination="https://x.example/r")
         assert seen["auth"] == "Bearer env-token"
 
     def test_no_authorization_header_when_no_token_is_available(self, mod, monkeypatch):
         seen = {}
 
-        class FakeResponse:
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def getcode(self): return 200
+        def handler(req, timeout=None):
+            seen["auth"] = req.headers.get("Authorization")
+            return FakeResponse(req.full_url)
 
         monkeypatch.delenv(mod.SINK_TOKEN_ENV, raising=False)
-        monkeypatch.setattr(urllib.request, "urlopen",
-                            lambda req, timeout=None: (seen.update(
-                                auth=req.headers.get("Authorization")), FakeResponse())[1])
+        fake_opener(monkeypatch, handler)
         mod.publish_receipt({"seq": 1, "seal": "a"}, destination="https://x.example/r")
         assert seen["auth"] is None
+
+
+class TestRedirectsAreRefused:
+    """urllib's default handler makes a redirect silently destructive.
+
+    On 301/302/303 it turns the POST into a bodiless GET and copies every
+    header except content-length and content-type to the new host. So an
+    `http://collector/receipts` that redirects to https — close to universal —
+    dropped the receipt body on every publish while this function reported
+    "Receipt accepted (HTTP 200)". The sink stayed empty, and the one check
+    that survives a wiped ~/.home_net_audit was never armed. The same handler
+    carried the Authorization header to whatever host the redirect named.
+    """
+
+    def test_a_redirect_is_reported_as_a_failed_publish(self, mod, monkeypatch):
+        def handler(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 301, "Moved Permanently", {}, None)
+
+        fake_opener(monkeypatch, handler)
+        report = mod.publish_receipt({"seq": 1, "seal": "a"},
+                                     destination="http://collector.example/r")
+        assert report["published"] is False
+
+    def test_landing_on_a_different_url_is_not_counted_as_published(self, mod, monkeypatch):
+        # Belt and braces for any handler that follows one anyway.
+        def handler(req, timeout=None):
+            return FakeResponse("https://elsewhere.example/r")
+
+        fake_opener(monkeypatch, handler)
+        report = mod.publish_receipt({"seq": 1, "seal": "a"},
+                                     destination="https://collector.example/r")
+        assert report["published"] is False
+        assert "elsewhere.example" in report["detail"]
+
+    def test_the_opener_installs_a_refusing_redirect_handler(self, mod, monkeypatch):
+        installed = []
+        monkeypatch.setattr(urllib.request, "build_opener",
+                            lambda *a, **k: installed.extend(a) or _NullOpener())
+        mod.publish_receipt({"seq": 1, "seal": "a"},
+                            destination="https://collector.example/r")
+        assert mod._NoRedirects in installed
+
+    def test_a_token_is_never_sent_over_plain_http(self, mod, monkeypatch):
+        # A bearer token over http is readable by anyone on the path, starting
+        # with the LAN this tool is auditing.
+        fake_opener(monkeypatch,
+                    lambda req, timeout=None: pytest.fail("must not send at all"))
+        report = mod.publish_receipt({"seq": 1, "seal": "a"},
+                                     destination="http://collector.example/r",
+                                     token="write-only-token")
+        assert report["published"] is False
+        assert "https" in report["detail"]
+
+
+class _NullOpener:
+    def open(self, req, timeout=None):
+        return FakeResponse(req.full_url)
 
 
 class TestReceiptLogReading:
@@ -318,6 +392,152 @@ class TestReceiptLogReading:
                     {"seq": 2, "seal": "b"}]
         report = mod.compare_with_receipts({"seq": 1, "seal": "a"}, receipts)
         assert report["status"] == "history_truncated"
+
+    @pytest.mark.parametrize("line", ["null", "0", '"str"', "[]"],
+                             ids=["null", "int", "string", "list"])
+    def test_a_line_that_is_valid_json_but_not_an_object_is_dropped(self, mod, tmp_path, line):
+        # `null` parses fine and then reached compare_with_receipts as
+        # `r.get(...)` — AttributeError, on every run, with no verdict, no diff,
+        # no baseline saved and no report. read_heartbeats and code_attestations
+        # already guarded; the guard belongs where the entries are produced.
+        target = tmp_path / "receipts.jsonl"
+        target.write_text(f'{{"seq": 1, "seal": "a"}}\n{line}\n', encoding="utf-8")
+        receipts = mod.read_receipts(str(target))
+        assert receipts == [{"seq": 1, "seal": "a"}]
+        assert mod.compare_with_receipts({"seq": 1, "seal": "a"}, receipts)["status"] == "ok"
+
+
+class TestALocalSeqAheadOfTheSinkIsNotAgreement:
+    """A run the sink never saw cannot be evidence that the sink agrees.
+
+    Past the history_truncated guard, `match` was empty, both remaining guards
+    skipped, and execution fell through to "ok — Local baseline agrees with N
+    off-host receipt(s)". So a fabricated record at seq 99 beside seven genuine
+    receipts read as a clean bill of health, and so did every run made while
+    publishing was quietly failing.
+    """
+
+    def test_a_seq_ahead_of_every_receipt_is_reported(self, mod):
+        receipts = [{"seq": i, "seal": f"s{i}"} for i in range(1, 8)]
+        report = mod.compare_with_receipts({"seq": 99, "seal": "FORGED"}, receipts)
+        assert report["status"] == "unpublished_runs"
+        assert "REVIEW" in mod.describe_receipt_status(report)
+
+    def test_the_detail_names_how_many_runs_are_unaccounted_for(self, mod):
+        receipts = [{"seq": 1, "seal": "a"}]
+        report = mod.compare_with_receipts({"seq": 4, "seal": "d"}, receipts)
+        assert "3 run(s) were never published" in report["detail"]
+
+    def test_matching_seqs_are_still_ok(self, mod):
+        receipts = [{"seq": 1, "seal": "a"}, {"seq": 2, "seal": "b"}]
+        assert mod.compare_with_receipts({"seq": 2, "seal": "b"},
+                                         receipts)["status"] == "ok"
+
+
+class TestTheFirstReceiptForARunIsTheReference:
+    """An append-only sink lets the host add lines. It cannot let it remove any.
+
+    seal_mismatch compared against match[-1] — the newest receipt for a seq,
+    which is precisely the one an attacker is able to append. Publishing a
+    second receipt for run 7 carrying the forged seal therefore made the
+    forgery the reference and the comparison passed. The existing test suite
+    missed it only because it publishes one receipt per seq.
+    """
+
+    def test_appending_a_second_receipt_does_not_launder_a_forged_seal(self, mod):
+        receipts = [{"seq": 7, "seal": "real"}, {"seq": 7, "seal": "FORGED"}]
+        report = mod.compare_with_receipts({"seq": 7, "seal": "FORGED"}, receipts)
+        assert report["status"] != "ok"
+
+    def test_two_seals_for_one_run_is_itself_the_finding(self, mod):
+        receipts = [{"seq": 7, "seal": "real"}, {"seq": 7, "seal": "FORGED"}]
+        report = mod.compare_with_receipts({"seq": 7, "seal": "FORGED"}, receipts)
+        assert report["status"] == "seal_conflict"
+        assert "HIGH" in mod.describe_receipt_status(report)
+
+    def test_a_duplicate_of_the_same_seal_is_not_a_conflict(self, mod):
+        # Republishing an identical receipt is harmless bookkeeping.
+        receipts = [{"seq": 7, "seal": "real"}, {"seq": 7, "seal": "real"}]
+        assert mod.compare_with_receipts({"seq": 7, "seal": "real"},
+                                         receipts)["status"] == "ok"
+
+
+class TestAWriteOnlySinkSaysSoRatherThanNothingToCompare:
+    """An https sink cannot be read back: read_receipts open()s it as a path.
+
+    Publishing branches on the scheme; reading never did. So thirty published
+    runs followed by `rm -rf ~/.home_net_audit` produced "[REVIEW] No off-host
+    receipts to compare against" — which is false, and REVIEW where the truth
+    is the HIGH history_truncated. --publish-to's own help advertises the URL
+    alongside the guarantee that silently did not hold.
+    """
+
+    def test_an_https_sink_is_not_reported_as_an_empty_one(self, mod):
+        report = mod.compare_with_receipts({"seq": 1, "seal": "a"}, [],
+                                           sink="https://collector.example/r")
+        assert report["status"] == "sink_unreadable"
+        assert "cannot" in report["detail"] and "read" in report["detail"]
+
+    def test_reading_an_https_sink_returns_nothing_rather_than_guessing(self, mod):
+        assert mod.read_receipts("https://collector.example/r") == []
+
+    def test_a_genuinely_empty_local_sink_is_still_no_receipts(self, mod, tmp_path):
+        report = mod.compare_with_receipts({"seq": 1, "seal": "a"}, [],
+                                           sink=str(tmp_path))
+        assert report["status"] == "no_receipts"
+
+
+class TestReceiptsForAnotherChainAreNotSilence:
+    """chain_id is derived from the baseline filename, hence from the subnet.
+
+    A renumbering rogue DHCP server therefore moves the chain, orphans every
+    receipt this machine ever published, and used to leave "[REVIEW] No
+    off-host receipts to compare against" — while a fresh chain was sealed at
+    seq 1 under the attacker's numbering. That is the strongest evidence
+    available being discarded and reported as an absence.
+    """
+
+    def test_receipts_belonging_only_to_other_chains_are_reported(self, mod):
+        receipts = [{"seq": 7, "seal": "a", "chain": "another-chain"}]
+        report = mod.compare_with_receipts({"seq": 1, "seal": "x"}, receipts)
+        assert report["status"] == "chain_unknown"
+        assert "1 receipt(s)" in report["detail"]
+
+    def test_a_truly_empty_sink_is_still_no_receipts(self, mod):
+        assert mod.compare_with_receipts({"seq": 1, "seal": "x"},
+                                         [])["status"] == "no_receipts"
+
+    def test_heartbeats_alone_do_not_count_as_another_chain(self, mod):
+        # Heartbeats say nothing about baselines in any chain.
+        receipts = [{"kind": "heartbeat", "chain": "another-chain", "at": "x"}]
+        assert mod.compare_with_receipts({"seq": 1, "seal": "x"},
+                                         receipts)["status"] == "no_receipts"
+
+
+class TestAFailedPublishIsSurfaced:
+    """publish_receipt has always documented that the caller must surface this.
+
+    "A receipt that silently failed to leave the machine is the same as never
+    having sent one" — and no caller checked. An unmounted sink or an expired
+    token produced months of runs that published nothing and printed nothing.
+    """
+
+    def test_a_failed_publish_produces_a_review_line(self, mod):
+        line = mod.describe_publish_result({"published": False, "mode": "digest",
+                                            "detail": "sink down"})
+        assert line is not None
+        assert "REVIEW" in line and "sink down" in line
+
+    def test_a_successful_publish_produces_no_line(self, mod):
+        assert mod.describe_publish_result(
+            {"published": True, "mode": "digest", "detail": "ok"}) is None
+
+    def test_save_baseline_hands_the_result_back_to_the_caller(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "publish_receipt",
+                            lambda *a, **k: {"published": False, "mode": "digest",
+                                             "detail": "sink down"})
+        record = mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        assert record["_receipt"]["published"] is False
 
 
 class TestSealIsNotDisturbedByPublishing:

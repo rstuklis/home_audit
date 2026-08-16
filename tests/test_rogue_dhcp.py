@@ -123,6 +123,80 @@ class TestOfferParsing:
         assert responders[0]["offered_ip"] == "unknown"
 
 
+class TestTheCookieIsReadAtItsFixedOffset:
+    """RFC 2131 puts the magic cookie at byte 236, and nowhere else.
+
+    parse_dhcp_options used to `data.find()` it, which handed the sender control
+    of where parsing began: `sname` (44) and `file` (108) are free-form bytes
+    they fill in. A decoy cookie planted there, followed by an 0xff terminator,
+    ended the option walk before it ever reached 236 — so the audit reported the
+    benign gateway from the decoy while the client applied the poisoned one that
+    followed. One rogue server, one responder in the count, nothing flagged.
+    """
+
+    @staticmethod
+    def _packet_with_decoy(decoy_options, real_options):
+        """An OFFER carrying a second cookie inside the `file` field."""
+        decoy = b"\x63\x82\x53\x63" + decoy_options + b"\xff"
+        pkt = struct.pack(
+            "!BBBBLHH4s4s4s4s16s64s128s",
+            2, 1, 6, 0, 0x1234, 0, 0,
+            b"\x00" * 4,
+            socket.inet_aton("192.168.1.100"),
+            b"\x00" * 4, b"\x00" * 4,
+            b"\x00" * 16, b"\x00" * 64,
+            decoy.ljust(128, b"\x00"),        # `file` — sender-controlled
+        )
+        assert len(pkt) == 236, "the cookie must land exactly at byte 236"
+        return pkt + b"\x63\x82\x53\x63" + real_options + b"\xff"
+
+    def test_a_decoy_cookie_in_the_file_field_does_not_hide_the_real_options(
+            self, mod, monkeypatch):
+        pkt = self._packet_with_decoy(
+            decoy_options=b"\x03\x04" + socket.inet_aton("192.168.1.1"),
+            real_options=b"\x03\x04" + socket.inet_aton("10.6.6.6"),
+        )
+        _wire(monkeypatch, mod, [(pkt, ("192.168.1.1", 67))])
+        responders, _ = mod.check_rogue_dhcp(timeout=5)
+        assert responders[0]["router"] == ["10.6.6.6"], \
+            "the options at offset 236 are the ones the client obeys"
+
+    def test_a_decoy_cannot_hide_a_poisoned_default_route(self, mod, monkeypatch):
+        # Option 121 is the one that matters most: it overrides the default
+        # route without touching option 3, so hiding it hides everything.
+        classless = b"\x79\x08" + b"\x00" + socket.inet_aton("10.6.6.6") + b"\x00\x00\x00"
+        pkt = self._packet_with_decoy(
+            decoy_options=b"\x03\x04" + socket.inet_aton("192.168.1.1"),
+            real_options=classless,
+        )
+        _wire(monkeypatch, mod, [(pkt, ("192.168.1.1", 67))])
+        responders, _ = mod.check_rogue_dhcp(timeout=5)
+        assert responders[0]["static_routes"], "the poisoned route must be visible"
+
+    def test_a_packet_with_no_cookie_at_236_yields_no_options(self, mod):
+        assert mod.parse_dhcp_options(b"\x00" * 236 + b"\x03\x04\x01\x02\x03\x04") == {}
+
+    def test_a_packet_too_short_to_reach_the_cookie_yields_no_options(self, mod):
+        assert mod.parse_dhcp_options(b"\x63\x82\x53\x63" * 10) == {}
+
+
+class TestOfferBufferSize:
+    def test_the_receive_buffer_is_large_enough_for_a_full_offer(self, mod, monkeypatch):
+        # 1024 truncated a large OFFER mid-options, so anything past the first
+        # kilobyte was invisible here while the OS client still applied it.
+        sizes = []
+        real = _FakeDhcpSocket.recvfrom
+
+        def recording(self, n):
+            sizes.append(n)
+            return real(self, n)
+
+        monkeypatch.setattr(_FakeDhcpSocket, "recvfrom", recording)
+        _wire(monkeypatch, mod, [(_offer_packet("192.168.1.100"), ("192.168.1.1", 67))])
+        mod.check_rogue_dhcp(timeout=5)
+        assert sizes and min(sizes) >= 4096
+
+
 class TestBindFailure:
     def test_a_bind_denial_returns_an_error_string_not_an_exception(self, mod, monkeypatch):
         # Port 68 needs privilege; without it bind raises PermissionError. The

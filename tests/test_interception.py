@@ -169,16 +169,37 @@ class TestDnsQueryConstruction:
         assert (qtype, qclass) == (1, 1)
 
 
+def dns_reply(qid_source, responder="192.168.1.1", body=b"\x81\x80" + b"\x00" * 8):
+    """A 12-byte-minimum DNS answer echoing the transaction id that was sent."""
+    return (qid_source[:2] + body, (responder, 53))
+
+
 class TestDnsInterceptionProbe:
-    def _fake_socket(self, monkeypatch, reply=None, error=None):
+    def _fake_socket(self, monkeypatch, reply=None, error=None, send_error=None):
+        """reply may be a (bytes, addr) pair or a callable taking the sent query.
+
+        The callable form exists because the transaction id is now random per
+        call, so a test that wants its reply believed has to echo the id the
+        probe actually chose rather than a constant.
+        """
         class FakeSocket:
-            def __init__(self, *a, **k): self.closed = False
+            def __init__(self, *a, **k):
+                self.closed = False
+                self.peer = None
+                self.sent = None
             def settimeout(self, t): pass
-            def sendto(self, data, addr): self.sent = (data, addr)
+            def connect(self, addr):
+                if send_error:
+                    raise send_error
+                self.peer = addr
+            def send(self, data):
+                if send_error:
+                    raise send_error
+                self.sent = (data, self.peer)
             def recvfrom(self, n):
                 if error:
                     raise error
-                return reply
+                return reply(self.sent[0]) if callable(reply) else reply
             def close(self): self.closed = True
 
         created = []
@@ -197,16 +218,17 @@ class TestDnsInterceptionProbe:
         assert result["intercepted"] is False
         assert result["risk"] == "OK"
 
-    def test_any_answer_means_interception(self, mod, monkeypatch):
+    def test_an_answer_echoing_the_query_id_means_interception(self, mod, monkeypatch):
         """192.0.2.1 routes nowhere, so a reply can only come from the path."""
-        self._fake_socket(monkeypatch, reply=(b"\x4a\x4a\x81\x80", ("192.168.1.1", 53)))
+        self._fake_socket(monkeypatch, reply=dns_reply)
         result = mod.probe_dns_interception()
         assert result["intercepted"] is True
         assert result["risk"] == "HIGH"
         assert result["responder"] == "192.168.1.1"
 
     def test_the_responder_is_named_in_the_note(self, mod, monkeypatch):
-        self._fake_socket(monkeypatch, reply=(b"x", ("10.0.0.1", 53)))
+        self._fake_socket(monkeypatch,
+                          reply=lambda q: dns_reply(q, responder="10.0.0.1"))
         assert "10.0.0.1" in mod.probe_dns_interception()["note"]
 
     def test_a_network_error_is_not_interception(self, mod, monkeypatch):
@@ -219,7 +241,7 @@ class TestDnsInterceptionProbe:
         mod.probe_dns_interception()
         assert created[0].closed is True
 
-        created = self._fake_socket(monkeypatch, reply=(b"x", ("10.0.0.1", 53)))
+        created = self._fake_socket(monkeypatch, reply=dns_reply)
         mod.probe_dns_interception()
         assert created[0].closed is True
 
@@ -233,6 +255,68 @@ class TestDnsInterceptionProbe:
         created = self._fake_socket(monkeypatch, error=socket.timeout())
         mod.probe_dns_interception(target="198.51.100.1")
         assert created[0].sent[1] == ("198.51.100.1", 53)
+
+    def test_the_socket_is_connected_so_the_kernel_filters_the_sender(self, mod, monkeypatch):
+        # An unconnected socket accepts a datagram from anyone. connect() is
+        # what makes "something answered" mean "something answered *this*".
+        created = self._fake_socket(monkeypatch, error=socket.timeout())
+        mod.probe_dns_interception()
+        assert created[0].peer == ("192.0.2.1", 53)
+
+
+class TestTheProbeDistinguishesNotRunFromClean:
+    """A send that never left the machine is not evidence of anything.
+
+    sendto and recvfrom used to share one `except (socket.timeout, OSError)`,
+    so ENETUNREACH or EACCES on the *send* returned the same OK verdict as a
+    successful query that timed out: "port 53 is not being transparently
+    redirected", certified from zero observation. Every sibling probe in this
+    module keeps a third state; this one didn't.
+    """
+
+    def test_a_send_that_never_left_is_review_not_ok(self, mod, monkeypatch):
+        TestDnsInterceptionProbe()._fake_socket(
+            monkeypatch, send_error=OSError(13, "Permission denied"))
+        result = mod.probe_dns_interception()
+        assert result["risk"] == "REVIEW"
+        assert result["intercepted"] is None, "unknown must not collapse into False"
+
+    def test_the_review_note_says_the_check_did_not_run(self, mod, monkeypatch):
+        TestDnsInterceptionProbe()._fake_socket(
+            monkeypatch, send_error=OSError(51, "Network is unreachable"))
+        assert "has not run" in mod.probe_dns_interception()["note"]
+
+
+class TestTheAnswerIsValidatedBeforeItIsBelieved:
+    """The verdict used to fire on a datagram merely existing.
+
+    The socket was unconnected, `data` was bound and never read, and nothing
+    checked the transaction id — so any stray or deliberately sprayed packet
+    landing on the ephemeral port produced a HIGH naming a responder of the
+    sender's choosing.
+    """
+
+    def test_a_reply_with_the_wrong_transaction_id_is_not_interception(self, mod, monkeypatch):
+        TestDnsInterceptionProbe()._fake_socket(
+            monkeypatch, reply=(b"\x00\x00" + b"\x00" * 10, ("10.0.0.1", 53)))
+        result = mod.probe_dns_interception()
+        assert result["intercepted"] is False
+        assert result["risk"] == "OK"
+
+    def test_a_reply_too_short_to_be_dns_is_not_interception(self, mod, monkeypatch):
+        TestDnsInterceptionProbe()._fake_socket(
+            monkeypatch, reply=lambda q: (q[:2], ("10.0.0.1", 53)))
+        assert mod.probe_dns_interception()["intercepted"] is False
+
+    def test_the_transaction_id_is_not_a_constant(self, mod, monkeypatch):
+        # It was hard-coded at 0x4a4a, which an attacker can simply echo.
+        seen = set()
+        for _ in range(8):
+            created = TestDnsInterceptionProbe()._fake_socket(
+                monkeypatch, error=socket.timeout())
+            mod.probe_dns_interception()
+            seen.add(created[0].sent[0][:2])
+        assert len(seen) > 1, "the query id must be random per call"
 
 
 class TestReporting:

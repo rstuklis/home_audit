@@ -72,7 +72,7 @@ jobs:
           # check but an empty one. Both take -n.
           # tests/test_capture_redaction.py pins the same property for
           # tools/capture_fixtures.py against the audit's own source.
-          cap arp_a arp -a
+          cap arp_a arp -an
           cap ndp_a ndp -an
           cap ndp_r ndp -rn
           cap netstat_rn netstat -rn

@@ -477,8 +477,10 @@ class TestCaptureContract:
         hostname and every row is dropped — the CI capture documented that
         command for weeks while the audit ran `ndp -an`, and the fixtures
         described output nothing produced. The same slip went the other way in
-        this tool's first version, which captured `arp -an` while the audit
-        runs `arp -a`.
+        this tool's first version, which captured `arp -an` while the audit ran
+        `arp -a` — and then a third time, in the same place, when the audit
+        moved to `arp -an` because the resolved name turned out to be
+        attacker-controlled text that the MAC pattern matched first.
 
         Comparing against the audit's source rather than a list written here
         is the whole point: a hand-kept copy only proves it matches itself.

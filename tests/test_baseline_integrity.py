@@ -201,6 +201,137 @@ class TestChainDetectsReplacement:
         # The unreadable line is skipped; the real entry still governs.
         assert mod.verify_baseline(passphrase=PASSPHRASE)["status"] == "ok"
 
+    @pytest.mark.parametrize("line", ["0", "null", '"a string"', "[1, 2]"],
+                             ids=["int", "null", "string", "list"])
+    def test_a_history_line_that_is_valid_json_but_not_an_object(self, mod, line):
+        """"{not json" was caught; "0" was not.
+
+        json.loads returns a perfectly good int for a line reading "0", which
+        then reached verify_baseline as `entries[-1].get(...)` — AttributeError
+        — and save_baseline as `history[-1]["seq"] + 1` — TypeError. Neither is
+        caught anywhere up the stack, so a one-byte append by anyone who can
+        write this file replaced the tamper verdict with a traceback. The
+        module states the standard it broke in read_receipts: a crash on a
+        malformed line turns the evidence trail into a denial of service.
+        """
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        with open(mod.HISTORY_FILE, "a") as f:
+            f.write(line + "\n")
+        assert mod.verify_baseline(passphrase=PASSPHRASE)["status"] == "ok"
+
+    def test_saving_still_works_with_a_non_object_history_line(self, mod):
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        with open(mod.HISTORY_FILE, "a") as f:
+            f.write("0\n")
+        record = mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        assert record["seq"] == 2, "the junk line must not be counted as a run"
+
+
+class TestTheChainIsConsultedBeforeTheRecordsShape:
+    """Both cheap attacks work by making the record stop looking sealed.
+
+    verify_baseline used to answer `absent` or `legacy` — INFO and REVIEW —
+    from the record alone, before read_history() was ever called. Deleting the
+    file, truncating it to "{", or simply dropping the "format" key therefore
+    cost nothing and produced a benign verdict, and since the run continues and
+    ends in an unconditional save_baseline, the next seal was written chained
+    onto the attacker's record. Every run after that reported "Seal verified".
+
+    The chain is the part an attacker cannot forge without the passphrase, so
+    it decides what the record's shape means.
+    """
+
+    def test_a_deleted_baseline_beside_a_live_chain_is_high(self, mod):
+        for _ in range(3):
+            mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        os.unlink(mod.BASELINE_FILE)
+
+        report = mod.verify_baseline(passphrase=PASSPHRASE)
+        assert report["status"] == "record_missing"
+        assert "HIGH" in mod.describe_baseline_integrity(report)
+        assert "3" in report["detail"], "say how many runs the chain remembers"
+
+    def test_a_truncated_baseline_beside_a_live_chain_is_high(self, mod):
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        with open(mod.BASELINE_FILE, "w") as f:
+            f.write("{")
+        report = mod.verify_baseline(passphrase=PASSPHRASE)
+        assert report["status"] == "record_missing"
+        assert "HIGH" in mod.describe_baseline_integrity(report)
+
+    def test_dropping_the_format_key_is_a_downgrade_not_a_legacy_baseline(self, mod):
+        for _ in range(2):
+            mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        # Strictly cheaper than forging a seal or rewriting the chain.
+        with open(mod.BASELINE_FILE, "w") as f:
+            json.dump({"gateway": "192.168.1.1", "router_open_ports": []}, f)
+
+        report = mod.verify_baseline(passphrase=PASSPHRASE)
+        assert report["status"] == "downgraded"
+        assert "HIGH" in mod.describe_baseline_integrity(report)
+
+    def test_a_non_integer_format_is_also_a_downgrade(self, mod):
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        _tamper(mod, lambda r: r.update(format="2"))    # a string, not 2
+        assert mod.verify_baseline(passphrase=PASSPHRASE)["status"] == "downgraded"
+
+    def test_a_genuine_first_run_is_still_absent(self, mod):
+        # With no chain, "no baseline" is exactly what it looks like.
+        report = mod.verify_baseline(passphrase=PASSPHRASE)
+        assert report["status"] == "absent"
+        assert "INFO" in mod.describe_baseline_integrity(report)
+
+    def test_a_genuine_legacy_baseline_is_still_legacy(self, mod):
+        # A real format-1 baseline predates the chain, so there is no history
+        # file beside it. That is what distinguishes it from a downgrade.
+        mod._secure_dir()
+        with open(mod.BASELINE_FILE, "w") as f:
+            json.dump(STATE, f)
+        report = mod.verify_baseline(passphrase=PASSPHRASE)
+        assert report["status"] == "legacy"
+        assert "REVIEW" in mod.describe_baseline_integrity(report)
+
+
+class TestKdfParametersAreValidatedBeforeUse:
+    """Every KDF value is read back out of the file being checked.
+
+    The try block covered bytes.fromhex and caught only ValueError, while
+    derive_baseline_key sat outside it — so a tampered baseline could raise
+    TypeError, AttributeError, or simply hang, uncaught, out of the one
+    function whose answer was about to be "this has been altered". The run dies
+    at the CHANGE DETECTION banner, before the diff, the save and the report,
+    and the obvious user response — delete ~/.home_net_audit — is the goal.
+    """
+
+    @pytest.mark.parametrize("kdf", [
+        {"salt": 123, "iterations": 200_000},
+        {"salt": "abcd", "iterations": "200000"},
+        {"salt": "abcd", "iterations": 0},
+        {"salt": "abcd", "iterations": -1},
+        {"salt": "abcd", "iterations": True},
+        {"salt": "not-hex", "iterations": 200_000},
+        [1, 2],
+        None,
+        "kdf",
+    ], ids=["salt-int", "iterations-str", "iterations-zero", "iterations-negative",
+            "iterations-bool", "salt-not-hex", "kdf-list", "kdf-null", "kdf-str"])
+    def test_malformed_parameters_report_modification(self, mod, kdf):
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        _tamper(mod, lambda r: r.update(kdf=kdf))
+        report = mod.verify_baseline(passphrase=PASSPHRASE)
+        assert report["status"] == "modified"
+
+    def test_an_absurd_iteration_count_does_not_hang(self, mod):
+        # PBKDF2 does exactly as much work as it is asked to: 10**12 is not a
+        # malformed value that raises, it is a hang.
+        mod.save_baseline(STATE, passphrase=PASSPHRASE)
+        _tamper(mod, lambda r: r.update(kdf={"salt": "abcd", "iterations": 10 ** 12}))
+        assert mod.verify_baseline(passphrase=PASSPHRASE)["status"] == "modified"
+
+    def test_the_iteration_ceiling_is_above_what_the_tool_writes(self, mod):
+        assert mod.KDF_ITERATIONS <= mod.KDF_ITERATIONS_MAX, \
+            "the guard must not reject baselines this tool wrote itself"
+
 
 class TestUnkeyedModeIsHonestlyLabelled:
     def test_unkeyed_verification_is_not_reported_as_a_passed_security_check(self, mod):
