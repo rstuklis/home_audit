@@ -58,7 +58,10 @@ class TestDeviceAppearedOrVanished:
         assert appeared[0] != vanished[0], "the two events must not share a note"
 
     def test_several_new_devices_are_collapsed_into_one_note(self, mod):
-        old = {"devices": []}
+        # The coverage list is what makes the empty baseline a sweep that found
+        # nothing rather than a run that never looked; without it the arrivals
+        # below are compared against an unknown and correctly withheld.
+        old = {"devices": [], "scanned_subnets": ["192.168.1.0/24"]}
         new = {"devices": [dev(INTRUDER), dev(PRINTER, ip="192.168.1.40")]}
 
         notes = mod.diff_baseline(old, new)
@@ -280,11 +283,31 @@ class TestUnmeasuredDoesNotDestroyTheBaseline:
 
     def test_a_sweep_that_genuinely_found_nothing_is_kept(self, mod):
         # [] is a measurement — the sweep ran and the network was empty — and
-        # must not be replaced by an older, richer list. Only an absent key or
-        # None means "not measured".
+        # must not be replaced by an older, richer list. What makes it a
+        # measurement is the coverage beside it: the run reached somewhere a
+        # device could have answered from, and none did.
         merged = mod.carry_forward_unmeasured(
-            {"devices": []}, {"devices": [{"mac": "aa:bb:cc:dd:ee:ff"}]})
+            {"devices": [], "scanned_subnets": ["192.168.87.0/24"]},
+            {"devices": [{"mac": "aa:bb:cc:dd:ee:ff"}]})
         assert merged["devices"] == []
+
+    def test_a_sweep_of_ground_this_host_is_not_on_keeps_the_known_devices(self, mod):
+        # The same wipe as the --no-discovery incident, reached without ever
+        # touching that flag: sweeping a subnet this machine has no interface in
+        # returns [] devices AND [] coverage, because collect_devices reads the
+        # ARP cache and onlink_coverage refuses to call unreachable ground
+        # scanned. Judged on key presence alone that pair passed as a
+        # measurement and overwrote ten known devices with nothing.
+        known = [{"ip": "192.168.87.5", "mac": "aa:bb:cc:dd:ee:ff",
+                  "subnet": "192.168.87.0/24"}]
+        previous = {"devices": known, "scanned_subnets": ["192.168.87.0/24"]}
+        merged = mod.carry_forward_unmeasured(
+            {"devices": [], "scanned_subnets": []}, previous)
+
+        assert merged["devices"] == known
+        assert merged["scanned_subnets"] == ["192.168.87.0/24"]
+        assert merged["carried_forward"] == ["devices", "scanned_subnets"], \
+            "the pair records one measurement and must carry together"
 
     def test_the_upstream_modem_reading_is_carried_forward_too(self, mod):
         merged = mod.carry_forward_unmeasured(
@@ -917,3 +940,166 @@ class TestARunThatDidNotSweepReportsNoDevices:
         new = {"router_open_ports": [80, 23]}
         notes = mod.diff_baseline(old, new)
         assert any("23" in n for n in notes)
+
+
+class TestADepartureIsAClaimAboutGroundThatWasCovered:
+    """The guard above asks whether a sweep happened; these ask WHERE.
+
+    Both are the same mistake at different resolutions. Judging the sweep by
+    whether the "devices" key exists misses the run that swept ground this host
+    is not on — the ARP cache holds on-link entries only, so that run reports []
+    devices with [] coverage and passes as a measured empty network. And even
+    two runs that both genuinely swept can cover different subnets: the menu's
+    device scan sweeps one, a full audit sweeps what the interfaces suggest, so
+    a departure has to be checked against what THIS run actually looked at. The
+    subnet-move check has always carried that test; departures did not.
+    """
+
+    BASE = {"devices": [dev(LAPTOP, subnet="192.168.1.0/24"),
+                        dev(PRINTER, ip="192.168.87.40", subnet="192.168.87.0/24")],
+            "scanned_subnets": ["192.168.1.0/24", "192.168.87.0/24"]}
+
+    def test_a_sweep_of_ground_this_host_is_not_on_is_not_an_empty_network(self, mod):
+        # Menu option 3's "All networks", or --subnet 192.168.87.0/24 from a
+        # laptop on 192.168.1.x: the sweep runs, finds nothing it could ever
+        # have found, and onlink_coverage records that no sighting was possible.
+        assert mod.diff_baseline(self.BASE, {"devices": [],
+                                             "scanned_subnets": []}) == []
+
+    def test_an_empty_sweep_of_reachable_ground_is_still_a_finding(self, mod):
+        # The distinction has to cut both ways or it is just suppression: with
+        # coverage, an empty list is a network that really did go silent.
+        notes = mod.diff_baseline(self.BASE, {"devices": [],
+                                              "scanned_subnets": ["192.168.1.0/24"]})
+        assert any(LAPTOP in n and "gone" in n for n in notes)
+
+    def test_a_partial_sweep_does_not_report_the_unswept_subnet_as_gone(self, mod):
+        # The menu sweeps one subnet; the baseline came from a full audit. The
+        # printer is on the subnet nobody looked at this run.
+        notes = mod.diff_baseline(self.BASE, {"devices": [dev(LAPTOP)],
+                                              "scanned_subnets": ["192.168.1.0/24"]})
+        assert not any("gone" in n for n in notes), \
+            "reported a departure from ground this run never swept"
+
+    def test_a_departure_from_ground_that_WAS_swept_is_still_reported(self, mod):
+        # The other half of the same run: the laptop's own subnet was covered,
+        # so its absence there is a measurement rather than a gap.
+        notes = mod.diff_baseline(self.BASE, {"devices": [dev(PRINTER, ip="192.168.87.40",
+                                                             subnet="192.168.87.0/24")],
+                                              "scanned_subnets": ["192.168.1.0/24"]})
+        assert any(LAPTOP in n and "gone" in n for n in notes)
+        assert not any(PRINTER in n for n in notes)
+
+    def test_an_arrival_is_never_withheld_for_lack_of_baseline_coverage(self, mod):
+        # Presence is measured directly: this run SAW the device. That the
+        # baseline had never swept that subnet makes an unknown device there
+        # more worth reporting, not less — withholding it would put the
+        # blindness exactly where it costs most.
+        old = {"devices": [dev(LAPTOP)], "scanned_subnets": ["192.168.1.0/24"]}
+        notes = mod.diff_baseline(old, {"devices": [dev(LAPTOP),
+                                                    dev(INTRUDER, ip="192.168.87.66",
+                                                        subnet="192.168.87.0/24")],
+                                        "scanned_subnets": ["192.168.1.0/24",
+                                                            "192.168.87.0/24"]})
+        assert any(INTRUDER in n and "NEW device" in n for n in notes)
+
+    def test_a_baseline_predating_per_device_subnets_still_reports_departures(self, mod):
+        # Where the device used to answer is unknown, so there is nothing to
+        # check the coverage against. Silence here would be a regression that
+        # hid real departures behind a guard meant to narrow false ones.
+        old = {"devices": [{"ip": "192.168.1.50", "mac": LAPTOP}],
+               "scanned_subnets": ["192.168.1.0/24"]}
+        notes = mod.diff_baseline(old, {"devices": [],
+                                        "scanned_subnets": ["192.168.1.0/24"]})
+        assert any(LAPTOP in n and "gone" in n for n in notes)
+
+    def test_a_baseline_predating_coverage_is_diffed_as_before(self, mod):
+        # No scanned_subnets on either side is an old baseline, not an
+        # unreachable sweep: a non-empty device list is its own proof that the
+        # run reached somewhere, and departures fall back to the plain set diff.
+        old = {"devices": [dev(LAPTOP), dev(PRINTER, ip="192.168.1.40")]}
+        notes = mod.diff_baseline(old, {"devices": [dev(LAPTOP)]})
+        assert any(PRINTER in n and "gone" in n for n in notes)
+
+
+class TestAWithheldComparisonSaysSoRatherThanReadingAsClean:
+    """Withholding a comparison is right; withholding it silently is not.
+
+    diff_baseline returns no note when it cannot support a device comparison,
+    and the caller prints "No changes since baseline." over exactly that — a
+    clean bill of health for a list nobody looked at, in the section where the
+    reader is most likely to stop reading. The caveat is INFO throughout: it
+    reports the extent of the comparison, and reporting scope as an alarm would
+    fire on every deliberate --no-discovery run.
+    """
+
+    SWEPT = {"devices": [dev(LAPTOP), dev(PRINTER, ip="192.168.87.40",
+                                          subnet="192.168.87.0/24")],
+             "scanned_subnets": ["192.168.1.0/24", "192.168.87.0/24"]}
+
+    def test_a_whole_comparison_produces_no_caveat(self, mod):
+        # The ordinary run must gain no noise.
+        assert mod.describe_comparison_coverage(self.SWEPT, self.SWEPT) is None
+
+    def test_a_run_that_did_not_sweep_says_so(self, mod):
+        line = mod.describe_comparison_coverage(self.SWEPT, {"router_open_ports": [80]})
+        assert "not compared" in line and "this run did not sweep" in line
+        assert "INFO" in line
+
+    def test_a_sweep_of_unreachable_ground_says_so_too(self, mod):
+        # [] devices with [] coverage is the same silence as no sweep at all.
+        line = mod.describe_comparison_coverage(
+            self.SWEPT, {"devices": [], "scanned_subnets": []})
+        assert "this run did not sweep" in line
+
+    def test_a_baseline_without_devices_says_the_arrivals_are_unknown(self, mod):
+        # The dangerous mirror: a first baseline saved from --no-discovery makes
+        # the next full audit's arrivals unreportable, so a real intruder that
+        # WAS seen would otherwise read as "No changes since baseline."
+        line = mod.describe_comparison_coverage({"router_open_ports": [80]}, self.SWEPT)
+        assert "baseline holds no swept device list" in line
+        assert "unknown here, not absent" in line
+
+    def test_neither_side_sweeping_is_named_as_such(self, mod):
+        line = mod.describe_comparison_coverage({}, {})
+        assert "neither this run nor the baseline swept" in line
+
+    def test_a_partial_sweep_names_the_ground_it_missed(self, mod):
+        # The suppression added for spurious departures is itself silent, so it
+        # gets the same treatment: say which ground went unchecked.
+        line = mod.describe_comparison_coverage(
+            self.SWEPT, {"devices": [dev(LAPTOP)],
+                         "scanned_subnets": ["192.168.1.0/24"]})
+        assert "192.168.87.0/24" in line
+        assert "192.168.1.0/24" not in line, "named ground that WAS swept"
+        assert "nothing there is reported as gone" in line
+
+    def test_a_baseline_predating_coverage_produces_no_caveat(self, mod):
+        # Nothing was narrowed there — diff_baseline falls back to a plain set
+        # diff — so there is nothing to caveat.
+        assert mod.describe_comparison_coverage(
+            {"devices": [dev(LAPTOP)]}, {"devices": [dev(LAPTOP)]}) is None
+
+    def test_the_caveat_survives_a_hand_edited_baseline(self, mod):
+        # Baselines are editable JSON; a corrupt device entry must not crash the
+        # line that explains the comparison.
+        corrupt = {"devices": [dev(LAPTOP), "not-a-dict", {"mac": PRINTER}],
+                   "scanned_subnets": ["192.168.1.0/24"]}
+        assert mod.describe_comparison_coverage(corrupt, corrupt) is None
+
+    def test_the_caveat_is_printed_above_the_verdict(self, mod, capsys, monkeypatch):
+        # End-to-end through the real print path: the reader must not be able to
+        # see "No changes since baseline." without seeing what was not compared.
+        monkeypatch.setattr(mod, "load_baseline", lambda: self.SWEPT)
+        monkeypatch.setattr(mod, "use_current_network_baseline", lambda: (None, None))
+        monkeypatch.setattr(mod, "describe_current_network", lambda s: None)
+        monkeypatch.setattr(mod, "verify_baseline", lambda p: {"status": "ok"})
+        monkeypatch.setattr(mod, "resolve_passphrase", lambda: None)
+        monkeypatch.setattr(mod, "resolve_sink", lambda: None)
+
+        mod.action_compare_baseline({"router_open_ports": [80, 443]})
+
+        out = capsys.readouterr().out
+        assert "No changes since baseline." in out
+        assert "device list not compared" in out
+        assert out.index("device list not compared") < out.index("No changes since")

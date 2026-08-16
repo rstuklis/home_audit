@@ -75,13 +75,21 @@ class TestNetworksDoNotShareABaseline:
 
     def test_the_old_shared_file_would_have_alarmed(self, mod, net):
         # Pins what the change is worth, by showing the failure it removes: the
-        # two states really are wholly different, so a shared baseline could
-        # only ever produce a full arrival/departure sweep.
+        # two states really are wholly different, so a shared baseline alarms
+        # about a switch on which nothing whatever has happened.
         love = state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80, 5000])
         pearl = state_for(PEARL, ["b8:27:eb:00:00:01"], [80])
         notes = mod.diff_baseline(love, pearl)
         assert any("NEW device" in n for n in notes)
-        assert any("gone" in n for n in notes)
+        assert any("closed" in n for n in notes)
+        # The departure half is NOT asserted, and its absence is the point of a
+        # separate fix rather than a weakening of this one. The Pearl run swept
+        # only Pearl's subnet, so it never looked where the Loveshack device
+        # answers; "gone" would be a claim about ground nobody covered. Per-network
+        # baselines are still what keeps the switch quiet — the arrival above
+        # fires on the shared file and no coverage test can withhold it, because
+        # the device really was seen.
+        assert not any("gone" in n for n in notes)
 
     def test_each_network_keeps_its_own_seal_chain(self, mod, net):
         # A chain means nothing except relative to what it chains, so a shared

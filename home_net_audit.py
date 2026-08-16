@@ -1117,6 +1117,37 @@ def resolve_passphrase(prompt=False):
 CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports",
                       "devices", "scanned_subnets")
 
+# The two keys that record one measurement between them: what was found, and
+# where it was possible to find anything. They are measured together or not at
+# all, so they carry together — pairing a fresh device list with a stale
+# coverage list would state that this run swept ground it never touched.
+SWEEP_KEYS = ("devices", "scanned_subnets")
+
+
+def swept_anywhere(state):
+    """Whether `state`'s device list is a measurement or an absence of looking.
+
+    Key presence is not the question, and treating it as the question is what
+    made "no devices" ambiguous in the first place. A sweep of a subnet this
+    host has no interface in returns an empty list through the ordinary path:
+    collect_devices resolves neighbours from the ARP cache and drops anything
+    outside the swept subnet, so off-link ground answers exactly as empty ground
+    does. onlink_coverage exists to tell those apart and records the verdict in
+    scanned_subnets — an empty coverage list means no sighting was possible
+    anywhere, which is not a finding about the network.
+
+    So an empty device list is a measurement only where the run could have seen
+    something. A non-empty one needs no corroboration: devices were found, which
+    is proof the sweep reached somewhere, and demanding coverage as well would
+    read every baseline saved before scanned_subnets existed as unmeasured.
+    """
+    devices = state.get("devices")
+    if devices is None:
+        return False
+    if devices:
+        return True
+    return bool(state.get("scanned_subnets"))
+
 
 def carry_forward_unmeasured(state, previous=None):
     """Return `state` with unmeasured values replaced by the last known-good ones.
@@ -1155,8 +1186,23 @@ def carry_forward_unmeasured(state, previous=None):
     carried = []
     measured_at = {}
     for key in CARRY_FORWARD_KEYS:
-        if state.get(key) is not None:
-            measured_at[key] = stamp
+        # An empty list is a real reading for the port keys — scanned, nothing
+        # open — but not for the sweep pair, where it is also what a sweep of
+        # unreachable ground returns. Asking only whether the key is present let
+        # that second case through as a measurement and overwrite the baseline
+        # with it: the ten-device incident above, reached by a laptop sweeping a
+        # subnet it was not joined to rather than by --no-discovery. Silent, and
+        # permanent, because the wiped list becomes the new reference point.
+        if key in SWEEP_KEYS:
+            measured = swept_anywhere(state)
+        else:
+            measured = state.get(key) is not None
+        if measured:
+            if state.get(key) is not None:
+                measured_at[key] = stamp
+            # A run that swept but recorded no coverage list predates
+            # scanned_subnets. Leaving the key absent is right: carrying the
+            # previous run's coverage would attach it to this run's devices.
         elif previous.get(key) is not None:
             carried.append(key)
             # The origin of the reading, not the run that inherited it. Falling
@@ -1717,6 +1763,64 @@ def describe_baseline_freshness(state, now=None):
             f"the baseline was saved — {', '.join(parts)}.")
 
 
+def describe_comparison_coverage(old, new):
+    """A caveat line naming what the device comparison could not cover, or None.
+
+    The sibling of describe_baseline_freshness, for the run rather than the
+    baseline. That one says the baseline holds values it did not measure; this
+    one says the comparison just made was narrower than it looks.
+
+    Both exist because "No changes since baseline." is printed by measuring
+    nothing at all just as readily as by measuring everything and finding it
+    unchanged. diff_baseline is right to withhold a device comparison it cannot
+    support — an unswept run reporting every device as gone is the alarm that
+    started this — but withholding it silently substitutes one wrong answer for
+    another, and the second is worse for being reassuring. A --no-discovery run
+    printed a clean bill of health over a device list nobody had looked at.
+
+    Two narrower comparisons are worth naming, and neither is a finding:
+
+    The device list was not compared at all, because one side never swept. The
+    mirror case is the dangerous one — a first baseline saved from a run that
+    skipped discovery means the next full audit has nothing to compare its
+    arrivals against, so a genuine intruder that WAS seen goes unreported.
+
+    Or both sides swept, but not the same ground, so a departure from the ground
+    this run missed is not something the report would have said.
+
+    Silent when the comparison was whole, so an ordinary run gains no noise.
+    """
+    old, new = old or {}, new or {}
+    old_swept, new_swept = swept_anywhere(old), swept_anywhere(new)
+    if not (old_swept and new_swept):
+        if not old_swept and not new_swept:
+            why = "neither this run nor the baseline swept for devices"
+        elif not new_swept:
+            # Covers both --no-discovery and a sweep of ground this host is not
+            # on, which are the same thing seen from the report: no sighting was
+            # possible, so nothing about the devices was learned.
+            why = "this run did not sweep for devices"
+        else:
+            why = "the baseline holds no swept device list"
+        return (f"  [INFO  ] Comparison coverage: device list not compared — {why}. "
+                "Arrivals and departures are unknown here, not absent.")
+
+    new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
+    if not new_cov:
+        # No coverage recorded means a baseline predating scanned_subnets, and
+        # diff_baseline falls back to a plain set diff there. Nothing was
+        # narrowed, so there is nothing to caveat.
+        return None
+    unswept = sorted({d.get("subnet") for d in (old.get("devices") or [])
+                      if isinstance(d, dict) and isinstance(d.get("subnet"), str)
+                      and d.get("subnet") and d.get("subnet") not in new_cov})
+    if not unswept:
+        return None
+    return (f"  [INFO  ] Comparison coverage: the baseline lists devices on "
+            f"{', '.join(unswept)}, which this run did not sweep, so nothing "
+            "there is reported as gone.")
+
+
 def load_labels():
     try:
         with open(LABELS_FILE) as f:
@@ -2072,13 +2176,32 @@ def diff_baseline(old, new):
     # discipline the port lists already follow: an unmeasured side is compared
     # against nothing, in either direction. An empty LIST still diffs, because a
     # sweep that genuinely found nothing is a real and alarming finding.
-    devices_measured = (old.get("devices") is not None
-                        and new.get("devices") is not None)
+    devices_measured = swept_anywhere(old) and swept_anywhere(new)
 
     old_macs, old_private, old_subnets = _split(old)
     new_macs, new_private, new_subnets = _split(new)
+    new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
+    old_cov = {s for s in (old.get("scanned_subnets") or ()) if isinstance(s, str)}
     appeared = (new_macs - old_macs) if devices_measured else set()
     vanished = (old_macs - new_macs) if devices_measured else set()
+    # Both sides having swept somewhere does not mean they swept the same ground,
+    # and a departure is a claim about ground: this run looked where the device
+    # used to answer and it was not there. The subnet-move check below has always
+    # carried that test; departures never did, so a baseline from a full audit
+    # compared against the menu's single-subnet sweep reported every device on
+    # every other subnet as gone — the loudest line in the report, describing
+    # nothing but the two runs covering different ground.
+    #
+    # Arrivals need no such test and must not be given one. A device that is
+    # present was seen, directly, by this run; that the baseline never covered
+    # where it is now makes it more worth reporting, not less. Suppressing an
+    # unknown device because the old run had not looked there is the blindness
+    # named below, in the section where it would cost the most.
+    if new_cov:
+        # No recorded subnet means a baseline written before devices carried one.
+        # Where it used to answer is unknown, so there is nothing to check it
+        # against, and reporting is what the empty set already yields here.
+        vanished = {m for m in vanished if old_subnets.get(m, set()) <= new_cov}
     if appeared:
         notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
     if vanished:
@@ -2109,8 +2232,6 @@ def diff_baseline(old, new):
     # subnet to the trusted one, the exact boundary crossing this check exists to
     # catch. Novelty of the destination is worth saying, never worth suppressing
     # the note for.
-    new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
-    old_cov = {s for s in (old.get("scanned_subnets") or ()) if isinstance(s, str)}
     moved = []
     for mac in (sorted(old_subnets.keys() & new_subnets.keys() & old_macs & new_macs)
                 if devices_measured else []):
@@ -4408,6 +4529,11 @@ def action_compare_baseline(state):
         return
     changes = diff_baseline(old, state)
     print(f"Baseline from: {old.get('timestamp', '?')}")
+    # Above the verdict, because it qualifies the verdict: it is as true of a
+    # short list of changes as it is of "No changes since baseline."
+    _coverage = describe_comparison_coverage(old, state)
+    if _coverage:
+        print(_coverage)
     if changes:
         print("CHANGES DETECTED:")
         for c in changes:
@@ -4562,6 +4688,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     if old:
         changes = diff_baseline(old, state)
         print(f"Baseline from: {old.get('timestamp', '?')}")
+        _coverage = describe_comparison_coverage(old, state)
+        if _coverage:
+            print(_coverage)
         if changes:
             print("CHANGES DETECTED:")
             for c in changes:
