@@ -2065,10 +2065,20 @@ def diff_baseline(old, new):
         stable = {m for m in macs if not is_randomized_mac(m)}
         return stable, macs - stable, subnets
 
+    # A run that did not sweep has no "devices" key at all, and that is not the
+    # same as a sweep that found nothing. Read as an empty set, every device in
+    # the baseline reads as gone — which is what --no-discovery produced: nine
+    # devices reported missing from a network where nothing had moved. The same
+    # discipline the port lists already follow: an unmeasured side is compared
+    # against nothing, in either direction. An empty LIST still diffs, because a
+    # sweep that genuinely found nothing is a real and alarming finding.
+    devices_measured = (old.get("devices") is not None
+                        and new.get("devices") is not None)
+
     old_macs, old_private, old_subnets = _split(old)
     new_macs, new_private, new_subnets = _split(new)
-    appeared = new_macs - old_macs
-    vanished = old_macs - new_macs
+    appeared = (new_macs - old_macs) if devices_measured else set()
+    vanished = (old_macs - new_macs) if devices_measured else set()
     if appeared:
         notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
     if vanished:
@@ -2102,7 +2112,8 @@ def diff_baseline(old, new):
     new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
     old_cov = {s for s in (old.get("scanned_subnets") or ()) if isinstance(s, str)}
     moved = []
-    for mac in sorted(old_subnets.keys() & new_subnets.keys() & old_macs & new_macs):
+    for mac in (sorted(old_subnets.keys() & new_subnets.keys() & old_macs & new_macs)
+                if devices_measured else []):
         was, now = old_subnets[mac], new_subnets[mac]
         if new_cov and was.isdisjoint(now) and was <= new_cov:
             entry = f"{mac} ({', '.join(sorted(was))} -> {', '.join(sorted(now))})"
@@ -2123,7 +2134,7 @@ def diff_baseline(old, new):
             f"Device(s) moved to a different subnet: {'; '.join(moved)}. A device "
             "that changes subnet keeps its MAC, so it is not reported as an "
             "arrival or a departure above.")
-    if len(new_private) > len(old_private):
+    if devices_measured and len(new_private) > len(old_private):
         notes.append(
             f"{len(new_private)} device(s) using rotating private addresses, up "
             f"from {len(old_private)}. These cannot be identified across runs, so "

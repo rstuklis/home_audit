@@ -858,3 +858,62 @@ class TestBaselineFreshness:
         assert "age unknown" in line
         line = mod.describe_baseline_freshness({"carried_forward": ["devices"]})
         assert "age unknown" in line
+
+
+class TestARunThatDidNotSweepReportsNoDevices:
+    """--no-discovery produces a state with no "devices" key at all, and read as
+    an empty set every device in the baseline reads as gone. Observed live: a
+    --no-discovery run reported nine devices missing from a network where
+    nothing had moved, which is the loudest section of the report crying wolf
+    for a sweep that was never asked to run.
+
+    carry_forward_unmeasured already protects the SAVE path. This is the
+    COMPARE path, and it needs the same discipline the port lists have had
+    since the blocked-scan work: an unmeasured side is compared against
+    nothing, in either direction.
+    """
+
+    BASE = {"devices": [dev(LAPTOP), dev(PRINTER, ip="192.168.1.40")],
+            "scanned_subnets": ["192.168.1.0/24"]}
+
+    def test_a_run_without_a_sweep_reports_no_departures(self, mod):
+        assert mod.diff_baseline(self.BASE, {"router_open_ports": [80]}) == []
+
+    def test_a_baseline_without_devices_reports_no_arrivals(self, mod):
+        # The mirror image: the first run after a --no-discovery baseline must
+        # not read every device as newly arrived.
+        assert mod.diff_baseline({"router_open_ports": [80]}, self.BASE) == []
+
+    def test_an_empty_sweep_is_still_a_finding(self, mod):
+        # [] means the sweep ran and the network was empty. That is real, and
+        # alarming, and must survive the guard above.
+        notes = mod.diff_baseline(self.BASE, {"devices": [],
+                                              "scanned_subnets": ["192.168.1.0/24"]})
+        assert any("gone" in n for n in notes)
+
+    def test_a_real_arrival_is_still_reported(self, mod):
+        notes = mod.diff_baseline(
+            self.BASE, {"devices": self.BASE["devices"] + [dev(INTRUDER, ip="192.168.1.66")],
+                        "scanned_subnets": ["192.168.1.0/24"]})
+        assert any(INTRUDER in n for n in notes)
+
+    def test_the_private_mac_count_is_not_compared_either(self, mod):
+        # Same root cause, quieter symptom: an unswept run has zero rotating
+        # addresses, so the count would read as having dropped — or, on the
+        # baseline side, as having risen from nothing.
+        base = {"devices": [dev(PHONE_MON), dev(PHONE_TUE, ip="192.168.1.41")],
+                "scanned_subnets": ["192.168.1.0/24"]}
+        assert mod.diff_baseline({"router_open_ports": [80]}, base) == []
+
+    def test_a_subnet_move_is_not_claimed_without_a_sweep(self, mod):
+        cov = ["192.168.1.0/24", "192.168.87.0/24"]
+        old = {"devices": [dev(LAPTOP, ip="192.168.1.50", subnet="192.168.1.0/24")],
+               "scanned_subnets": cov}
+        assert mod.diff_baseline(old, {"scanned_subnets": cov}) == []
+
+    def test_other_sections_still_diff_normally(self, mod):
+        # Gating devices must not silence the rest of the report.
+        old = dict(self.BASE, router_open_ports=[80])
+        new = {"router_open_ports": [80, 23]}
+        notes = mod.diff_baseline(old, new)
+        assert any("23" in n for n in notes)
