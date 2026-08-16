@@ -79,6 +79,29 @@ Companions: `make_subprocess_run` (for `_launchd_running`, which calls
 `subprocess.run` directly and branches on the return code before reading stdout) and
 `make_check_port`.
 
+## Verifying by hand without wrecking the real data
+
+The autouse sandbox covers pytest. It does not cover the thing that actually
+caused damage here: a `python -c` snippet importing the module to check one
+function. Those run with no sandbox at all, and a miss is silent — the writes
+succeed, and it surfaces later as a live baseline full of invented devices and a
+seal chain carrying entries no audit produced. That happened, and the invented
+values then propagated into a real scheduled run through carry-forward.
+
+Redirect everything with one variable:
+
+```sh
+HOME_NET_AUDIT_DIR=$(mktemp -d) python3 -c 'import home_net_audit as h; ...'
+```
+
+It moves the baselines, seal chains, labels, named networks and saved reports
+together. Setting `BASELINE_DIR` alone is not enough — `BASELINE_FILE` and
+friends are computed at import, and `select_network_baseline` derives from the
+file, so a partial redirect quietly resolves back to `~/.home_net_audit`.
+
+Do this for any snippet that might write, and for anything calling
+`save_baseline`, `select_network_baseline` or `migrate_legacy_baseline` at all.
+
 ## Fixtures
 
 Captured command output lives in `tests/fixtures/` with a **`.out` extension**.

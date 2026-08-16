@@ -59,7 +59,24 @@ from datetime import datetime, timezone
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASELINE_DIR = os.path.expanduser("~/.home_net_audit")
+# Everything this tool remembers lives under one directory, and one environment
+# variable moves all of it: baselines, seal chains, labels, named networks and
+# saved reports. It exists so a run can be pointed somewhere disposable without
+# each caller having to know which files there are.
+#
+# That matters more than convenience. Ad-hoc verification — a python -c snippet
+# that imports this module to check one function — writes to the real directory
+# unless every path is redirected individually, and missing one is silent: the
+# writes succeed, and the damage only surfaces later as a baseline full of
+# invented devices, or a seal chain carrying entries no audit produced. Both
+# have happened here. A single switch is something a careless one-liner can
+# actually be bothered to set:
+#
+#     HOME_NET_AUDIT_DIR=$(mktemp -d) python3 -c '...'
+#
+# The default is unchanged, so nothing that does not set it behaves differently.
+DIR_ENV = "HOME_NET_AUDIT_DIR"
+BASELINE_DIR = os.path.expanduser(os.environ.get(DIR_ENV) or "~/.home_net_audit")
 # Reassigned by select_network_baseline() once a run knows which network it is
 # on. They stay module-level names rather than becoming functions because the
 # test sandbox redirects every attribute ending in _FILE by name; a computed
@@ -4630,7 +4647,18 @@ def interactive_menu():
 def main():
     ap = argparse.ArgumentParser(
         description="Defensive audit of your own home network. "
-                    "Run with no arguments for an interactive menu.")
+                    "Run with no arguments for an interactive menu.",
+        epilog=(
+            "Environment:\n"
+            f"  {DIR_ENV:<28} where baselines, seal chains, labels and reports\n"
+            f"  {'':<28} are kept (default ~/.home_net_audit). Point it at a\n"
+            f"  {'':<28} temporary directory to try something without touching\n"
+            f"  {'':<28} the real one.\n"
+            f"  {PASSPHRASE_ENV:<28} seals the baseline so it cannot be rewritten unnoticed.\n"
+            f"  {SINK_ENV:<28} off-host receipt destination; {SINK_TOKEN_ENV} its bearer token.\n"
+            f"  {ALERT_ENV:<28} where --monitor sends alerts.\n"
+            "  TPLINK_PASSWORD              modem admin password, for DSL line stats."),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--subnet", nargs="+",
                     help="Override auto-detected subnets entirely, e.g. 192.168.1.0/24")
     ap.add_argument("--extra-subnet", nargs="+", metavar="SUBNET",
