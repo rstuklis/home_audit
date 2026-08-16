@@ -660,6 +660,25 @@ UNREACHABLE_ERRNOS = frozenset((
 ))
 
 
+def local_network_denied_note(what):
+    """The note for a check the OS refused to let off this machine.
+
+    Three checks reach the local subnet by different means — a TCP scan, a DHCP
+    broadcast, an SSDP multicast — and macOS Local Network privacy denies all
+    three to a background job with the same instant EHOSTUNREACH. Each used to
+    describe that denial as a finding about the network: the scan said "no open
+    ports", the DHCP check said "try sudo", the UPnP check said the router may
+    have UPnP disabled. All three sent the reader somewhere useless, and the
+    last two sent them somewhere actively wrong, since no amount of privilege
+    or router configuration changes a permission the job cannot be granted.
+    """
+    return (f"{what} was refused by the OS, not answered by the network. On macOS "
+            "this is Local Network privacy denying a background (launchd/cron) job "
+            "access to its own subnet; the same audit run from a terminal works. "
+            "It is not a privilege problem and sudo does not help — run the audit "
+            "interactively for this check.")
+
+
 def probe_port(host, port, timeout=0.6):
     """Probe one TCP port. True = open, False = closed, None = unreachable.
 
@@ -2742,7 +2761,14 @@ def check_rogue_dhcp(timeout=4):
             except OSError:
                 break
     except OSError as e:
-        return [], f"Could not bind to port 68 (try sudo): {e}"
+        # "try sudo" was wrong for the commonest cause. EHOSTUNREACH here is the
+        # Local Network denial, not a permission this user can escalate to.
+        if e.errno in UNREACHABLE_ERRNOS:
+            return [], local_network_denied_note("The DHCP DISCOVER broadcast")
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return [], (f"Could not bind to port 68, which needs privilege: {e}. "
+                        "Re-run with sudo to include this check.")
+        return [], f"Could not bind to port 68: {e}"
     finally:
         sock.close()
 
@@ -2797,6 +2823,7 @@ def get_upnp_port_mappings(gateway):
         "\r\n"
     )
     location = None
+    ssdp_refused = False
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(3)
     try:
@@ -2812,12 +2839,16 @@ def get_upnp_port_mappings(gateway):
                     break
             except socket.timeout:
                 break
-    except OSError:
-        pass
+    except OSError as e:
+        # Whether SSDP left the machine at all decides which of two very
+        # different things the silence means.
+        ssdp_refused = e.errno in UNREACHABLE_ERRNOS
     finally:
         sock.close()
 
     if not location:
+        if ssdp_refused:
+            return [], local_network_denied_note("SSDP discovery")
         return [], "No UPnP device found via SSDP (router may have UPnP disabled)"
 
     # Step 2: Fetch the device description XML to find the control URL

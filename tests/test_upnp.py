@@ -188,3 +188,35 @@ class TestMappingParse:
         mappings, _ = mod.get_upnp_port_mappings("192.168.1.1")
         assert len(mappings) == 1
         assert mappings[0]["description"] == "ftp"
+
+
+class TestSsdpRefusedIsNotAnAbsentRouter:
+    """SSDP is multicast to the local subnet, so a background job's discovery is
+    refused by the same Local Network privacy denial. Reporting that as "router
+    may have UPnP disabled" is a claim about the router made from evidence that
+    never left the machine — and it points the reader at their router's settings
+    for a permission problem on their Mac."""
+
+    def _blocked_socket(self, errno_code):
+        class Refusing:
+            def settimeout(self, t): pass
+            def sendto(self, *a): raise OSError(errno_code, "No route to host")
+            def recvfrom(self, n): raise socket.timeout()
+            def close(self): pass
+        return lambda *a, **k: Refusing()
+
+    def test_a_refused_ssdp_send_is_reported_as_a_denial(self, mod, monkeypatch):
+        import errno as _errno
+        monkeypatch.setattr(mod.socket, "socket", self._blocked_socket(_errno.EHOSTUNREACH))
+        mappings, note = mod.get_upnp_port_mappings("192.168.87.1")
+        assert mappings == []
+        assert "Local Network privacy" in note
+        assert "UPnP disabled" not in note, "a denial was reported as a router setting"
+
+    def test_a_genuinely_silent_network_still_reads_as_no_upnp_device(self, mod, monkeypatch):
+        # SSDP left the machine and nothing answered: that IS a statement about
+        # the network, and must keep being made.
+        _wire(monkeypatch, mod, None, lambda u, r: "")
+        mappings, note = mod.get_upnp_port_mappings("192.168.87.1")
+        assert mappings == []
+        assert "No UPnP device found" in note

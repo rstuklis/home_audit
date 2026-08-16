@@ -132,3 +132,36 @@ class TestBindFailure:
         assert responders == []
         assert err is not None
         assert "68" in err
+
+
+class TestDenialIsNotAPrivilegeProblem:
+    """macOS Local Network privacy denies a background job its own subnet, and
+    the DHCP broadcast is refused with EHOSTUNREACH — the same errno the port
+    scan gets. The note used to say "try sudo", which is the one remedy that
+    cannot work: the job is not short of privilege, it is short of a permission
+    launchd jobs cannot be granted. A reader who follows that advice learns
+    nothing and concludes the tool is broken."""
+
+    def test_an_unreachable_bind_is_reported_as_a_denial_not_as_sudo(self, mod, monkeypatch):
+        import errno as _errno
+        _wire(monkeypatch, mod, [],
+              bind_error=OSError(_errno.EHOSTUNREACH, "No route to host"))
+        _, note = mod.check_rogue_dhcp(timeout=5)
+        assert "sudo does not help" in note
+        assert "Local Network privacy" in note
+
+    def test_a_genuine_permission_error_still_recommends_sudo(self, mod, monkeypatch):
+        # The distinction is the point: on a box where privilege really is the
+        # blocker, sudo IS the answer and must still be offered.
+        import errno as _errno
+        _wire(monkeypatch, mod, [],
+              bind_error=PermissionError(_errno.EACCES, "Permission denied"))
+        _, note = mod.check_rogue_dhcp(timeout=5)
+        assert "sudo" in note
+        assert "Local Network privacy" not in note
+
+    def test_an_unrecognised_bind_error_is_reported_plainly(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, [], bind_error=OSError(99, "Cannot assign requested address"))
+        _, note = mod.check_rogue_dhcp(timeout=5)
+        assert "port 68" in note
+        assert "sudo" not in note and "Local Network" not in note
