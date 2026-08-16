@@ -354,3 +354,68 @@ class TestTheNetworkLineIsActuallyPrinted:
 
     def test_no_line_when_the_network_is_unknown(self, mod):
         assert mod.describe_current_network(None) is None
+
+
+class TestAChangedNetmaskDoesNotStartOver:
+    """The key carries the prefix, so 192.168.87.0/24 and /23 are different
+    files. A router handing out a changed netmask would otherwise look like a
+    network nobody had ever audited: "no baseline saved yet", a fresh chain from
+    seq 1, and the real baseline left on disk unread. Nothing is renamed — the
+    exact key is tried first and an existing chain for the same network is
+    adopted only as a fallback."""
+
+    def _save_under(self, mod, subnet, ports):
+        mod.select_network_baseline(subnet)
+        mod.save_baseline(state_for(subnet, ["3c:22:fb:00:00:01"], ports))
+
+    def test_a_wider_mask_finds_the_existing_chain(self, mod, net):
+        self._save_under(mod, LOVESHACK, [80, 5000])          # /24 baseline exists
+        mod.select_network_baseline("192.168.87.0/25")        # same network address
+        assert mod.load_baseline() is not None, "a netmask change started over"
+        assert mod.load_baseline()["router_open_ports"] == [80, 5000]
+
+    def test_the_chain_continues_rather_than_restarting(self, mod, net):
+        self._save_under(mod, LOVESHACK, [80])
+        self._save_under(mod, LOVESHACK, [80])
+        mod.select_network_baseline("192.168.87.0/25")
+        mod.save_baseline(state_for(LOVESHACK, ["3c:22:fb:00:00:01"], [80]))
+        assert mod.load_baseline_record()["seq"] == 3, "the seal chain restarted"
+
+    def test_the_exact_key_still_wins_when_it_exists(self, mod, net):
+        # Both prefixes on disk: the one actually asked for must be used, not
+        # whichever the fallback would have found.
+        self._save_under(mod, "192.168.87.0/25", [443])
+        self._save_under(mod, LOVESHACK, [80, 5000])
+        mod.select_network_baseline(LOVESHACK)
+        assert mod.load_baseline()["router_open_ports"] == [80, 5000]
+
+    def test_two_candidate_prefixes_are_not_guessed_between(self, mod, net):
+        # Ambiguous: attaching a run to the wrong chain is worse than a clean
+        # start, so an unrecognised prefix gets its own file.
+        #
+        # The files are written directly rather than through the tool, because
+        # saving under the second prefix would ADOPT the first — the fallback
+        # consolidating instead of forking, which is the behaviour the tests
+        # above pin. Two siblings can only arise from something outside this
+        # code path: a restore from backup, or a copy from another machine.
+        (net / "baseline-192-168-87-0-25.json").write_text("{}")
+        (net / "baseline-192-168-87-0-26.json").write_text("{}")
+        assert mod.existing_key_for_same_network(str(net), LOVESHACK) is None
+
+    def test_a_different_network_is_never_adopted(self, mod, net):
+        self._save_under(mod, LOVESHACK, [80])
+        mod.select_network_baseline(PEARL)
+        assert mod.load_baseline() is None, "pearl adopted loveshack's baseline"
+
+    def test_an_unparseable_subnet_adopts_nothing(self, mod, net):
+        self._save_under(mod, LOVESHACK, [80])
+        assert mod.existing_key_for_same_network(str(net), "not-a-subnet") is None
+        assert mod.existing_key_for_same_network(str(net), None) is None
+
+    def test_a_missing_directory_is_not_an_error(self, mod, tmp_path):
+        assert mod.existing_key_for_same_network(str(tmp_path / "nope"), LOVESHACK) is None
+
+    def test_unrelated_files_are_not_mistaken_for_baselines(self, mod, net):
+        (net / "baseline-notes.txt").write_text("x")
+        (net / "baseline-192-168-87-0-backup.json").write_text("{}")
+        assert mod.existing_key_for_same_network(str(net), LOVESHACK) is None

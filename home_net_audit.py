@@ -1790,6 +1790,56 @@ def baseline_key(subnet_str):
     return re.sub(r"[^0-9A-Za-z]+", "-", str(subnet_str)).strip("-") or None
 
 
+def existing_key_for_same_network(directory, subnet_str):
+    """A baseline already on disk for this network under a different prefix.
+
+    The key carries the prefix length, so 192.168.87.0/24 and 192.168.87.0/23
+    are different files. A router handing out a changed netmask — after a
+    firmware update, or a lease from a different DHCP scope — would therefore
+    look like a network nobody has ever audited: "no baseline saved yet", a
+    fresh chain from seq 1, and the real baseline left on disk unread.
+
+    Re-keying on the network address alone would fix that and orphan every
+    baseline already written, so instead the exact key is tried first and this
+    is the fallback. Nothing is renamed or migrated; an existing chain is simply
+    found and carried on with.
+
+    Only an unambiguous match is adopted. If two prefixes are already on disk
+    for one network there is no way to tell which is the live one, and guessing
+    would attach a run to the wrong chain — worse than starting a clean one.
+
+    The limit worth knowing: this matches on the NETWORK ADDRESS, so it covers a
+    prefix change that leaves that address alone (/24 to /25 on 192.168.87.0)
+    and not one that moves it (192.168.87.0/24 to a /23, whose network address
+    is 192.168.86.0 — a /23 spans both). The wider case still starts a fresh
+    baseline, and says so rather than silently comparing against the wrong
+    chain. Matching on overlap instead would cover it, at the cost of letting
+    two genuinely different networks adopt each other's history; that trade is
+    not worth making for a case with no observed instance.
+
+    Returns the key, or None.
+    """
+    try:
+        net = ipaddress.ip_network(str(subnet_str), strict=False)
+    except (ValueError, TypeError):
+        return None
+    wanted = str(net.network_address).replace(".", "-")
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    matches = []
+    for name in names:
+        m = re.fullmatch(r"baseline-(.+)\.json", name)
+        if not m:
+            continue
+        key = m.group(1)
+        head, _, tail = key.rpartition("-")
+        if head == wanted and tail.isdigit():
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else None
+
+
 def select_network_baseline(subnet_str):
     """Point BASELINE_FILE and HISTORY_FILE at this network's own files.
 
@@ -1819,6 +1869,13 @@ def select_network_baseline(subnet_str):
     # write outside the redirection entirely. Deriving from the file leaves one
     # source of truth: selection follows wherever the baseline was pointed.
     directory = os.path.dirname(BASELINE_FILE) or BASELINE_DIR
+    # The exact key wins whenever it names a baseline that exists. Only when it
+    # does not is a differently-masked one for the same network considered, so
+    # this can adopt a chain but never divert away from one.
+    if not os.path.exists(os.path.join(directory, f"baseline-{key}.json")):
+        sibling = existing_key_for_same_network(directory, subnet_str)
+        if sibling:
+            key = sibling
     BASELINE_FILE = os.path.join(directory, f"baseline-{key}.json")
     HISTORY_FILE = os.path.join(directory, f"history-{key}.jsonl")
     return key
