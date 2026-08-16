@@ -183,6 +183,43 @@ Mac itself.
 
 ---
 
+## Which findings survive a lying gateway
+
+The report prints as one flat list of risk-tagged lines, and that format quietly
+implies they are all equally well founded. They are not, and the report now says
+so in an **Evidence provenance** section rather than leaving it to this document.
+
+| Class | Means | Defeated by |
+|---|---|---|
+| Observed | Read from this machine's own OS — ARP cache, routing table, interfaces, firewall, its own listening sockets | A compromised **host** (which is why you run it from a second machine) |
+| Measured | This tool did it and watched the result — TCP connect, TLS handshake, a DHCP offer arriving, a Router Advertisement on the link | Someone actively in the path, who has to act to interfere |
+| Self-reported | The device under assessment said so — UPnP mappings, the router's admin pages, its answers to login attempts | The router simply omitting what it does not wish to mention |
+| Via resolver | Answered through DNS, which on a home network the gateway usually serves | The gateway answering a question about itself |
+| Third party | Fetched from an outside service — vendor names come from `api.macvendors.com` | Anyone on the path to that service; it also sends every discovered MAC off-network |
+
+The distinction is not decoration. Two examples of what it changes:
+
+**The router hostname check asks the suspect to confirm its own identity.** It
+detects a rogue router by a reverse DNS lookup, and that lookup goes to whatever
+resolver this machine is configured with — normally the router. A rogue one
+answers with something unremarkable or with nothing at all, and *no PTR record*
+is the most likely output on any real home network. It used to print `[OK]`. It
+now prints `[INFO]` with the reason whenever the resolver is the gateway, and
+keeps `[OK]` only when an independent resolver answered.
+
+**A quiet UPnP dump is the router's account of its own forwarding table.** A
+router that has punched a hole for an attacker omits it, and there is no second
+source to check against. "No mappings" is now reported as what it is.
+
+Read the class as a question about *what would have to be true for this to be
+wrong*, not as a severity. A self-reported finding that **incriminates** is the
+strongest evidence in the report — the router volunteered something against its
+own interest. It is specifically the clean self-reported result that is weak, for
+the same reason an unkeyed seal verifies without being forgery-proof: passing was
+always available to an attacker.
+
+---
+
 ## What none of this catches
 
 Worth being blunt, because a monitoring setup invites more confidence than it
@@ -190,8 +227,10 @@ earns.
 
 - **Passive interception upstream.** Anything at or beyond your ISP leaves no
   trace on the LAN. Assume it is possible and encrypt accordingly.
-- **A compromised router.** UPnP mappings, DHCP responses and the admin page are
-  all self-reported by the device you are trying to assess.
+- **A compromised router.** UPnP mappings, DHCP offer contents and the admin page
+  are all self-reported by the device you are trying to assess. The report now
+  marks which findings those are rather than only saying so here, but marking
+  them does not make them verifiable — nothing on the LAN can.
 - **Endpoint implants.** Empirically the most likely route to a targeted
   individual, and a network monitor cannot see them. Lockdown Mode, prompt
   patching and Apple Threat Notifications matter far more here.

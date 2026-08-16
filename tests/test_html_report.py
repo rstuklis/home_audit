@@ -625,13 +625,23 @@ class TestDocumentStructure:
         assert text.count("<table>") > 1, "rich state should render several tables"
 
     def test_each_table_row_has_as_many_cells_as_the_header(self, mod, tmp_path):
+        # Scoped per table rather than over the whole document. A device list
+        # carrying vendor names now also renders the provenance table — the
+        # vendors were fetched from a third party whatever else the run did — so
+        # collecting every <th> on the page mixed two headers into one list.
+        # Comparing each table against its own header is what this is for.
         text = render(mod, tmp_path, {"devices": RICH_STATE["devices"]})
-        headers = re.findall(r"<th>(.*?)</th>", text, re.S)
-        assert headers == ["IP", "MAC", "Vendor", "Subnet"]
-        for tr in re.finditer(r"<tr[^>]*>(.*?)</tr>", text, re.S):
-            cells = re.findall(r"<td[^>]*>", tr.group(1))
-            if cells:
-                assert len(cells) == len(headers)
+        tables = re.findall(r"<table>(.*?)</table>", text, re.S)
+        assert tables, "expected at least one table"
+        seen = []
+        for tbl in tables:
+            headers = re.findall(r"<th>(.*?)</th>", tbl, re.S)
+            seen.append(headers)
+            for tr in re.finditer(r"<tr[^>]*>(.*?)</tr>", tbl, re.S):
+                cells = re.findall(r"<td[^>]*>", tr.group(1))
+                if cells:
+                    assert len(cells) == len(headers)
+        assert ["IP", "MAC", "Vendor", "Subnet"] in seen
 
     def test_the_charset_is_declared_before_any_content(self, mod, tmp_path):
         text = render(mod, tmp_path, dict(RICH_STATE))
@@ -664,6 +674,11 @@ class TestSectionSelection:
         "Sharing Services", "Default Credentials Probe", "Speed Test",
         "UPnP Port Mappings", "Rogue DHCP Check", "Listening Services",
         "Router Hostname Check",
+        # Renders whenever the run produced any finding the gateway supplied.
+        # RICH_STATE holds several (upnp, default_creds, router_hostname, and
+        # devices carrying vendor names), so dropping any single key below still
+        # leaves this section standing and the count arithmetic holds.
+        "Evidence Provenance",
     ]
 
     def test_a_full_state_renders_every_section(self, mod, tmp_path):

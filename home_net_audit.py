@@ -2096,6 +2096,171 @@ def describe_comparison_coverage(old, new):
             "there is reported as gone.")
 
 
+# ---------------------------------------------------------------------------
+# Evidence provenance
+#
+# Every finding in this report rests on something, and what it rests on is not
+# always independent of what it describes. The report prints as one flat list,
+# which quietly implies the lines are equally well founded. They are not, and
+# the gap is not academic: a clean result obtained by asking the device under
+# suspicion is not a clean result. It is that device's answer.
+#
+# Four classes, ordered by how much a compromised gateway can do about them:
+#
+#   OBSERVED       this machine's own kernel and OS state — the ARP cache, the
+#                  routing table, its interfaces, its firewall, its own
+#                  listening sockets. A gateway cannot edit any of it. A
+#                  compromised HOST can, which is the entire reason DEPLOYMENT
+#                  .md argues for running this from a second machine.
+#   MEASURED       something this tool did over the network and watched the
+#                  result of: a TCP connect, a TLS handshake, a DHCP offer
+#                  arriving, a Router Advertisement on the link. Someone in the
+#                  path can interfere, but they have to act, and acting is what
+#                  most of the rest of this tool is looking for.
+#   SELF_REPORTED  the device being assessed said so. UPnP mappings are the
+#                  router's own list of the holes it has punched; DSL stats and
+#                  admin banners come off its own pages. A compromised router
+#                  omits whatever it likes.
+#   RESOLVER_DEPENDENT
+#                  answered through DNS. On a home network the resolver usually
+#                  IS the gateway, so a question about the router gets answered
+#                  by the router.
+#
+# This is deliberately NOT a severity axis, and reading it as one gets it
+# backwards. A self-reported finding of an open port or an active mapping is
+# excellent evidence — the router volunteered something against its own
+# interest. What carries no weight is specifically the CLEAN self-reported
+# result, for the same reason an unkeyed seal verifies without being
+# forgery-proof: the check passed, and passing was always available to an
+# attacker. Absence of evidence, from a witness with a motive, is not evidence
+# of absence.
+# ---------------------------------------------------------------------------
+
+OBSERVED = "observed"
+MEASURED = "measured"
+SELF_REPORTED = "self_reported"
+RESOLVER_DEPENDENT = "resolver_dependent"
+THIRD_PARTY = "third_party"
+
+# state key -> (class, what the finding actually rests on, human label)
+#
+# Two entries do not correspond to a state key of their own, because one
+# measurement can rest on two different grounds at once. The device list is a
+# read of this machine's own ARP cache; the vendor names attached to it came
+# from an HTTP call to a service on the internet, over the network being
+# audited. Same key, same printed table, two answers to "what if this is
+# wrong", so they are listed apart rather than averaged into one.
+EVIDENCE = {
+    "gateway":             (OBSERVED, "this machine's routing table", "Default gateway"),
+    "dns":                 (OBSERVED, "this machine's resolver configuration", "DNS settings"),
+    "devices":             (OBSERVED, "this machine's ARP and neighbour caches", "Connected devices"),
+    "arp_spoof":           (OBSERVED, "repeated reads of this machine's ARP cache", "ARP spoofing check"),
+    "firewall":            (OBSERVED, "this machine's firewall configuration", "Firewall status"),
+    "sharing":             (OBSERVED, "this machine's sharing service configuration", "Sharing services"),
+    "listening":           (OBSERVED, "this machine's own listening sockets", "Listening services"),
+    "wifi":                (OBSERVED, "this machine's Wi-Fi association", "Wi-Fi security"),
+
+    "router_open_ports":   (MEASURED, "TCP connections this tool opened to the gateway", "Router port scan"),
+    "upstream_open_ports": (MEASURED, "TCP connections this tool opened to the modem", "Upstream port scan"),
+    "router_tls":          (MEASURED, "the certificate the gateway presented", "Router TLS"),
+    "ipv6":                (MEASURED, "Router Advertisements seen on the link", "IPv6 routers"),
+    "evil_twin":           (MEASURED, "beacons seen on the air", "Evil twin check"),
+    # How many servers answered is a fact about the wire. What they offered is
+    # not: the gateway, DNS and static routes in an offer are values the server
+    # chose to send, and a rogue that answers alone still reads as the only one.
+    "dhcp":                (MEASURED, "which servers answered a DHCP request on the wire", "Rogue DHCP check"),
+    "interception":        (MEASURED, "how a crafted query came back", "Interception checks"),
+
+    "upnp":                (SELF_REPORTED, "the gateway's own list of its port mappings", "UPnP port mappings"),
+    "dsl":                 (SELF_REPORTED, "the router's own admin page", "DSL line stats"),
+    "default_creds":       (SELF_REPORTED, "the router's own responses to login attempts", "Default credentials"),
+    "dhcp_offer_contents": (SELF_REPORTED, "the values the answering DHCP server chose to send", "DHCP offer contents"),
+
+    "router_hostname":     (RESOLVER_DEPENDENT, "a reverse DNS answer about the gateway", "Router hostname"),
+
+    "device_vendors":      (THIRD_PARTY, "an HTTP lookup to api.macvendors.com, over this network", "Device vendor names"),
+}
+
+_EVIDENCE_TAG = {
+    SELF_REPORTED: "self-reported",
+    RESOLVER_DEPENDENT: "via resolver",
+    THIRD_PARTY: "third party",
+}
+
+# Findings that share a state key with something of a different provenance, and
+# the test for whether this run actually produced them.
+_DERIVED_EVIDENCE = {
+    "device_vendors": lambda state: any(
+        isinstance(d, dict) and d.get("vendor")
+        for d in (state.get("devices") or ())),
+    "dhcp_offer_contents": lambda state: bool(
+        isinstance(state.get("dhcp"), dict) and state["dhcp"].get("responders")),
+}
+
+
+def evidence_for(key):
+    """(class, basis, label) for a state key, or None if it is not a finding."""
+    return EVIDENCE.get(key)
+
+
+def findings_by_evidence(state):
+    """Group the findings actually present in `state` by evidence class."""
+    state = state or {}
+    grouped = {}
+    for key in state:
+        entry = EVIDENCE.get(key)
+        if entry and state.get(key) is not None:
+            grouped.setdefault(entry[0], []).append(key)
+    for key, was_produced in _DERIVED_EVIDENCE.items():
+        try:
+            produced = was_produced(state)
+        except (AttributeError, TypeError):
+            # A malformed state should cost the caller its provenance section,
+            # not the audit it is describing.
+            continue
+        if produced:
+            grouped.setdefault(EVIDENCE[key][0], []).append(key)
+    return {cls: sorted(keys) for cls, keys in grouped.items()}
+
+
+def describe_evidence_basis(state):
+    """The report block naming which findings came from the thing they describe.
+
+    Silent when this run produced none of them, so a report with nothing to
+    qualify gains no paragraph telling the reader that nothing needs qualifying.
+    """
+    grouped = findings_by_evidence(state)
+    dependent = [(cls, key)
+                 for cls in (SELF_REPORTED, RESOLVER_DEPENDENT, THIRD_PARTY)
+                 for key in grouped.get(cls, ())]
+    if not dependent:
+        return None
+
+    independent = len(grouped.get(OBSERVED, ())) + len(grouped.get(MEASURED, ()))
+    width = max(len(EVIDENCE[key][2]) for _cls, key in dependent)
+    lines = ["  Not every finding above rests on the same ground. These came from "
+             "the device",
+             "  they describe, through it, or from someone else entirely:"]
+    for cls, key in dependent:
+        _cls, basis, label = EVIDENCE[key]
+        lines.append(f"    [{_EVIDENCE_TAG[cls]:13}] {label:{width}}  — {basis}")
+    lines.append("")
+    lines.append("  Take seriously anything they admit to: a router listing a port "
+                 "mapping has")
+    lines.append("  volunteered something against its own interest. A CLEAN result "
+                 "from them is")
+    lines.append("  worth much less — it says nothing was volunteered, which is not "
+                 "the same as")
+    lines.append("  there being nothing to find.")
+    if independent:
+        lines.append(f"  The other {independent} finding(s) rest on this machine's own "
+                     "state or on measurements")
+        lines.append("  this tool made itself, which a gateway cannot edit. A "
+                     "compromised HOST can —")
+        lines.append("  that is what running this from a second machine is for.")
+    return "\n".join(lines)
+
+
 def load_labels():
     try:
         with open(LABELS_FILE) as f:
@@ -3419,7 +3584,17 @@ def action_upnp_dump():
         return {"mappings": [], "note": err}
 
     if not mappings:
-        print("  No active UPnP port mappings found.")
+        # "None found" and "none disclosed" are the same output here, and the
+        # difference is the whole question. Every mapping in this list is one
+        # the gateway chose to enumerate about itself; one that has forwarded a
+        # port for an attacker simply leaves it out of the answer, and the tool
+        # has no second source to check that against.
+        print("  The gateway reported no active UPnP port mappings.")
+        print("  That is its own account of its own forwarding table, so it is weak "
+              "evidence:")
+        print("  a router hiding a mapping omits it here and this check cannot tell. "
+              "Ports")
+        print("  reachable from outside are worth confirming from outside.")
         return {"mappings": []}
 
     print(f"  {len(mappings)} active UPnP port mapping(s):")
@@ -3737,11 +3912,28 @@ def action_default_creds():
 # NEW FEATURE 6: Router hostname check
 # ---------------------------------------------------------------------------
 
-def check_router_hostname(gateway):
+def check_router_hostname(gateway, resolvers=None):
     """
     Perform a reverse DNS lookup on the gateway IP.
     An unexpected or suspicious hostname may indicate a rogue router.
-    Returns dict: {gateway, hostname, suspicious}
+    Returns dict: {gateway, hostname, suspicious, self_attested}
+
+    The lookup goes through whatever resolver this machine is configured to
+    use, and on a home network that is normally the gateway itself — which is
+    the device this check exists to be suspicious of. When that is the case the
+    answer is the router's statement about its own identity, and a rogue one
+    answers it exactly as an honest one would: with something unremarkable, or
+    with nothing at all. The nothing-at-all path is the most likely output on a
+    real home network, and it used to print as a passed check.
+
+    So `self_attested` records who answered. It does not make the finding
+    wrong — a cloud-provider PTR is still worth seeing — but it decides whether
+    a clean result may be reported as OK, in the same way and for the same
+    reason that an unkeyed seal verifies without being called forgery-proof.
+
+    `resolvers` is passed in rather than read here so this stays a pure
+    function of what it is given; callers that do not supply it get
+    self_attested None, meaning "not established" rather than "no".
     """
     try:
         hostname = socket.gethostbyaddr(gateway)[0]
@@ -3750,6 +3942,7 @@ def check_router_hostname(gateway):
     except Exception:
         hostname = None
 
+    self_attested = None if resolvers is None else (gateway in resolvers)
     suspicious = False
     note = ""
     if not hostname:
@@ -3769,7 +3962,8 @@ def check_router_hostname(gateway):
         if not suspicious:
             note = "Hostname looks normal for a home router."
 
-    return {"gateway": gateway, "hostname": hostname, "suspicious": suspicious, "note": note}
+    return {"gateway": gateway, "hostname": hostname, "suspicious": suspicious,
+            "note": note, "self_attested": self_attested}
 
 
 def action_router_hostname():
@@ -3779,11 +3973,28 @@ def action_router_hostname():
         print("  Could not determine gateway.")
         return {}
 
-    result = check_router_hostname(gateway)
+    resolvers = get_dns_servers()
+    result = check_router_hostname(gateway, resolvers)
     print(f"  Gateway IP : {result['gateway']}")
     print(f"  Hostname   : {result['hostname'] or '(none)'}")
-    risk = "HIGH" if result["suspicious"] else "OK"
-    print(f"  [{risk}] {result['note']}")
+
+    if result["suspicious"]:
+        # Still worth reporting at full volume. A router that names a cloud
+        # provider has said something against its own interest, and evidence
+        # from a witness with a motive to lie is strongest when it incriminates.
+        print(f"  [HIGH] {result['note']}")
+    elif result["self_attested"]:
+        # Not OK. The gateway resolved the question about the gateway, so a
+        # rogue one produces this exact output, and printing OK would certify a
+        # check that cannot fail closed.
+        print(f"  [INFO] {result['note']}")
+        print("         This answer came from the gateway itself — it is one of this "
+              "machine's")
+        print("         resolvers, so it was asked to vouch for its own identity. A "
+              "rogue router")
+        print("         answers this the same way yours just did. Not a passed check.")
+    else:
+        print(f"  [OK] {result['note']}")
     return result
 
 
@@ -4407,11 +4618,48 @@ def generate_html_report(state, output_path=None):
     # Router hostname
     if "router_hostname" in state:
         rh = state["router_hostname"]
-        risk = "HIGH" if rh.get("suspicious") else "OK"
+        if rh.get("suspicious"):
+            risk = "HIGH"
+        elif rh.get("self_attested"):
+            # The gateway answered the question about the gateway. A rogue one
+            # answers it identically, so this cannot be badged as a pass.
+            risk = "INFO"
+        else:
+            risk = "OK"
         body = f"""<p>{risk_badge(risk)} Gateway: {_esc(rh.get('gateway','?'))}</p>
                    <p>Hostname: {_esc(rh.get('hostname') or '(none)')}</p>
                    <p>{_esc(rh.get('note',''))}</p>"""
+        if rh.get("self_attested"):
+            body += ("<p>This answer was served by the gateway itself, which is one "
+                     "of this machine's resolvers — it was asked to vouch for its own "
+                     "identity. A rogue router answers exactly as this one did, so "
+                     "this is <strong>not a passed check</strong>.</p>")
         sections_html += section("Router Hostname Check", body)
+
+    # Evidence provenance.
+    #
+    # The terminal report prints this too, but it matters more here: an exported
+    # file is the artefact most likely to be read by someone who did not run the
+    # audit and cannot see which lines the gateway was trusted for.
+    _grouped = findings_by_evidence(state)
+    _basis_rows = [[EVIDENCE[key][2], _EVIDENCE_TAG[cls], EVIDENCE[key][1]]
+                   for cls in (SELF_REPORTED, RESOLVER_DEPENDENT, THIRD_PARTY)
+                   for key in _grouped.get(cls, ())]
+    if _basis_rows:
+        _independent = len(_grouped.get(OBSERVED, ())) + len(_grouped.get(MEASURED, ()))
+        body = table(["Finding", "Came from", "Specifically"], _basis_rows)
+        body += ("<p>The findings above did not come from an independent source. Take "
+                 "seriously anything they admit to — a router listing a port mapping "
+                 "has volunteered something against its own interest. A <em>clean</em> "
+                 "result from them is worth much less: it says nothing was "
+                 "volunteered, which is not the same as there being nothing to "
+                 "find.</p>")
+        if _independent:
+            body += (f"<p>The other {_independent} finding(s) rest on this machine's "
+                     "own state or on measurements this tool made itself, which a "
+                     "gateway cannot edit. A compromised <strong>host</strong> can, "
+                     "which is what running this from a second machine is for.</p>")
+        sections_html += section("Evidence Provenance", body)
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
@@ -4984,6 +5232,11 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
             print("No changes since baseline.")
     else:
         print("No baseline saved yet. Use option 5 after reviewing results.")
+
+    _basis = describe_evidence_basis(state)
+    if _basis:
+        hr("EVIDENCE PROVENANCE")
+        print(_basis)
 
     hr()
     print("Full audit complete. This is a snapshot, not a guarantee.")
