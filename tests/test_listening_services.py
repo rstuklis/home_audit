@@ -318,3 +318,99 @@ class TestKnownBugs:
         )
         wire(monkeypatch, mod, lsof_udp=lsof_udp, netstat_udp=netstat_udp)
         assert mod.check_listening_services() == []
+
+
+class TestListenerClassification:
+    """Three groups needing opposite advice, from one list.
+
+    lsof reports only processes owned by the invoking user, so on a normal run
+    most listeners arrive from netstat with no name: four rows named against
+    twenty-one netstat sees, on the machine this was written for. The report
+    used to mark all of them "*" and say "verify you recognise them" — advice
+    nobody can follow for a bare port number, and which buried the two entries
+    that could genuinely have been checked under twenty that could not.
+    """
+
+    SYSTEM = {53: "DNS", 137: "NetBIOS", 5353: "mDNS", 631: "CUPS"}
+
+    def _svc(self, port, process="?", proto="TCP"):
+        return {"port": port, "proto": proto, "pid": "?", "process": process}
+
+    def test_a_named_non_system_listener_is_checkable(self, mod):
+        got = mod.classify_listeners([self._svc(19292, "AdobeReso")], self.SYSTEM)
+        assert got["named"] and not got["unattributed"]
+
+    def test_an_unnamed_non_system_listener_is_not_checkable(self, mod):
+        got = mod.classify_listeners([self._svc(49154)], self.SYSTEM)
+        assert got["unattributed"] and not got["named"]
+
+    @pytest.mark.parametrize("port", [53, 137, 631, 5353])
+    def test_well_known_ports_are_system_whether_named_or_not(self, mod, port):
+        got = mod.classify_listeners([self._svc(port)], self.SYSTEM)
+        assert got["system"] and not got["named"] and not got["unattributed"]
+
+    def test_a_privileged_port_is_system_even_when_unlisted(self, mod):
+        # Anything below 1024 needs privilege to bind, so it is not the kind of
+        # thing a stray user process opened.
+        got = mod.classify_listeners([self._svc(22, "sshd")], self.SYSTEM)
+        assert got["system"]
+
+    def test_the_two_groups_are_kept_apart(self, mod):
+        services = ([self._svc(p) for p in (49154, 49155, 49156)]
+                    + [self._svc(19292, "AdobeReso"), self._svc(7679, "Google")])
+        got = mod.classify_listeners(services, self.SYSTEM)
+        assert len(got["unattributed"]) == 3
+        assert len(got["named"]) == 2
+        assert not (set(map(id, got["named"])) & set(map(id, got["unattributed"])))
+
+    @pytest.mark.parametrize("missing", ["?", "", "   ", None])
+    def test_every_shape_of_missing_name_counts_as_unattributed(self, mod, missing):
+        got = mod.classify_listeners([self._svc(49154, missing)], self.SYSTEM)
+        assert got["unattributed"], f"{missing!r} was treated as a process name"
+
+    def test_a_malformed_entry_does_not_raise(self, mod):
+        # netstat output is parsed defensively elsewhere; this must not be the
+        # place a corrupt row takes the whole audit down.
+        got = mod.classify_listeners([{"proto": "TCP"}, {"port": None}], self.SYSTEM)
+        assert len(got["system"]) == 2
+
+    def test_every_listener_lands_in_exactly_one_group(self, mod):
+        services = [self._svc(53), self._svc(49154), self._svc(19292, "Adobe")]
+        got = mod.classify_listeners(services, self.SYSTEM)
+        assert sum(len(v) for v in got.values()) == len(services)
+
+
+class TestListenerReportWording:
+    SYSTEM = {5353: "mDNS"}
+
+    def _run(self, mod, monkeypatch, services):
+        monkeypatch.setattr(mod, "check_listening_services", lambda: services)
+        mod.action_listening_services()
+
+    def test_unnamed_listeners_are_not_offered_for_recognition(self, mod, monkeypatch, capsys):
+        self._run(mod, monkeypatch,
+                  [{"port": p, "proto": "TCP", "pid": "?", "process": "?"}
+                   for p in (49154, 49155)])
+        out = capsys.readouterr().out
+        assert "could not be attributed" in out
+        assert "Verify you recognise" not in out, \
+            "asked the reader to recognise a bare port number"
+
+    def test_the_remedy_is_stated_because_here_it_works(self, mod, monkeypatch, capsys):
+        # Distinct from the Local Network denials, where sudo is the wrong
+        # advice; for process attribution it is the right advice.
+        self._run(mod, monkeypatch,
+                  [{"port": 49154, "proto": "TCP", "pid": "?", "process": "?"}])
+        assert "sudo" in capsys.readouterr().out
+
+    def test_named_listeners_are_still_offered_for_recognition(self, mod, monkeypatch, capsys):
+        self._run(mod, monkeypatch,
+                  [{"port": 19292, "proto": "TCP", "pid": "697", "process": "AdobeReso"}])
+        out = capsys.readouterr().out
+        assert "Verify you recognise" in out
+        assert "could not be attributed" not in out
+
+    def test_a_clean_machine_still_says_so(self, mod, monkeypatch, capsys):
+        self._run(mod, monkeypatch,
+                  [{"port": 5353, "proto": "UDP", "pid": "?", "process": "?"}])
+        assert "No unexpected listeners found" in capsys.readouterr().out

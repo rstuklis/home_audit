@@ -3394,6 +3394,39 @@ def check_listening_services():
     return sorted(listeners.values(), key=lambda x: x["port"])
 
 
+UNNAMED_PROCESS = "?"
+
+
+def classify_listeners(services, system_ports):
+    """Split listeners into the three groups a reader must treat differently.
+
+    Returns {"system", "named", "unattributed"}.
+
+    A listener on a well-known system port is background. Of the rest, one with
+    a process name is something the reader can actually recognise or not. One
+    without a name is not a finding yet: lsof reports only processes owned by
+    the invoking user, so anything belonging to root or another account arrives
+    from netstat with nothing attached. On this machine that is most of them —
+    four rows named against twenty-one netstat sees.
+
+    Keeping them apart matters because the two groups need opposite advice.
+    "Verify you recognise them" is impossible for a bare port number, and
+    printing it under twenty unnameable rows buries the two entries that could
+    genuinely have been checked. Unlike the Local Network denials elsewhere in
+    this tool, sudo really does fix this one, so it is worth saying.
+    """
+    system, named, unattributed = [], [], []
+    for s in services:
+        port = s.get("port")
+        if not isinstance(port, int) or port < 1024 or port in system_ports:
+            system.append(s)
+        elif str(s.get("process") or "").strip() in ("", UNNAMED_PROCESS):
+            unattributed.append(s)
+        else:
+            named.append(s)
+    return {"system": system, "named": named, "unattributed": unattributed}
+
+
 def action_listening_services():
     hr("LISTENING SERVICES AUDIT")
     print("  Checking what processes on this Mac accept inbound connections...")
@@ -3409,21 +3442,34 @@ def action_listening_services():
         print("  Could not enumerate listening services (try running with sudo).")
         return []
 
-    flagged = []
+    groups = classify_listeners(services, SYSTEM_PORTS)
+    unattributed = groups["unattributed"]
+    named = groups["named"]
+
     print(f"\n  {'Port':<7} {'Proto':<6} {'Process':<22} Note")
     print(f"  {'-'*5:<7} {'-'*5:<6} {'-'*20:<22} {'-'*30}")
     for s in services:
         port = s["port"]
         note = SYSTEM_PORTS.get(port, "")
-        marker = "  "
-        if port >= 1024 and not note:
-            marker = "* "
-            flagged.append(s)
+        marker = "* " if s in named or s in unattributed else "  "
         print(f"{marker} {port:<7} {s['proto']:<6} {s['process']:<22} {note}")
 
-    if flagged:
-        print(f"\n  * {len(flagged)} non-system listener(s) marked above. Verify you recognise them.")
-    else:
+    if named:
+        print(f"\n  * {len(named)} non-system listener(s) named above. "
+              "Verify you recognise them.")
+    if unattributed:
+        # Deliberately not lumped in with the line above. A port number on its
+        # own is not something anyone can recognise, and the remedy here is real
+        # — unlike the Local Network denials elsewhere in this tool, sudo does
+        # supply these names.
+        ports = ", ".join(str(s["port"]) for s in unattributed[:8])
+        more = f" (+{len(unattributed) - 8} more)" if len(unattributed) > 8 else ""
+        print(f"\n  * {len(unattributed)} listener(s) could not be attributed to a "
+              "process: lsof reports only\n    processes owned by you, so these belong "
+              "to root or another account. Re-run\n    with sudo to name them before "
+              "judging whether they belong here.")
+        print(f"    Ports: {ports}{more}")
+    if not named and not unattributed:
         print("\n  No unexpected listeners found.")
 
     return services
