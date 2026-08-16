@@ -183,6 +183,41 @@ Mac itself.
 
 ---
 
+## Which program wrote the report
+
+Sealing, receipts and heartbeats all authenticate **data**. None of them says
+anything about the **program**, and the program runs on the machine being
+assessed. Delete the check that would report a backdoor port and every one of
+those defences keeps working perfectly, indefinitely, over a report that has
+quietly stopped looking.
+
+So every receipt and every heartbeat now carries a SHA-256 of the script that
+wrote it, and the audit reports when that digest changes across the off-host
+record.
+
+**Read the limit before you rely on this.** The script hashes itself. A modified
+script reports whatever digest it likes, including the original's, and nothing
+here can tell — any check the script runs on itself is a check the attacker has
+already edited. This is the same weakness the provenance section calls
+*self-reported*, and it is in that class deliberately.
+
+What it catches is a modification that did not anticipate being watched: an
+unreviewed edit, a file swapped by someone who did not read it, drift between two
+machines meant to run the same audit, a half-finished upgrade. Against an
+adversary who knows the line exists it is worth nothing.
+
+It covers this file only — not the interpreter, not the standard library, not
+anything else on the host.
+
+The digest is printed in the report so you can compare it against a trusted
+source by hand, which is the one check that does not run on the suspect machine:
+
+```sh
+shasum -a 256 home_net_audit.py      # from a copy you trust, on a machine you trust
+```
+
+---
+
 ## Which findings survive a lying gateway
 
 The report prints as one flat list of risk-tagged lines, and that format quietly
@@ -237,6 +272,10 @@ earns.
 - **A subverted monitor.** Heartbeats catch a monitor that stopped. They do
   nothing about one that is still running and lying, because both the checks and
   the heartbeat come from the same host. Anyone who owns the observer gets both.
+- **An edited audit script that knows it is attested.** The digest is computed by
+  the same script it describes, so a deliberate edit can carry the original
+  forward. Comparing the digest by hand against a trusted copy is the only check
+  here that does not run on the machine under suspicion.
 - **Wholesale destruction of the observer.** Receipts survive it; the observer
   does not.
 

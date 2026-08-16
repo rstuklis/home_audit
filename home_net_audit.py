@@ -1241,6 +1241,11 @@ def save_baseline(state, passphrase=None):
         "seq": seq,
         "prev": prev,
         "keyed": passphrase is not None,
+        # Which program wrote this. Inside the sealed payload so it cannot be
+        # edited after the fact without breaking the seal — though that buys
+        # less than it appears to, since the script computing the digest is the
+        # one an attacker would have edited. See script_digest.
+        "code": script_digest(),
         "state": state,
     }
     key = None
@@ -1392,6 +1397,42 @@ def chain_id(baseline_path=None):
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
+def script_digest(path=None):
+    """SHA-256 of the audit script on disk, or None if it cannot be read.
+
+    Everything else in this module authenticates DATA. The baseline is sealed so
+    it cannot be rewritten, receipts survive it being deleted, heartbeats show
+    observation was happening. Not one of them says anything about the program
+    that produced any of it — and the program lives on the machine being
+    assessed. Delete the check that would report a backdoor port and every one
+    of those defences keeps working perfectly, indefinitely, over a report that
+    has simply stopped looking. Recording the digest is what makes that edit
+    visible in the off-host record rather than invisible forever.
+
+    The limit is severe, and stating it is most of the point: THE SCRIPT HASHES
+    ITSELF. A modified script reports whatever digest it likes, including the
+    original's, and nothing here can tell. This is exactly the weakness the
+    provenance section calls self-reported — a witness testifying about itself —
+    and it belongs in that class rather than being dressed up as an integrity
+    guarantee. It is the same shape as the router hostname check asking the
+    gateway to confirm its own identity, and it is not fixable from in here: any
+    check the script runs on itself is a check the attacker has already edited.
+
+    What it does catch is a modification that did not anticipate being watched —
+    an unreviewed edit, a file swapped by someone who did not read it, drift
+    between two machines meant to run the same audit, a half-finished upgrade.
+    Against an adversary who knows this line exists it is worth nothing.
+
+    It also covers only this file. The interpreter, the standard library and
+    anything else on the host are outside it.
+    """
+    try:
+        with open(path or os.path.abspath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def baseline_receipt(record):
     """The minimum that proves a run happened, and nothing more.
 
@@ -1410,6 +1451,10 @@ def baseline_receipt(record):
         "prev": record.get("prev"),
         "keyed": record.get("keyed"),
         "chain": chain_id(),
+        # Copied from the record rather than recomputed, so the receipt attests
+        # to the program that actually wrote that baseline, not to whatever is
+        # on disk by the time the receipt is published.
+        "code": record.get("code"),
     }
 
 
@@ -1773,6 +1818,10 @@ def monitor_heartbeat(destination=None, token=None, interval=None, at=None):
         "chain": chain_id(),
         "interval": interval if interval is not None else MONITOR_INTERVAL,
         "at": (at or _utcnow()).isoformat(),
+        # A long-running monitor is the deployment where an edited script has
+        # the most time to go unnoticed, so liveness carries the same attestation
+        # a baseline does.
+        "code": script_digest(),
     }
     destination = resolve_sink(destination)
     if not destination:
@@ -1966,6 +2015,57 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     except KeyboardInterrupt:
         printer("\nStopped.")
     return raised
+
+
+def code_attestations(receipts):
+    """(digest, when) for every receipt that recorded one, oldest first.
+
+    Both channels are read: a baseline receipt stamps `published_at`, a
+    heartbeat stamps `at`. Monitor deployments may publish nothing but
+    heartbeats for weeks, and those are exactly the runs where an edited script
+    has the longest to go unnoticed.
+    """
+    found = []
+    for r in receipts or ():
+        if not isinstance(r, dict):
+            continue
+        digest = r.get("code")
+        if not digest:
+            continue                 # predates attestation; not a change
+        found.append((digest, r.get("published_at") or r.get("at") or ""))
+    return sorted(found, key=lambda pair: pair[1])
+
+
+def code_changes(receipts):
+    """Points in the off-host record where the attesting script changed."""
+    seen = code_attestations(receipts)
+    changes = []
+    for (before, _), (after, when) in zip(seen, seen[1:]):
+        if before != after:
+            changes.append({"from": before, "to": after, "at": when})
+    return changes
+
+
+def describe_code_attestation(receipts):
+    """A line on whether the audit program itself has changed, or None.
+
+    Silent when nothing off-host has attested anything, so a deployment without
+    a sink gains no line about a record it is not keeping.
+    """
+    seen = code_attestations(receipts)
+    if not seen:
+        return None
+    changes = code_changes(receipts)
+    caveat = ("Self-reported: the script hashes itself, so this catches an edit "
+              "that did not expect to be watched, not one that did.")
+    if not changes:
+        return (f"  [INFO  ] Audit code: sha256 {seen[-1][0][:12]}… unchanged across "
+                f"{len(seen)} off-host record(s). {caveat}")
+    last = changes[-1]
+    return (f"  [REVIEW] Audit code: the script's digest changed at "
+            f"{last['at'] or 'an unrecorded time'} ({last['from'][:12]}… → "
+            f"{last['to'][:12]}…), {len(changes)} time(s) on record. If you did not "
+            f"update the tool, something edited it. {caveat}")
 
 
 def describe_receipt_status(report):
@@ -5136,6 +5236,12 @@ def action_compare_baseline(state):
         _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
         if _gaps:
             print(_gaps)
+        # Reads both channels: a monitor-only deployment publishes heartbeats
+        # for weeks without a single baseline receipt, and that is exactly where
+        # an edited script has the longest to go unnoticed.
+        _code = describe_code_attestation(read_receipts(_sink))
+        if _code:
+            print(_code)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:
@@ -5307,6 +5413,12 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         _gaps = describe_observation_gaps(observation_gaps(read_heartbeats(_sink)))
         if _gaps:
             print(_gaps)
+        # Reads both channels: a monitor-only deployment publishes heartbeats
+        # for weeks without a single baseline receipt, and that is exactly where
+        # an edited script has the longest to go unnoticed.
+        _code = describe_code_attestation(read_receipts(_sink))
+        if _code:
+            print(_code)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:
