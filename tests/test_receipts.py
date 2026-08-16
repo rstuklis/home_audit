@@ -362,6 +362,22 @@ class TestRedirectsAreRefused:
                                      token="write-only-token")
         assert report["published"] is False
         assert "https" in report["detail"]
+        assert "sink token" in report["detail"]
+
+    def test_the_refusal_names_the_credential_the_caller_actually_set(
+            self, mod, monkeypatch):
+        # This function is the transport for receipts, heartbeats and alerts,
+        # and the alert channel carries a different credential to a different
+        # endpoint. Telling an alert user their *sink* token was refused points
+        # them at the wrong setting.
+        fake_opener(monkeypatch,
+                    lambda req, timeout=None: pytest.fail("must not send at all"))
+        monkeypatch.setenv(mod.ALERT_TOKEN_ENV, "alert-token")
+        report = mod.send_alert({"kind": "k", "detail": "d"},
+                                destination="http://alerts.example/hook")
+        assert report["published"] is False
+        assert "alert token" in report["detail"]
+        assert "sink token" not in report["detail"]
 
 
 class _NullOpener:

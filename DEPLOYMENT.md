@@ -112,17 +112,30 @@ It watches the default gateway, **the gateway's MAC** (a change there with the
 IP unchanged is what ARP poisoning looks like), the set of advertising IPv6
 routers, the DNS resolvers, and arrivals in the neighbour table.
 
-Alerts go to a **separate** destination from receipts (`HOME_NET_AUDIT_ALERT`),
-with a **separate** credential (`HOME_NET_AUDIT_ALERT_TOKEN`). Routine
-bookkeeping and things a person must wake up for usually belong on different
-channels — and an alert printed to a terminal on the host under suspicion has
-been delivered to the adversary and nobody else.
+Alerts go to a **separate** destination from receipts, with a **separate**
+credential. Routine bookkeeping and things a person must wake up for usually
+belong on different channels — and an alert printed to a terminal on the host
+under suspicion has been delivered to the adversary and nobody else.
+
+```sh
+export HOME_NET_AUDIT_ALERT='https://alerts.example/hook'
+export HOME_NET_AUDIT_ALERT_TOKEN='alert-channel-token'   # sent as Bearer
+```
+
+`HOME_NET_AUDIT_ALERT_TOKEN` is optional — leave it unset for a destination
+that authenticates in the URL, as most chat webhooks do. What it must never be
+is your sink token.
 
 The alert channel used to fall back to `HOME_NET_AUDIT_SINK_TOKEN` when no
 alert token was set, which meant pointing `HOME_NET_AUDIT_ALERT` at a chat
 webhook logged the append-only collector's credential at a third party on every
-alert. It no longer does; if you were relying on that fallback, set
-`HOME_NET_AUDIT_ALERT_TOKEN` explicitly.
+alert — the one credential whose whole purpose is that the audited host cannot
+use it to rewrite what it has already published. It no longer falls back. **If
+you were relying on that, alerts now go out unauthenticated until you set
+`HOME_NET_AUDIT_ALERT_TOKEN` explicitly.**
+
+The same two rules as the receipt sink apply to this URL, for the same reasons:
+redirects are refused rather than followed, and a token requires `https://`.
 
 **An alert that cannot be delivered is queued and retried** on every subsequent
 poll, and named again at HIGH when the loop ends with any still undelivered.
@@ -192,6 +205,21 @@ RestartSec=30
 [Install]
 WantedBy=multi-user.target
 ```
+
+The destinations sit in the unit because they are configuration; the three
+credentials sit in `EnvironmentFile` because they are not:
+
+```sh
+# /etc/home-net-audit/secrets — chmod 600, owned by the audit user
+HOME_NET_AUDIT_SINK_TOKEN=write-only-token
+HOME_NET_AUDIT_ALERT_TOKEN=alert-channel-token
+HOME_NET_AUDIT_PASSPHRASE=…
+```
+
+Keep the two tokens distinct. They authenticate to different endpoints and
+protect different things — the sink token is what stops the audited host
+rewriting its own published history, and it has no business travelling to
+whatever service pages you.
 
 Run it as a dedicated `audit` user. Its `~/.home_net_audit` should not be
 writable by the account you use day to day.
