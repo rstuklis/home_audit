@@ -1504,7 +1504,7 @@ def compare_with_receipts(record, receipts):
     run 7, and a local baseline claiming run 1 gives it away.
 
     Returns {status, detail}. Statuses: ok, no_receipts, history_truncated,
-    seal_mismatch.
+    seal_mismatch, keyed_downgrade.
     """
     # Only this chain's receipts, plus every receipt that predates chains.
     #
@@ -1537,6 +1537,27 @@ def compare_with_receipts(record, receipts):
     if not receipts:
         return {"status": "no_receipts",
                 "detail": "No off-host receipts to compare against."}
+
+    # Keyed-ness is sticky, and this is the only place that can hold it to that.
+    #
+    # An unkeyed seal is one a compromised host can recompute at will, so the
+    # cheapest forgery available to an attacker without the passphrase is not to
+    # break the key but to strip it: replace the baseline with an unkeyed record
+    # carrying whatever state they like, and extend the chain one step as unkeyed.
+    # verify_baseline cannot catch this — the same attacker rewrites the local
+    # history to agree that the run was unkeyed, and an unkeyed seal that matches
+    # its own contents verifies. The receipts are the one record they cannot
+    # overwrite, and they still say the chain was keyed. If any receipt here was
+    # keyed while the local baseline now is not, the key has been removed, and
+    # everything the current baseline claims is attacker-controlled.
+    if any(r.get("keyed") for r in receipts) and not (record or {}).get("keyed"):
+        return {"status": "keyed_downgrade",
+                "detail": "The off-host receipts record this chain as sealed with a "
+                          "passphrase, but the local baseline is now unkeyed. An "
+                          "unkeyed seal is one a compromised host can forge, so the "
+                          "key was stripped to rewrite the baseline undetected. Treat "
+                          "the current baseline as attacker-controlled and re-seal "
+                          "from a trusted state."}
 
     highest = max((r.get("seq") or 0) for r in receipts)
     local_seq = (record or {}).get("seq") or 0
@@ -1700,6 +1721,7 @@ def describe_receipt_status(report):
         "no_receipts": "REVIEW",
         "history_truncated": "HIGH",
         "seal_mismatch": "HIGH",
+        "keyed_downgrade": "HIGH",
     }.get(report.get("status"), "REVIEW")
     return f"  [{risk:6}] Off-host receipts: {report.get('detail', '')}"
 
