@@ -3335,9 +3335,25 @@ def diff_baseline(old, new):
             notes.append(f"Port(s) now closed on {host}: {sorted(old_ports - new_ports)}")
     old_bssids = set(old.get("wifi_bssids", []))
     new_bssids = set(new.get("wifi_bssids", []))
-    if new_bssids - old_bssids:
+    added_bssids = new_bssids - old_bssids
+    if added_bssids and not old_bssids:
+        # An empty old list means earlier runs could not see any BSSID —
+        # redaction, not absence — so this is visibility beginning, not a
+        # second access point appearing. Asserting "evil twin" here would
+        # contradict the Evil Twin section's own verdict in the same report.
         notes.append(
-            f"NEW access point advertising your SSID: {sorted(new_bssids - old_bssids)}. "
+            f"BSSID(s) recorded for the first time: {sorted(added_bssids)}. "
+            "Earlier runs could not read any, so this is new visibility, "
+            "not a new access point.")
+    elif added_bssids and (new.get("evil_twin") or {}).get("source") == "association_record":
+        notes.append(
+            f"Associated with previously unseen BSSID(s): {sorted(added_bssids)}. "
+            "Read from the association record, which sees only the joined "
+            "access point — a mesh roaming between its own units looks like "
+            "this. The Evil Twin section has the verdict.")
+    elif added_bssids:
+        notes.append(
+            f"NEW access point advertising your SSID: {sorted(added_bssids)}. "
             "A second AP broadcasting your network name is an evil twin.")
 
     old_offer = (old.get("dhcp") or {}).get("responders") or []
@@ -3753,6 +3769,102 @@ def parse_wifi_networks(text):
     return {k: v for k, v in networks.items() if v}
 
 
+def _scutil_wifi_fallback():
+    """Return (ssid, bssid) from the SystemConfiguration dynamic store, or
+    (None, None).
+
+    Sequoia scrubs the store's top-level SSID_STR and BSSID keys for a process
+    without Location Services, but (as of 15.7) the CachedScanRecord left
+    beside them is an NSKeyedArchiver plist still carrying both for the
+    network this machine last associated to. Unprivileged, and refreshed on
+    every association. Two honest limits: it is a cache, so a reading taken
+    mid-roam can be one association behind; and everything in it originated
+    in beacon frames, so a hostile access point chose these bytes — the
+    parser treats the blob as untrusted and returns nothing on any surprise.
+    """
+    out = run(["/bin/sh", "-c",
+               "echo 'show State:/Network/Interface/en0/AirPort' | scutil"],
+              timeout=10) or ""
+    m = re.search(r"CachedScanRecord\s*:\s*<data>\s*0x([0-9a-fA-F]+)", out)
+    if not m:
+        return None, None
+    try:
+        import plistlib
+        arc = plistlib.loads(bytes.fromhex(m.group(1)))
+        objs = arc["$objects"]
+
+        def deref(v):
+            if isinstance(v, plistlib.UID):
+                return objs[v.data] if v.data < len(objs) else None
+            return v
+
+        for o in objs:
+            if not (isinstance(o, dict) and "NS.keys" in o and "NS.objects" in o):
+                continue
+            keys = [deref(k) for k in o["NS.keys"]]
+            vals = [deref(v) for v in o["NS.objects"]]
+            kv = {k: v for k, v in zip(keys, vals) if isinstance(k, str)}
+            ssid = kv.get("SSID_STR")
+            if not (isinstance(ssid, str) and 0 < len(ssid) <= 32):
+                continue
+            bssid = None
+            b = kv.get("BSSID")
+            if isinstance(b, str) and len(b.split(":")) == 6:
+                try:
+                    bssid = ":".join(f"{int(x, 16):02x}" for x in b.split(":"))
+                except ValueError:
+                    bssid = None
+            return ssid, bssid
+    except Exception:
+        pass
+    return None, None
+
+
+def _wdutil_wifi_fallback():
+    """Return (ssid, bssid) via `sudo -n wdutil info`, or (None, None).
+
+    Location Services gates the SSID per-process, and a launchd background job
+    has no way to hold that grant — root is the one path macOS still allows.
+    `sudo -n` never prompts: without a NOPASSWD rule for wdutil it fails
+    instantly and this returns nothing, leaving behaviour exactly as before.
+    Enable it with a drop-in like
+        rstuklis ALL=(root) NOPASSWD: /usr/bin/wdutil info
+    in /etc/sudoers.d/. The BSSID returned is only the one this machine is
+    associated to — wdutil cannot see other access points advertising the same
+    SSID, so a twin is caught at the moment of association, not while merely
+    broadcasting nearby.
+    """
+    out = run(["sudo", "-n", "/usr/bin/wdutil", "info"], timeout=10) or ""
+    ssid = bssid = None
+    m = re.search(r"^\s*SSID\s*:\s*(.+?)\s*$", out, re.MULTILINE)
+    if m and m.group(1).lower() not in ("<redacted>", "redacted", "none"):
+        ssid = m.group(1)
+    m = re.search(r"^\s*BSSID\s*:\s*(\S+)\s*$", out, re.MULTILINE)
+    if m:
+        raw = m.group(1).split(":")
+        if len(raw) == 6:
+            try:
+                bssid = ":".join(f"{int(x, 16):02x}" for x in raw)
+            except ValueError:
+                bssid = None
+    return ssid, bssid
+
+
+def _redacted_wifi_fallback():
+    """SSID/BSSID for a process macOS redacts them from.
+
+    The dynamic store's cached association record first — unprivileged and
+    still populated on current macOS — then root wdutil, which needs the
+    sudoers rule and which 15.7 redacts anyway; older systems still honour
+    it. Both sources describe only the access point this machine associated
+    to, never other advertisers of the SSID, and callers must treat them so.
+    """
+    ssid, bssid = _scutil_wifi_fallback()
+    if ssid:
+        return ssid, bssid
+    return _wdutil_wifi_fallback()
+
+
 def check_evil_twin(ssid=None, known=None):
     """Flag a BSSID advertising your SSID that was not in the baseline.
 
@@ -3765,13 +3877,30 @@ def check_evil_twin(ssid=None, known=None):
     if ssid is None:
         ssid, _ = _parse_connected_wifi_block(out)
 
+    # Fallback only on actual redaction. An unassociated Mac, absent Wi-Fi
+    # hardware or a Linux observer returns no SSID at all, and issuing failed
+    # sudo attempts from those hosts would put privilege-escalation noise in
+    # their auth logs for zero possible benefit.
+    via_fallback = False
+    if ssid == "<redacted>":
+        w_ssid, w_bssid = _redacted_wifi_fallback()
+        if w_ssid:
+            ssid = w_ssid
+            via_fallback = True
+            networks.setdefault(ssid, [])
+            if w_bssid and w_bssid not in networks[ssid]:
+                networks[ssid].append(w_bssid)
+
     if not ssid or ssid == "<redacted>":
         return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
                 "note": "Could not read the connected SSID. macOS withholds it "
                         "from a process without Location Services access — grant "
                         "it to this terminal in System Settings > Privacy & "
-                        "Security > Location Services. Running with sudo does "
-                        "not help; the gate is the permission, not the user."}
+                        "Security > Location Services for interactive runs. "
+                        "The automatic fallbacks — the system configuration "
+                        "store's association record, then root wdutil under a "
+                        "NOPASSWD rule — were also unreadable, so a scheduled "
+                        "job on this system has no path to the SSID."}
 
     bssids = networks.get(ssid, [])
     if not bssids:
@@ -3779,9 +3908,46 @@ def check_evil_twin(ssid=None, known=None):
                 "note": f"No BSSID visible for {ssid}. BSSIDs are withheld from a "
                         "process without Location Services access — grant it in "
                         "System Settings > Privacy & Security > Location Services. "
-                        "sudo does not reveal them."}
+                        "sudo alone does not reveal them; a NOPASSWD rule for "
+                        "`/usr/bin/wdutil info` lets the audit read the "
+                        "associated one."}
 
     known = list(known or [])
+
+    if via_fallback:
+        # The fallback sources see only the access point this machine is
+        # associated to, so the full comparative check cannot run: a sibling
+        # mesh unit and an evil twin that captured the association look
+        # identical — one never-seen BSSID. Alarming at HIGH would page on
+        # every mesh roam forever, so a new association is a REVIEW to verify
+        # once, and the union is kept so it is then remembered.
+        new = [b for b in bssids if b not in known]
+        merged = known + new
+        if new and known:
+            return {"ssid": ssid, "bssids": merged, "unexpected": new, "risk": "REVIEW",
+                    "source": "association_record",
+                    "note": f"Associated with {', '.join(new)} on {ssid}, a BSSID "
+                            "not seen before. Read from this machine's "
+                            "association record, which covers only the access "
+                            "point it joined — a mesh roaming between its own "
+                            "units looks exactly like this, and so would a twin "
+                            "that captured the association. Check the MAC "
+                            "against your own equipment once; it is then "
+                            "remembered."}
+        if known:
+            return {"ssid": ssid, "bssids": merged, "unexpected": [], "risk": "OK",
+                    "source": "association_record",
+                    "note": f"Associated with a known BSSID on {ssid}. Read from "
+                            "the association record — only the joined access "
+                            "point is visible, not other advertisers of this "
+                            "SSID."}
+        return {"ssid": ssid, "bssids": merged, "unexpected": [], "risk": "OK",
+                "source": "association_record",
+                "note": f"{ssid} associated via {', '.join(bssids)}. Read from "
+                        "the association record — only the joined access point "
+                        "is visible. Saved as the first known BSSID for this "
+                        "network."}
+
     unexpected = [b for b in bssids if b not in known] if known else []
     if unexpected:
         return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "HIGH",
@@ -3814,7 +3980,8 @@ def check_wifi_security():
 
     Returns a dict: ssid, auth, cipher, risk, note. ssid is None when macOS
     withholds it, which it does from any process without Location Services
-    access — the default for a terminal, and unaffected by sudo. An SSID and a
+    access — the default for a terminal, and unaffected by plain sudo (the
+    wdutil fallback below is the one sanctioned root path). An SSID and a
     BSSID can be looked up in a wardriving database to place a house on a map,
     so those two fields sit behind that permission while everything else in the
     same report — firmware, channel, country code, the security mode this
@@ -3826,6 +3993,12 @@ def check_wifi_security():
     ssid_raw, block = _parse_connected_wifi_block(out)
     if ssid_raw and ssid_raw != "<redacted>":
         result["ssid"] = ssid_raw
+    elif ssid_raw == "<redacted>":
+        # Redaction specifically — an unassociated or Wi-Fi-less host gets no
+        # block at all, and a failed sudo attempt there is pure auth-log noise.
+        w_ssid, _ = _redacted_wifi_fallback()
+        if w_ssid:
+            result["ssid"] = w_ssid
 
     # Security is scoped to the connected block only — never a neighbour's value.
     m = re.search(r"^\s*Security:\s*(.+?)\s*$", block, re.MULTILINE)
