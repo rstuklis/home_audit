@@ -35,7 +35,7 @@ python3 smsf_screener.py --rules                      # every policy number the 
 python3 smsf_screener.py --audit-universe             # cross-check the hand-curated CSV
 ```
 
-The download takes about a minute for the 53 products (a short pause between
+The download takes about a minute for the 56 products (a short pause between
 requests stays under Yahoo's rate limit) and prints a line per ticker. It
 talks to Yahoo Finance's public chart endpoint; if that ever changes shape the
 tool says so per ticker rather than writing bad files, exits non-zero when
