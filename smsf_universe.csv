@@ -1,0 +1,54 @@
+ticker,name,issuer,structure,role,category,asset_class,mer_pct,size_aud_m,franking_pct,distribution_frequency,hedged,notes,as_at
+AAA,Betashares Australian High Interest Cash ETF,Betashares,etf,cash,cash ETF (bank deposits),defensive,0.18,4500,0,monthly,na,Holds bank deposits; pays monthly; unit price sits near AUD 50,2026-09-06
+BILL,iShares Core Cash ETF,BlackRock iShares,etf,cash,cash ETF (short-term money market),defensive,0.07,2500,0,monthly,na,Short-dated bank paper; unit price near AUD 100,2026-09-06
+ISEC,iShares Enhanced Cash ETF,BlackRock iShares,etf,cash,cash ETF (enhanced),defensive,0.12,1000,0,monthly,na,Slightly longer paper than BILL for a little more yield,2026-09-06
+MMKT,Betashares Australian Cash Plus Fund (managed fund),Betashares,active_etf,cash,cash-plus active fund,defensive,0.12,700,0,monthly,na,Actively managed cash-plus; may hold short-dated credit,2026-09-06
+VAF,Vanguard Australian Fixed Interest Index ETF,Vanguard,etf,defensive,Australian composite bond ETF,defensive,0.10,2500,0,quarterly,na,Bloomberg AusBond Composite; duration about 5 years,2026-09-06
+IAF,iShares Core Composite Bond ETF,BlackRock iShares,etf,defensive,Australian composite bond ETF,defensive,0.10,3000,0,quarterly,na,Bloomberg AusBond Composite; duration about 5 years,2026-09-06
+VGB,Vanguard Australian Government Bond Index ETF,Vanguard,etf,defensive,Australian government bond ETF,defensive,0.16,1000,0,quarterly,na,Commonwealth and state government bonds only,2026-09-06
+AGVT,Betashares Australian Government Bond ETF,Betashares,etf,defensive,Australian government bond ETF,defensive,0.22,500,0,monthly,na,Longer duration (7-12 year bonds); more sensitive to rates,2026-09-06
+BOND,SPDR S&P/ASX Australian Bond Fund,State Street,etf,defensive,Australian composite bond ETF,defensive,0.24,60,0,quarterly,na,Small fund; kept in the universe to show the size filter working,2026-09-06
+VBND,Vanguard Global Aggregate Bond Index (Hedged) ETF,Vanguard,etf,defensive,global bond ETF (AUD hedged),defensive,0.20,900,0,quarterly,yes,Global government and corporate bonds hedged to AUD,2026-09-06
+CRED,Betashares Australian Investment Grade Corporate Bond ETF,Betashares,etf,defensive,Australian corporate bond ETF,defensive,0.25,700,0,monthly,na,Fixed-rate corporate bonds; duration about 5-6 years,2026-09-06
+VACF,Vanguard Australian Corporate Fixed Interest Index ETF,Vanguard,etf,defensive,Australian corporate bond ETF,defensive,0.20,800,0,quarterly,na,Investment-grade corporate bonds,2026-09-06
+QPON,Betashares Australian Bank Senior Floating Rate Bond ETF,Betashares,etf,defensive,floating-rate bond ETF,defensive,0.19,1500,0,monthly,na,Senior bank floating-rate notes; near-zero duration,2026-09-06
+FLOT,VanEck Australian Floating Rate ETF,VanEck,etf,defensive,floating-rate bond ETF,defensive,0.22,800,0,monthly,na,Floating-rate notes; near-zero duration,2026-09-06
+SUBD,VanEck Australian Subordinated Debt ETF,VanEck,etf,defensive,subordinated (Tier 2) bank debt ETF,defensive,0.29,2000,0,monthly,na,Tier 2 bank debt: higher yield; ranks below senior bonds,2026-09-06
+HBRD,Betashares Active Australian Hybrids Fund (managed fund),Betashares,hybrid_etf,defensive,bank hybrid (AT1) active fund,defensive,0.55,2500,45,monthly,na,Bank Additional Tier 1 hybrids are being phased out by APRA; distributions partly franked,2026-09-06
+VAS,Vanguard Australian Shares Index ETF,Vanguard,etf,core_au,Australian equities ETF (S&P/ASX 300),growth,0.07,20000,75,quarterly,na,ASX 300; the most widely held Australian equity ETF,2026-09-06
+A200,Betashares Australia 200 ETF,Betashares,etf,core_au,Australian equities ETF (Solactive Australia 200),growth,0.04,9000,75,quarterly,na,Cheapest broad Australian equity ETF,2026-09-06
+IOZ,iShares Core S&P/ASX 200 ETF,BlackRock iShares,etf,core_au,Australian equities ETF (S&P/ASX 200),growth,0.05,7000,75,quarterly,na,,2026-09-06
+STW,SPDR S&P/ASX 200 Fund,State Street,etf,core_au,Australian equities ETF (S&P/ASX 200),growth,0.05,5500,75,quarterly,na,Oldest ETF on the ASX,2026-09-06
+MVW,VanEck Australian Equal Weight ETF,VanEck,etf,core_au,Australian equities ETF (equal weight),growth,0.35,2500,70,semi-annual,na,Equal weighting cuts bank and miner concentration at several times the fee,2026-09-06
+VGS,Vanguard MSCI Index International Shares ETF,Vanguard,etf,core_intl,developed-market equities ETF (unhedged),growth,0.18,11000,0,quarterly,no,MSCI World ex Australia; about 1500 companies,2026-09-06
+VGAD,Vanguard MSCI Index International Shares (Hedged) ETF,Vanguard,etf,core_intl,developed-market equities ETF (AUD hedged),growth,0.21,3500,0,quarterly,yes,Hedged version of VGS; distributions can be lumpy because hedging gains are paid out,2026-09-06
+BGBL,Betashares Global Shares ETF,Betashares,etf,core_intl,developed-market equities ETF (unhedged),growth,0.08,2000,0,semi-annual,no,Solactive developed markets ex Australia,2026-09-06
+HGBL,Betashares Global Shares Currency Hedged ETF,Betashares,etf,core_intl,developed-market equities ETF (AUD hedged),growth,0.11,600,0,semi-annual,yes,Hedged version of BGBL,2026-09-06
+IVV,iShares S&P 500 ETF,BlackRock iShares,etf,core_intl,US large-cap equities ETF (unhedged),growth,0.04,12000,0,quarterly,no,US only; concentrated in a handful of technology names,2026-09-06
+IHVV,iShares S&P 500 (AUD Hedged) ETF,BlackRock iShares,etf,core_intl,US large-cap equities ETF (AUD hedged),growth,0.10,1500,0,quarterly,yes,Hedged version of IVV,2026-09-06
+IWLD,iShares Core MSCI World ex Australia ESG Leaders ETF,BlackRock iShares,etf,core_intl,developed-market equities ETF (ESG screened; unhedged),growth,0.09,700,0,semi-annual,no,ESG screen means it is not a plain index fund,2026-09-06
+VEU,Vanguard All-World ex-US Shares Index ETF,Vanguard,etf,core_intl,world ex-US equities ETF (US-domiciled; unhedged),growth,0.05,3000,0,quarterly,no,US-domiciled: the fund must lodge a W-8BEN-E; US withholding and estate-tax questions; USD distributions,2026-09-06
+NDQ,Betashares Nasdaq 100 ETF,Betashares,etf,core_intl,US technology-heavy equities ETF (unhedged),growth,0.48,6000,0,semi-annual,no,A sector bet rather than core; fee above the role cap,2026-09-06
+VGE,Vanguard FTSE Emerging Markets Shares ETF,Vanguard,etf,core_intl,emerging-market equities ETF (unhedged),growth,0.48,1000,0,quarterly,no,Fee above the role cap; emerging-market risk,2026-09-06
+VHY,Vanguard Australian Shares High Yield ETF,Vanguard,etf,income,Australian high-dividend equities ETF,growth,0.25,5500,80,quarterly,na,FTSE ASFA high-yield screen; heavy in banks and miners,2026-09-06
+IHD,iShares S&P/ASX Dividend Opportunities ESG Screened ETF,BlackRock iShares,etf,income,Australian dividend equities ETF,growth,0.30,300,80,quarterly,na,,2026-09-06
+SYI,SPDR MSCI Australia Select High Dividend Yield Fund,State Street,etf,income,Australian dividend equities ETF,growth,0.35,500,80,quarterly,na,,2026-09-06
+HVST,Betashares Australian Dividend Harvester Fund (managed fund),Betashares,active_etf,income,dividend-harvesting active fund,growth,0.72,300,70,monthly,na,Rotates into shares before ex-dividend dates; high headline yield with a history of capital erosion; fee above the role cap,2026-09-06
+YMAX,Betashares Australian Top 20 Equity Yield Maximiser Fund (managed fund),Betashares,active_etf,income,covered-call income fund,growth,0.76,500,60,quarterly,na,Option overlay caps upside; part of the yield is option premium; fee above the role cap,2026-09-06
+AFI,Australian Foundation Investment Company,AFIC,lic,income,large-cap Australian equities LIC,growth,0.14,12000,100,semi-annual,na,Internally managed LIC; check premium or discount to NTA,2026-09-06
+ARG,Argo Investments,Argo,lic,income,large-cap Australian equities LIC,growth,0.14,8000,100,semi-annual,na,Internally managed LIC; check premium or discount to NTA,2026-09-06
+WHF,Whitefield Industrials,Whitefield,lic,income,industrials-only Australian equities LIC,growth,0.35,700,100,semi-annual,na,Excludes resources; check premium or discount to NTA,2026-09-06
+BKI,BKI Investment Company,BKI,lic,income,Australian equities LIC,growth,0.17,1500,100,semi-annual,na,Check premium or discount to NTA,2026-09-06
+DUI,Diversified United Investment,DUI,lic,income,Australian and international equities LIC,growth,0.13,1800,100,semi-annual,na,Holds some international ETFs; check premium or discount to NTA,2026-09-06
+GOLD,Global X Physical Gold,Global X,etf,diversifier,physical gold ETF (unhedged),growth,0.40,5000,0,none,no,Backed by allocated bullion in London; pays no income,2026-09-06
+PMGOLD,Perth Mint Gold,The Perth Mint,etf,diversifier,gold (Perth Mint depository receipt; unhedged),growth,0.15,1500,0,none,no,Government-backed Perth Mint structure; pays no income,2026-09-06
+QAU,Betashares Gold Bullion ETF - Currency Hedged,Betashares,etf,diversifier,physical gold ETF (AUD hedged),growth,0.59,1200,0,none,yes,Removes the USD exposure from gold,2026-09-06
+VAP,Vanguard Australian Property Securities Index ETF,Vanguard,etf,diversifier,Australian listed property (A-REIT) ETF,growth,0.23,3000,5,quarterly,na,Dominated by Goodman Group; overlaps with the ASX 300,2026-09-06
+SLF,SPDR S&P/ASX 200 Listed Property Fund,State Street,etf,diversifier,Australian listed property (A-REIT) ETF,growth,0.16,600,5,quarterly,na,,2026-09-06
+VBLD,Vanguard Global Infrastructure Index ETF,Vanguard,etf,diversifier,global infrastructure ETF (unhedged),growth,0.47,500,0,quarterly,no,,2026-09-06
+IFRA,VanEck FTSE Global Infrastructure (Hedged) ETF,VanEck,etf,diversifier,global infrastructure ETF (AUD hedged),growth,0.52,1000,0,quarterly,yes,,2026-09-06
+VDCO,Vanguard Diversified Conservative Index ETF,Vanguard,etf,all_in_one,diversified 30/70 growth/defensive ETF,mixed,0.27,300,20,quarterly,na,30% growth / 70% defensive,2026-09-06
+VDBA,Vanguard Diversified Balanced Index ETF,Vanguard,etf,all_in_one,diversified 50/50 ETF,mixed,0.27,1000,20,quarterly,na,50% growth / 50% defensive,2026-09-06
+VDGR,Vanguard Diversified Growth Index ETF,Vanguard,etf,all_in_one,diversified 70/30 ETF,mixed,0.27,1300,20,quarterly,na,70% growth / 30% defensive,2026-09-06
+VDHG,Vanguard Diversified High Growth Index ETF,Vanguard,etf,all_in_one,diversified 90/10 ETF,mixed,0.27,4000,20,quarterly,na,90% growth / 10% defensive,2026-09-06
+DHHF,Betashares Diversified All Growth ETF,Betashares,etf,all_in_one,diversified 100% growth ETF,growth,0.19,1200,25,quarterly,na,No bonds at all,2026-09-06

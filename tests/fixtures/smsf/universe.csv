@@ -1,0 +1,19 @@
+ticker,name,issuer,structure,role,category,asset_class,mer_pct,size_aud_m,franking_pct,distribution_frequency,hedged,notes,as_at
+CASHX,Fixture Cash ETF,FixtureCo,etf,cash,cash ETF,defensive,0.1,2000,0,monthly,na,,2026-06-30
+CASHY,Fixture Dearer Cash ETF,FixtureCo,etf,cash,cash ETF,defensive,0.28,300,0,monthly,na,,2026-06-30
+BONDX,Fixture Composite Bond ETF,FixtureCo,etf,defensive,bond ETF,defensive,0.1,1500,0,quarterly,na,,2026-06-30
+HYBX,Fixture Bank Hybrid Fund,FixtureCo,hybrid_etf,defensive,hybrid fund,defensive,0.3,2000,45,monthly,na,,2026-06-30
+AUEQX,Fixture Australian Shares ETF,FixtureCo,etf,core_au,Australian equities ETF,growth,0.07,15000,75,quarterly,na,,2026-06-30
+AUEQY,Fixture Australia 200 ETF,FixtureCo,etf,core_au,Australian equities ETF,growth,0.05,6000,75,quarterly,na,,2026-06-30
+PRICY,Fixture Equal Weight ETF,FixtureCo,etf,core_au,Australian equities ETF,growth,0.35,2500,70,semi-annual,na,,2026-06-30
+INTLX,Fixture International Shares ETF,FixtureCo,etf,core_intl,international equities ETF,growth,0.18,9000,0,quarterly,no,,2026-06-30
+OLDFCT,Fixture International Shares (Hedged) ETF,FixtureCo,etf,core_intl,international equities ETF,growth,0.2,500,0,quarterly,yes,,2025-01-01
+HIYLD,Fixture Dividend Harvester Fund,FixtureCo,active_etf,income,dividend fund,growth,0.25,4000,80,quarterly,na,,2026-06-30
+LICX,Fixture Investment Company,FixtureCo,lic,income,Australian equities LIC,growth,0.14,10000,100,semi-annual,na,,2026-06-30
+TINYX,Fixture Tiny Infrastructure ETF,FixtureCo,etf,diversifier,infrastructure ETF,growth,0.4,40,0,none,no,,2026-06-30
+GOLDX,Fixture Physical Gold,FixtureCo,etf,diversifier,gold ETF,growth,0.4,3000,0,none,no,,2026-06-30
+THINX,Fixture Thinly Traded Property ETF,FixtureCo,etf,diversifier,property ETF,growth,0.2,500,0,none,na,,2026-06-30
+RICHX,Fixture Very High Unit Price Fund,FixtureCo,etf,diversifier,gold ETF,growth,0.2,1000,0,none,no,,2026-06-30
+STALE,Fixture Delisted Diversified ETF,FixtureCo,etf,all_in_one,diversified ETF,mixed,0.27,1000,20,quarterly,na,,2026-06-30
+ALLX,Fixture Diversified Balanced ETF,FixtureCo,etf,all_in_one,diversified ETF,mixed,0.27,3000,20,quarterly,na,,2026-06-30
+NODATA,Fixture Fund With No Price File,FixtureCo,etf,all_in_one,diversified ETF,mixed,0.27,3000,20,quarterly,na,,2026-06-30
