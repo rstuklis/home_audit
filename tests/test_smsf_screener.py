@@ -535,7 +535,7 @@ class TestFetchHistory:
             "ZZZ.AX": _Frame([]),
         }
         self._install_fake(monkeypatch, frames)
-        result = ss.fetch_history(["VAS", "ZZZ"], str(tmp_path))
+        result = ss.fetch_history(["VAS", "ZZZ"], str(tmp_path), backend="yfinance")
         assert result == {"fetched": ["VAS"], "empty": ["ZZZ"], "failed": {}}
         prices = ss.load_price_history(str(tmp_path), "VAS")
         assert [(r["date"].isoformat(), r["close"], r["volume"]) for r in prices] == [
@@ -553,13 +553,120 @@ class TestFetchHistory:
                 raise RuntimeError("boom")
 
         monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=Ticker))
-        result = ss.fetch_history(["VAS"], str(tmp_path))
+        result = ss.fetch_history(["VAS"], str(tmp_path), backend="yfinance")
         assert result["fetched"] == [] and "RuntimeError" in result["failed"]["VAS"]
 
     def test_missing_yfinance_is_a_clear_error(self, monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, "yfinance", None)
         with pytest.raises(ss.ScreenerError, match="yfinance is not installed"):
-            ss.fetch_history(["VAS"], str(tmp_path))
+            ss.fetch_history(["VAS"], str(tmp_path), backend="yfinance")
+
+    def test_unknown_backend(self, tmp_path):
+        with pytest.raises(ss.ScreenerError, match="fetch backend"):
+            ss.fetch_history(["VAS"], str(tmp_path), backend="bloomberg")
+
+
+# Yahoo stamps each daily bar at the session open in UTC. For the ASX in
+# January (daylight time, gmtoffset 39600) that is 23:00 UTC the evening
+# before: these are the 2026-01-05, 2026-01-06 and 2026-01-07 sessions, and
+# without the offset they would land on the wrong (previous) UTC date.
+SYDNEY = 39600
+STAMPS = [1767567600, 1767654000, 1767740400]
+
+
+def yahoo_payload(closes, volumes, dividends=None, offset=SYDNEY):
+    return {"chart": {"result": [{
+        "meta": {"symbol": "VAS.AX", "gmtoffset": offset},
+        "timestamp": STAMPS[:len(closes)],
+        "indicators": {"quote": [{"close": closes, "volume": volumes}]},
+        "events": {"dividends": dividends or {}},
+    }], "error": None}}
+
+
+class TestParseYahooChart:
+    def test_rows_and_dividends_in_sydney_dates(self):
+        payload = yahoo_payload([100.5, None, 101.0], [1000, None, 2000],
+                                {"1767747600": {"amount": 1.25, "date": 1767747600}})
+        rows, divs = ss.parse_yahoo_chart(payload)
+        assert [(r["date"].isoformat(), r["close"], r["volume"]) for r in rows] == [
+            ("2026-01-05", 100.5, 1000.0), ("2026-01-07", 101.0, 2000.0)]
+        assert divs == [{"date": date(2026, 1, 7), "amount": 1.25}]
+
+    def test_offset_moves_the_date(self):
+        # Without the exchange offset the same stamps fall on the previous UTC day.
+        rows, _ = ss.parse_yahoo_chart(yahoo_payload([1.0], [1], offset=0))
+        assert rows[0]["date"] == date(2026, 1, 4)
+
+    def test_error_and_bad_shape(self):
+        with pytest.raises(ss.ScreenerError, match="Yahoo error: No data"):
+            ss.parse_yahoo_chart({"chart": {"result": None, "error": {"code": "Not Found", "description": "No data"}}})
+        with pytest.raises(ss.ScreenerError, match="unexpected shape"):
+            ss.parse_yahoo_chart({"chart": {"result": [{"meta": {}}]}})
+        with pytest.raises(ss.ScreenerError, match="unexpected shape"):
+            ss.parse_yahoo_chart("not json at all")
+
+    def test_zero_and_junk_dividends_skipped(self):
+        payload = yahoo_payload([1.0], [1], {"a": {"amount": 0, "date": STAMPS[0]}, "b": {"amount": "x"},
+                                             "c": {"amount": 0.5, "date": STAMPS[0]}})
+        _, divs = ss.parse_yahoo_chart(payload)
+        assert divs == [{"date": date(2026, 1, 5), "amount": 0.5}]
+
+    def test_no_timestamps_means_no_rows(self):
+        payload = yahoo_payload([], [])
+        assert ss.parse_yahoo_chart(payload) == ([], [])
+
+
+class TestFetchHistoryYahoo:
+    def test_writes_files_and_reports_failures(self, monkeypatch, tmp_path):
+        calls = []
+
+        def fake_get(url, timeout=20.0):
+            calls.append(url)
+            if "VAS.AX" in url:
+                return yahoo_payload([100.5, 100.0, 101.0], [1000, 500, 2000],
+                                     {"x": {"amount": 1.25, "date": STAMPS[2]}})
+            if "ZZZ.AX" in url:
+                return yahoo_payload([], [])
+            raise ss.ScreenerError("HTTP 404 from https://query2.finance.yahoo.com/v8/finance/chart/BAD.AX")
+
+        monkeypatch.setattr(ss, "_http_get_json", fake_get)
+        monkeypatch.setattr(ss.time, "sleep", lambda s: None)
+        result = ss.fetch_history(["VAS", "ZZZ", "BAD"], str(tmp_path), years=3)
+        assert result["fetched"] == ["VAS"] and result["empty"] == ["ZZZ"]
+        assert "HTTP 404" in result["failed"]["BAD"]
+        assert all("range=3y" in u and "events=div" in u and u.endswith("false") for u in calls)
+        prices = ss.load_price_history(str(tmp_path), "VAS")
+        assert [(r["date"].isoformat(), r["close"]) for r in prices] == [
+            ("2026-01-05", 100.5), ("2026-01-06", 100.0), ("2026-01-07", 101.0)]
+        assert ss.load_distributions(str(tmp_path), "VAS") == [{"date": date(2026, 1, 7), "amount": 1.25}]
+        assert not (tmp_path / "ZZZ.csv").exists()
+
+    def test_http_errors_are_screener_errors(self, monkeypatch):
+        import urllib.error
+        import urllib.request
+
+        def raise_429(req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+        monkeypatch.setattr(urllib.request, "urlopen", raise_429)
+        with pytest.raises(ss.ScreenerError, match="HTTP 429 .*rate limited"):
+            ss._http_get_json("https://example.invalid/chart/VAS.AX?range=3y")
+
+        def raise_ssl(req, timeout=0):
+            raise urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+        monkeypatch.setattr(urllib.request, "urlopen", raise_ssl)
+        with pytest.raises(ss.ScreenerError, match="Install Certificates"):
+            ss._http_get_json("https://example.invalid/chart/VAS.AX")
+
+    def test_fetch_only_cli(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(ss, "_http_get_json", lambda url, timeout=20.0: yahoo_payload([50.0] * 3, [100] * 3))
+        monkeypatch.setattr(ss.time, "sleep", lambda s: None)
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "d"), "--fetch-only",
+                        "--only-role", "cash"])
+        err = capsys.readouterr().err
+        assert code == 0 and "fetched 2 of 2" in err
+        assert (tmp_path / "d" / "CASHX.csv").exists() and (tmp_path / "d" / "CASHY.dividends.csv").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +764,8 @@ class TestCli:
 
     def test_fetch_without_yfinance(self, capsys, monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, "yfinance", None)
-        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path), "--fetch-only"])
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path), "--fetch-only",
+                        "--fetch-backend", "yfinance"])
         assert code == 2 and "yfinance is not installed" in capsys.readouterr().err
 
     def test_bad_dates(self, capsys):

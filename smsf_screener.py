@@ -15,8 +15,9 @@ account. Decisions about your fund remain yours as trustee, and some of them
 (transfer balance cap, commutations, estate planning, Division 296) are worth
 a licensed adviser's or an SMSF specialist's time.
 
-Runs on the Python standard library only, like its sibling home_net_audit.py.
-The optional --fetch step needs the third-party `yfinance` package.
+Runs on the Python standard library only, like its sibling home_net_audit.py,
+including the --fetch step (Yahoo Finance's public chart endpoint via urllib).
+The third-party `yfinance` package is an optional alternative backend.
 
 What it does
 ------------
@@ -27,7 +28,7 @@ What it does
 2. Loads price and distribution history per ticker from CSV files:
        <data-dir>/<TICKER>.csv             date,close,volume
        <data-dir>/<TICKER>.dividends.csv   date,amount
-   `--fetch` fills that directory from Yahoo Finance via yfinance.
+   `--fetch` fills that directory from Yahoo Finance (no packages needed).
 3. Computes, per product: last price, 1-year volatility, 3-year maximum
    drawdown, median daily value traded, trailing 12-month cash yield, and the
    grossed-up yield a 0% taxpayer actually receives once franking credits are
@@ -76,7 +77,10 @@ import os
 import re
 import statistics
 import sys
-from datetime import date, datetime, timedelta
+import time
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
 
 __version__ = "0.1.0"
 
@@ -793,23 +797,132 @@ def illustrate(screened: dict, template: str, n_parcels: int, parcel_aud: float,
 
 
 # ---------------------------------------------------------------------------
-# Optional live fetch (yfinance)
+# Live fetch: Yahoo Finance via the standard library (default), or yfinance
 # ---------------------------------------------------------------------------
 
-def fetch_history(tickers: list[str], data_dir: str, years: int = 3, suffix: str = ".AX",
-                  progress=None) -> dict:
-    """Download price and dividend history into the CSV layout this tool reads.
+YAHOO_CHART_URL = ("https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+                   "?range={years}y&interval=1d&events=div&includeAdjustedClose=false")
+USER_AGENT = f"Mozilla/5.0 (compatible; smsf_screener/{__version__})"
+FETCH_BACKENDS = ("yahoo", "yfinance")
 
-    Needs the third-party yfinance package (python3 -m pip install yfinance).
-    Yahoo's ASX coverage is good for prices and volume and patchy for
-    distributions, which is why the screener warns when it sees fewer
-    distributions than the product's stated frequency implies.
+
+def _http_get_json(url: str, timeout: float = 20.0):
+    """The one network choke point: tests replace it, and failures read well."""
+    endpoint = url.split("?")[0]
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        hint = " (rate limited: wait a minute and retry)" if exc.code == 429 else ""
+        raise ScreenerError(f"HTTP {exc.code} from {endpoint}{hint}")
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        hint = ""
+        if "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            hint = (" (a python.org install needs 'Install Certificates.command' run once from the "
+                    "Python folder in Applications)")
+        raise ScreenerError(f"could not reach {endpoint}: {reason}{hint}")
+    except (ValueError, OSError) as exc:
+        raise ScreenerError(f"bad response from {endpoint}: {exc}")
+
+
+def parse_yahoo_chart(payload) -> tuple[list[dict], list[dict]]:
+    """Turn Yahoo's chart JSON into (price rows, dividend rows). Raises ScreenerError."""
+    try:
+        chart = payload["chart"]
+        if chart.get("error"):
+            err = chart["error"]
+            raise ScreenerError(f"Yahoo error: {err.get('description') or err}")
+        result = chart["result"][0]
+        offset = int((result.get("meta") or {}).get("gmtoffset", 0))
+        stamps = result.get("timestamp") or []
+        quote = result["indicators"]["quote"][0]
+        closes = quote.get("close") or []
+        volumes = quote.get("volume") or []
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+        raise ScreenerError(f"Yahoo chart response has an unexpected shape ({type(exc).__name__}: {exc})")
+
+    def local_date(ts) -> date:
+        # Yahoo stamps each session in UTC; shifting by the exchange's offset
+        # gives the Sydney trading date rather than the UTC date.
+        return datetime.fromtimestamp(int(ts) + offset, tz=timezone.utc).date()
+
+    rows: list[dict] = []
+    for i, ts in enumerate(stamps):
+        close = closes[i] if i < len(closes) else None
+        if close is None or not isinstance(close, (int, float)) or close <= 0:
+            continue
+        vol = volumes[i] if i < len(volumes) else None
+        rows.append({"date": local_date(ts), "close": float(close), "volume": float(vol or 0)})
+    dividends: list[dict] = []
+    for item in (((result.get("events") or {}).get("dividends") or {}).values()):
+        try:
+            amount = float(item.get("amount", 0))
+            ts = int(item.get("date"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if amount > 0:
+            dividends.append({"date": local_date(ts), "amount": amount})
+    rows.sort(key=lambda r: r["date"])
+    dividends.sort(key=lambda r: r["date"])
+    return rows, dividends
+
+
+def write_history_csvs(data_dir: str, ticker: str, rows: list[dict], dividends: list[dict]) -> None:
+    """Write the two CSV files the screener reads for one ticker."""
+    os.makedirs(data_dir, exist_ok=True)
+    with open(price_path(data_dir, ticker), "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["date", "close", "volume"])
+        for r in rows:
+            w.writerow([r["date"].isoformat(), f"{r['close']:.6f}", int(r["volume"])])
+    with open(dividend_path(data_dir, ticker), "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["date", "amount"])
+        for d in dividends:
+            w.writerow([d["date"].isoformat(), f"{d['amount']:.6f}"])
+
+
+def fetch_history_yahoo(tickers: list[str], data_dir: str, years: int = 3, suffix: str = ".AX",
+                        progress=None, pause: float = 0.5) -> dict:
+    """Standard-library download from Yahoo Finance's chart endpoint.
+
+    No packages needed. Yahoo's ASX coverage is good for prices and volume and
+    patchy for distributions, which is why the screener warns when it sees
+    fewer distributions than the product's stated frequency implies. A short
+    pause between requests keeps a 50-ticker run under Yahoo's rate limit.
     """
+    fetched: list[str] = []
+    empty: list[str] = []
+    failed: dict[str, str] = {}
+    for t in tickers:
+        url = YAHOO_CHART_URL.format(symbol=f"{t}{suffix}", years=years)
+        try:
+            rows, dividends = parse_yahoo_chart(_http_get_json(url))
+        except ScreenerError as exc:
+            failed[t] = str(exc)
+            continue
+        if not rows:
+            empty.append(t)
+            continue
+        write_history_csvs(data_dir, t, rows, dividends)
+        fetched.append(t)
+        if progress:
+            progress(t)
+        if pause:
+            time.sleep(pause)
+    return {"fetched": fetched, "empty": empty, "failed": failed}
+
+
+def fetch_history_yfinance(tickers: list[str], data_dir: str, years: int = 3, suffix: str = ".AX",
+                           progress=None) -> dict:
+    """Alternative backend using the third-party yfinance package."""
     try:
         import yfinance as yf  # type: ignore
     except ImportError:
-        raise ScreenerError("yfinance is not installed; run: python3 -m pip install yfinance")
-    os.makedirs(data_dir, exist_ok=True)
+        raise ScreenerError("yfinance is not installed; run: python3 -m pip install yfinance "
+                            "(or use the default --fetch-backend yahoo, which needs nothing)")
     fetched: list[str] = []
     empty: list[str] = []
     failed: dict[str, str] = {}
@@ -822,26 +935,32 @@ def fetch_history(tickers: list[str], data_dir: str, years: int = 3, suffix: str
         if hist is None or len(hist) == 0:
             empty.append(t)
             continue
-        with open(price_path(data_dir, t), "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["date", "close", "volume"])
-            for idx, row in hist.iterrows():
-                close = row.get("Close")
-                if close is None or (isinstance(close, float) and math.isnan(close)):
-                    continue
-                vol = row.get("Volume", 0) or 0
-                w.writerow([idx.date().isoformat(), f"{float(close):.6f}", int(vol)])
-        with open(dividend_path(data_dir, t), "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh)
-            w.writerow(["date", "amount"])
-            if "Dividends" in hist.columns:
-                for idx, amount in hist["Dividends"].items():
-                    if amount and float(amount) > 0:
-                        w.writerow([idx.date().isoformat(), f"{float(amount):.6f}"])
+        rows: list[dict] = []
+        for idx, row in hist.iterrows():
+            close = row.get("Close")
+            if close is None or (isinstance(close, float) and math.isnan(close)):
+                continue
+            rows.append({"date": idx.date(), "close": float(close), "volume": float(row.get("Volume", 0) or 0)})
+        dividends: list[dict] = []
+        if "Dividends" in hist.columns:
+            for idx, amount in hist["Dividends"].items():
+                if amount and float(amount) > 0:
+                    dividends.append({"date": idx.date(), "amount": float(amount)})
+        write_history_csvs(data_dir, t, rows, dividends)
         fetched.append(t)
         if progress:
             progress(t)
     return {"fetched": fetched, "empty": empty, "failed": failed}
+
+
+def fetch_history(tickers: list[str], data_dir: str, years: int = 3, backend: str = "yahoo",
+                  suffix: str = ".AX", progress=None) -> dict:
+    """Download price and dividend history into the CSV layout this tool reads."""
+    if backend == "yahoo":
+        return fetch_history_yahoo(tickers, data_dir, years=years, suffix=suffix, progress=progress)
+    if backend == "yfinance":
+        return fetch_history_yfinance(tickers, data_dir, years=years, suffix=suffix, progress=progress)
+    raise ScreenerError(f"fetch backend must be one of {FETCH_BACKENDS}, got {backend!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -1091,7 +1210,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "General information only; not personal advice.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-               "  python3 smsf_screener.py --fetch --data-dir data          # download history, then screen\n"
+               "  python3 smsf_screener.py --fetch --brokerage 9.95         # download history into ./data, then screen\n"
                "  python3 smsf_screener.py --data-dir data --explain VAS     # show the arithmetic for one code\n"
                "  python3 smsf_screener.py --data-dir data --illustrate balanced --n-parcels 6 --parcel 15000\n"
                "  python3 smsf_screener.py --rules                           # print every policy number\n")
@@ -1099,8 +1218,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="CSV of products and hand-curated static facts (default: smsf_universe.csv beside the script)")
     ap.add_argument("--data-dir", default=os.path.join(here, "data"),
                     help="directory of <TICKER>.csv and <TICKER>.dividends.csv (default: ./data)")
-    ap.add_argument("--fetch", action="store_true", help="download history into --data-dir first (needs yfinance)")
+    ap.add_argument("--fetch", action="store_true", help="download history into --data-dir first, then screen")
     ap.add_argument("--fetch-only", action="store_true", help="download and stop")
+    ap.add_argument("--fetch-backend", choices=FETCH_BACKENDS, default="yahoo",
+                    help="yahoo = Yahoo Finance via the standard library (default, no packages); "
+                         "yfinance = the third-party package")
     ap.add_argument("--years", type=int, default=3, help="years of history to fetch (default 3)")
     ap.add_argument("--as-of", type=str, default=None, help="freeze the as-of date (YYYY-MM-DD) for reproducible runs")
     ap.add_argument("--today", type=str, default=None, help="override today's date (YYYY-MM-DD), mainly for tests")
@@ -1157,9 +1279,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.fetch or args.fetch_only:
             result = fetch_history([p["ticker"] for p in products], args.data_dir, years=args.years,
+                                   backend=args.fetch_backend,
                                    progress=lambda t: print(f"fetched {t}", file=sys.stderr))
-            print(f"fetched {len(result['fetched'])}, empty {result['empty']}, failed {result['failed']}",
+            print(f"fetched {len(result['fetched'])} of {len(products)}; no data for {result['empty'] or 'none'}",
                   file=sys.stderr)
+            for t, why in result["failed"].items():
+                print(f"failed {t}: {why}", file=sys.stderr)
             if args.fetch_only:
                 return 0
 
