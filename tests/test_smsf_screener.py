@@ -9,8 +9,11 @@ the working directory to a temp dir, which is why fixture paths are absolute.
 """
 
 import importlib.util
-import io
 import json
+import math
+import re
+import shutil
+import statistics
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -25,14 +28,14 @@ TODAY = date(2026, 9, 6)
 AS_OF = date(2026, 9, 4)
 
 
-def _load():
-    spec = importlib.util.spec_from_file_location("smsf_screener", PROJECT_DIR / "smsf_screener.py")
+def _load(name, relpath):
+    spec = importlib.util.spec_from_file_location(name, PROJECT_DIR / relpath)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-ss = _load()
+ss = _load("smsf_screener", "smsf_screener.py")
 
 
 @pytest.fixture(scope="module")
@@ -46,6 +49,14 @@ def screened(universe):
                      parcels=(10_000.0, 25_000.0), brokerage_aud=10.0)
 
 
+@pytest.fixture
+def fixture_copy(tmp_path):
+    """A writable copy of the fixture data directory for tests that corrupt files."""
+    dst = tmp_path / "data"
+    shutil.copytree(FIXTURE_DIR, dst)
+    return dst
+
+
 def by_ticker(screened, ticker):
     for e in screened["results"]:
         if e["product"]["ticker"] == ticker:
@@ -53,8 +64,25 @@ def by_ticker(screened, ticker):
     raise KeyError(ticker)
 
 
+def _product(**over):
+    base = dict(ticker="T", name="Fund", issuer="X", structure="etf", role="core_au", category="c",
+                asset_class="growth", growth_pct=100.0, mer_pct=0.1, size_aud_m=1000.0, franking_pct=75.0,
+                distribution_frequency="quarterly", hedged=None, notes="", as_at=date(2026, 6, 30))
+    base.update(over)
+    return base
+
+
+def _metrics(**over):
+    base = dict(has_prices=True, first_date=date(2023, 9, 4), last_price=100.0, last_date=AS_OF,
+                price_age_days=0, history_days=1096, rows_1y=250, vol_pct=10.0, mdd_pct=10.0,
+                adv_aud=1_000_000.0, ttm_dist_per_unit=4.0, ttm_dist_count=4, expected_per_year=4,
+                cash_yield_pct=4.0, scoring_yield_pct=4.0, total_return_1y_pct=8.0)
+    base.update(over)
+    return base
+
+
 # ---------------------------------------------------------------------------
-# Pure arithmetic
+# Pure arithmetic and parsing
 # ---------------------------------------------------------------------------
 
 class TestGrossedUpYield:
@@ -62,6 +90,10 @@ class TestGrossedUpYield:
         gross, credit = ss.grossed_up_yield(4.0, 100.0)
         assert gross == pytest.approx(4.0 * (1 + 0.3 / 0.7))
         assert credit == pytest.approx(gross - 4.0)
+
+    def test_base_rate_entity_at_25pct(self):
+        gross, _ = ss.grossed_up_yield(4.0, 100.0, tax_rate=0.25)
+        assert gross == pytest.approx(4.0 * (1 + 0.25 / 0.75))
 
     def test_unfranked_is_unchanged(self):
         assert ss.grossed_up_yield(4.0, 0.0) == (4.0, 0.0)
@@ -92,6 +124,15 @@ class TestMinimumDrawdown:
         with pytest.raises(ss.ScreenerError):
             ss.minimum_drawdown_factor(-1)
 
+    def test_annual_minimum_rounds_to_ten_dollars(self):
+        assert ss.minimum_annual_pension(123_456.0, 60) == 4940.0    # 4938.24 -> 4940
+        assert ss.minimum_annual_pension(500_000.0, 60) == 20_000.0
+        assert ss.minimum_annual_pension(500_000.0, 80) == 35_000.0
+
+    def test_annual_minimum_rejects_non_positive_balance(self):
+        with pytest.raises(ss.ScreenerError):
+            ss.minimum_annual_pension(0.0, 60)
+
 
 class TestParcelPlan:
     def test_whole_units_after_brokerage(self):
@@ -103,6 +144,9 @@ class TestParcelPlan:
         assert plan["marketable"] is True
         assert plan["brokerage_pct"] == pytest.approx(10.0 / 9975.0 * 100)
 
+    def test_exact_multiple_is_not_floored_short_by_float_error(self):
+        assert ss.parcel_plan(1.61, 10_000.0, 9.95)["units"] == 6205   # 9990.05 / 1.61 == 6205 exactly
+
     def test_unit_price_above_parcel_buys_nothing(self):
         plan = ss.parcel_plan(30_000.0, 10_000.0, 10.0)
         assert plan["units"] == 0
@@ -112,8 +156,7 @@ class TestParcelPlan:
         assert plan["brokerage_pct"] is None
 
     def test_brokerage_larger_than_parcel(self):
-        plan = ss.parcel_plan(10.0, 5.0, 10.0)
-        assert plan["units"] == 0
+        assert ss.parcel_plan(10.0, 5.0, 10.0)["units"] == 0
 
     def test_below_marketable_parcel_flagged(self):
         plan = ss.parcel_plan(400.0, 600.0, 0.0)
@@ -123,6 +166,38 @@ class TestParcelPlan:
     def test_rejects_bad_inputs(self, price, parcel, brokerage):
         with pytest.raises(ss.ScreenerError):
             ss.parcel_plan(price, parcel, brokerage)
+
+
+class TestParsing:
+    def test_thousands_separators_only(self):
+        assert ss.parse_float("20,000", "x") == 20000.0
+        assert ss.parse_float("1,234,567.5", "x") == 1234567.5
+        for bad in ("0,07", "1,5", "1.234,50"):
+            with pytest.raises(ss.ScreenerError, match="expected a number"):
+                ss.parse_float(bad, "x")
+
+    def test_non_finite_rejected(self):
+        for bad in ("nan", "inf", "-inf", "1e400"):
+            with pytest.raises(ss.ScreenerError):
+                ss.parse_float(bad, "x")
+
+    def test_date_is_strict_on_every_python(self):
+        assert ss.parse_date("2026-09-06") == date(2026, 9, 6)
+        for bad in ("20260906", "2026-W36-1", "6/9/2026", "2026-02-30", ""):
+            with pytest.raises(ss.ScreenerError):
+                ss.parse_date(bad)
+
+    def test_blank_tokens(self):
+        assert all(ss.is_blank(t) for t in ("", " ", "null", "NaN", "n/a", "-", None))
+        assert not ss.is_blank("0") and not ss.is_blank("1.5")
+
+    def test_parcel_label_and_shorten(self):
+        assert ss.fmt_parcel_label(10_000) == "u@10k"
+        assert ss.fmt_parcel_label(12_500) == "u@12.5k"
+        assert ss.fmt_parcel_label(500) == "u@0.5k"
+        assert ss.shorten("Betashares Active Australian Hybrids Fund (managed fund)", 43).endswith("..")
+        assert " " not in ss.shorten("Betashares Active Australian Hybrids Fund (managed fund)", 43)[-3:]
+        assert ss.shorten("short", 43) == "short"
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +231,13 @@ class TestComputeMetrics:
 
     def test_no_rows_on_or_before_as_of(self):
         rows = _rows(date(2025, 6, 1), [100, 100])
-        assert ss.compute_metrics(rows, [], date(2025, 1, 1)) == {"has_prices": False}
+        m = ss.compute_metrics(rows, [], date(2025, 1, 1))
+        assert m == {"has_prices": False, "first_date": date(2025, 6, 1)}
+
+    def test_price_age_days(self):
+        rows = _rows(date(2026, 8, 1), [100.0] * 30)
+        assert ss.compute_metrics(rows, [], date(2026, 8, 30))["price_age_days"] == 0
+        assert ss.compute_metrics(rows, [], date(2026, 9, 2))["price_age_days"] == 3
 
     def test_ttm_window_is_half_open(self):
         as_of = date(2026, 3, 1)
@@ -186,8 +267,6 @@ class TestComputeMetrics:
         assert m["mdd_pct"] == pytest.approx(0.0)
 
     def test_volatility_is_annualised_stdev_of_log_returns(self):
-        import math
-        import statistics
         closes = [100.0]
         for i in range(60):
             closes.append(closes[-1] * (1.01 if i % 2 else 0.99))
@@ -196,100 +275,187 @@ class TestComputeMetrics:
         rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
         assert m["vol_pct"] == pytest.approx(statistics.stdev(rets) * math.sqrt(252) * 100)
 
+    def test_liquidity_is_a_median_over_the_last_60_rows(self):
+        rows = _rows(date(2026, 1, 1), [100.0] * 61)
+        rows[-1]["volume"] = 1_000_000          # one block trade must not lift the figure
+        m = ss.compute_metrics(rows, [], rows[-1]["date"])
+        assert m["adv_aud"] == pytest.approx(100_000.0)
+        rows = _rows(date(2026, 1, 1), [100.0] * 80)
+        rows[5]["volume"] = 1_000_000           # outside the 60-row window entirely
+        assert ss.compute_metrics(rows, [], rows[-1]["date"])["adv_aud"] == pytest.approx(100_000.0)
+
+    def test_liquidity_unknown_when_volumes_are_missing(self):
+        rows = _rows(date(2026, 1, 1), [100.0] * 61, volume=None)
+        assert ss.compute_metrics(rows, [], rows[-1]["date"])["adv_aud"] is None
+
+    def test_drawdown_window_is_three_years(self):
+        as_of = AS_OF
+        n = 4 * 365 + 1
+        start = as_of - timedelta(days=n - 1)
+
+        def series(peak_days_ago):
+            closes = [100.0] * n
+            p = n - 1 - peak_days_ago
+            closes[p] = 120.0
+            closes[p + 10] = 60.0
+            return _rows(start, closes)
+
+        assert ss.compute_metrics(series(2 * 365), [], as_of)["mdd_pct"] == pytest.approx(50.0)
+        assert ss.compute_metrics(series(int(3.5 * 365)), [], as_of)["mdd_pct"] == pytest.approx(0.0)
+
+    def test_distributions_are_added_back_for_vol_and_drawdown(self):
+        # A cash fund: NAV accrues 4.3% a year and drops by the payout monthly.
+        start = date(2025, 9, 1)
+        rows, dists = [], []
+        price = 50.0
+        d = start
+        last_month = None
+        for i in range(370):
+            if d.weekday() < 5:
+                if last_month is not None and d.month != last_month:
+                    price -= 0.18
+                    dists.append({"date": d, "amount": 0.18})
+                rows.append({"date": d, "close": round(price, 6), "volume": 1000})
+                last_month = d.month
+                price *= math.exp(0.043 / 252)
+            d += timedelta(days=1)
+        as_of = rows[-1]["date"]
+        adjusted = ss.compute_metrics(rows, dists, as_of)
+        raw = ss.compute_metrics(rows, [], as_of)
+        assert adjusted["vol_pct"] < 0.2 and adjusted["mdd_pct"] < 0.05
+        assert raw["vol_pct"] > 0.5 and raw["mdd_pct"] > 0.3
+        assert adjusted["cash_yield_pct"] == pytest.approx(len([x for x in dists if x["date"] > as_of - timedelta(days=365)]) * 0.18 / rows[-1]["close"] * 100)
+
+    def test_distribution_dated_on_a_weekend_is_attributed_to_the_next_session(self):
+        rows = [{"date": date(2026, 1, 2) + timedelta(days=i), "close": 100.0, "volume": 1000}
+                for i in range(40) if (date(2026, 1, 2) + timedelta(days=i)).weekday() < 5]
+        saturday = date(2026, 1, 10)
+        assert saturday.weekday() == 5
+        m = ss.compute_metrics(rows, [{"date": saturday, "amount": 5.0}], rows[-1]["date"])
+        # Added back on Monday: the adjusted series shows a +5% step, i.e. non-zero vol but no drawdown
+        assert m["mdd_pct"] == pytest.approx(0.0) and m["vol_pct"] > 0
+
+    def test_income_scored_on_expected_count_when_payments_overlap(self):
+        as_of = date(2026, 9, 3)
+        rows = _rows(as_of - timedelta(days=400), [100.0] * 401)
+        dates = [date(2025, 9, 5), date(2025, 12, 1), date(2026, 3, 2), date(2026, 6, 1), date(2026, 9, 3)]
+        dists = [{"date": d, "amount": 1.0} for d in dates]
+        m = ss.compute_metrics(rows, dists, as_of, expected_per_year=4)
+        assert m["ttm_dist_count"] == 5
+        assert m["cash_yield_pct"] == pytest.approx(5.0)
+        assert m["scoring_yield_pct"] == pytest.approx(4.0)
+        m = ss.compute_metrics(rows, dists, as_of, expected_per_year=0)
+        assert m["scoring_yield_pct"] == pytest.approx(5.0)
+
 
 # ---------------------------------------------------------------------------
 # Loading and validating input files
 # ---------------------------------------------------------------------------
 
+HEADER = ",".join(ss.UNIVERSE_COLUMNS) + "\n"
+GOOD = "VAS,Name,Vanguard,etf,core_au,cat,growth,100,0.07,20000,75,quarterly,na,,2026-06-30\n"
+
+
+def _write(tmp_path, text, name="u.csv", encoding="utf-8"):
+    path = tmp_path / name
+    path.write_text(text, encoding=encoding)
+    return str(path)
+
+
 class TestLoadUniverse:
     def test_fixture_universe_loads(self, universe):
-        assert {p["ticker"] for p in universe} >= {"CASHX", "AUEQX", "NODATA"}
+        assert {p["ticker"] for p in universe} >= {"CASHX", "AUEQX", "NODATA", "PAYX", "ALLGX", "THINL"}
         assert all(p["role"] in ss.ROLES for p in universe)
 
     def test_real_universe_loads_and_is_internally_consistent(self):
         products = ss.load_universe(str(REAL_UNIVERSE))
         assert len(products) >= 30
-        assert ss.audit_universe(products, TODAY) == []
-        assert all(p["as_at"] <= TODAY for p in products)
+        # Audit against the newest as_at so a refreshed CSV never reads as 'future'...
+        today = max(TODAY, max(p["as_at"] for p in products))
+        assert ss.audit_universe(products, today) == []
+        # ...and against the real calendar so a CSV left to rot fails CI as documented.
+        assert (date.today() - max(p["as_at"] for p in products)).days <= ss.STATIC_STALE_DAYS
+        assert {p["ticker"] for p in products if p["role"] == "all_in_one"} >= {"VDCO", "VDHG"}
 
-    def _write(self, tmp_path, text):
-        path = tmp_path / "u.csv"
-        path.write_text(text)
-        return str(path)
+    @pytest.mark.parametrize("bad,fragment", [
+        ("ticker,name\nVAS,x\n", "missing columns"),
+        (HEADER + GOOD.replace("core_au", "moon"), "role"),
+        (HEADER + GOOD + GOOD, "duplicate"),
+        (HEADER + GOOD.replace(",75,", ",120,"), "franking_pct"),
+        (HEADER + GOOD.replace("2026-06-30", "30/06/2026"), "as_at"),
+        (HEADER + GOOD.replace("VAS", "TOO-LONG"), "ASX code"),
+        (HEADER + GOOD.replace(",etf,", ",fund,"), "structure"),
+        (HEADER + GOOD.replace(",growth,", ",speculative,"), "asset_class"),
+        (HEADER + GOOD.replace("quarterly", "fortnightly"), "distribution_frequency"),
+        (HEADER + GOOD.replace(",na,,", ",maybe,,"), "hedged"),
+        (HEADER + GOOD.replace(",0.07,", ",6.0,"), "mer_pct"),
+        (HEADER + GOOD.replace("VAS,Name", "VAS,"), "name is required"),
+        (HEADER + GOOD.replace(",100,0.07", ",150,0.07"), "growth_pct"),
+        (HEADER + GOOD.replace("core_au", "all_in_one").replace(",100,0.07", ",,0.07"), "growth_pct is required"),
+        (HEADER, "no products"),
+    ])
+    def test_validation_errors(self, tmp_path, bad, fragment):
+        with pytest.raises(ss.ScreenerError, match=fragment):
+            ss.load_universe(_write(tmp_path, bad))
 
-    HEADER = ",".join(ss.UNIVERSE_COLUMNS) + "\n"
-    GOOD = "VAS,Name,Vanguard,etf,core_au,cat,growth,0.07,20000,75,quarterly,na,,2026-06-30\n"
+    def test_growth_pct_defaults_by_role(self, tmp_path):
+        text = HEADER + GOOD.replace(",100,0.07", ",,0.07") + \
+            "AAA,Cash,B,etf,cash,c,defensive,,0.18,4500,0,monthly,na,,2026-06-30\n"
+        products = ss.load_universe(_write(tmp_path, text))
+        assert products[0]["growth_pct"] == 100.0 and products[1]["growth_pct"] == 0.0
 
-    def test_missing_column(self, tmp_path):
-        with pytest.raises(ss.ScreenerError, match="missing columns"):
-            ss.load_universe(self._write(tmp_path, "ticker,name\nVAS,x\n"))
-
-    def test_bad_role(self, tmp_path):
-        bad = self.GOOD.replace("core_au", "moon")
-        with pytest.raises(ss.ScreenerError, match="role"):
-            ss.load_universe(self._write(tmp_path, self.HEADER + bad))
-
-    def test_duplicate_ticker(self, tmp_path):
-        with pytest.raises(ss.ScreenerError, match="duplicate"):
-            ss.load_universe(self._write(tmp_path, self.HEADER + self.GOOD + self.GOOD))
-
-    def test_franking_out_of_range(self, tmp_path):
-        bad = self.GOOD.replace(",75,", ",120,")
-        with pytest.raises(ss.ScreenerError, match="franking_pct"):
-            ss.load_universe(self._write(tmp_path, self.HEADER + bad))
-
-    def test_bad_date(self, tmp_path):
-        bad = self.GOOD.replace("2026-06-30", "30/06/2026")
-        with pytest.raises(ss.ScreenerError, match="as_at"):
-            ss.load_universe(self._write(tmp_path, self.HEADER + bad))
-
-    def test_ticker_is_upper_cased_and_validated(self, tmp_path):
-        products = ss.load_universe(self._write(tmp_path, self.HEADER + self.GOOD.replace("VAS", "vas")))
-        assert products[0]["ticker"] == "VAS"
-        with pytest.raises(ss.ScreenerError, match="ASX code"):
-            ss.load_universe(self._write(tmp_path, self.HEADER + self.GOOD.replace("VAS", "TOO-LONG")))
+    def test_ticker_is_upper_cased(self, tmp_path):
+        assert ss.load_universe(_write(tmp_path, HEADER + GOOD.replace("VAS", "vas")))[0]["ticker"] == "VAS"
 
     def test_missing_file(self, tmp_path):
         with pytest.raises(ss.ScreenerError, match="not found"):
             ss.load_universe(str(tmp_path / "nope.csv"))
 
-    def test_empty_file(self, tmp_path):
-        with pytest.raises(ss.ScreenerError, match="no products"):
-            ss.load_universe(self._write(tmp_path, self.HEADER))
+    def test_bom_and_padded_header_are_accepted(self, tmp_path):
+        padded = ", ".join(ss.UNIVERSE_COLUMNS) + "\n" + GOOD
+        assert ss.load_universe(_write(tmp_path, padded, encoding="utf-8-sig"))[0]["ticker"] == "VAS"
+
+    def test_non_utf8_is_a_clear_error(self, tmp_path):
+        text = HEADER + GOOD.replace("Name", "Café")
+        with pytest.raises(ss.ScreenerError, match="not readable as UTF-8"):
+            ss.load_universe(_write(tmp_path, text, encoding="latin-1"))
+        with pytest.raises(ss.ScreenerError, match="UTF-8"):
+            ss.load_universe(_write(tmp_path, HEADER + GOOD, encoding="utf-16"))
+
+    def test_trailing_comma_row_is_tolerated(self, tmp_path):
+        assert ss.load_universe(_write(tmp_path, HEADER + GOOD.rstrip("\n") + ",\n"))[0]["ticker"] == "VAS"
 
 
 class TestAuditUniverse:
-    def _product(self, **over):
-        base = dict(ticker="T", name="Fund", issuer="X", structure="etf", role="core_au", category="c",
-                    asset_class="growth", mer_pct=0.1, size_aud_m=1000, franking_pct=75,
-                    distribution_frequency="quarterly", hedged=None, notes="", as_at=date(2026, 6, 30))
-        base.update(over)
-        return base
-
     def test_clean_product_has_no_findings(self):
-        assert ss.audit_universe([self._product()], TODAY) == []
+        assert ss.audit_universe([_product()], TODAY) == []
 
-    def test_hedged_name_but_unhedged_flag(self):
-        f = ss.audit_universe([self._product(name="Global (Hedged) ETF", hedged=False)], TODAY)
-        assert any("hedged" in x for x in f)
-
-    def test_franking_on_bond_fund(self):
-        f = ss.audit_universe([self._product(role="defensive", asset_class="defensive", franking_pct=40)], TODAY)
-        assert any("implausible" in x for x in f)
+    @pytest.mark.parametrize("over,fragment", [
+        (dict(name="Global (Hedged) ETF", hedged=False), "hedged"),
+        (dict(role="defensive", asset_class="defensive", growth_pct=0, franking_pct=40), "implausible"),
+        (dict(franking_pct=10), "low for an Australian equity"),
+        (dict(role="cash", asset_class="defensive", growth_pct=0, franking_pct=0, mer_pct=0.5), "cash product with MER"),
+        (dict(mer_pct=0), "MER is 0"),
+        (dict(size_aud_m=1), "millions"),
+        (dict(role="cash", franking_pct=0, growth_pct=0), "asset_class growth conflicts"),
+        (dict(asset_class="defensive"), "asset_class defensive conflicts"),
+        (dict(role="defensive", asset_class="defensive", franking_pct=0, growth_pct=30), "growth_pct 30 on a defensive"),
+        (dict(growth_pct=60), "growth_pct 60 on an equity"),
+        (dict(structure="hybrid_etf"), "hybrid_etf should carry role defensive"),
+        (dict(as_at=TODAY - timedelta(days=ss.STATIC_STALE_DAYS + 1)), "days old"),
+        (dict(as_at=TODAY + timedelta(days=1)), "future"),
+    ])
+    def test_each_check_fires(self, over, fragment):
+        findings = ss.audit_universe([_product(**over)], TODAY)
+        assert any(fragment in f for f in findings), findings
 
     def test_hybrid_franking_is_allowed(self):
-        p = self._product(role="defensive", asset_class="defensive", structure="hybrid_etf", franking_pct=45)
+        p = _product(role="defensive", asset_class="defensive", structure="hybrid_etf", franking_pct=45, growth_pct=0)
         assert ss.audit_universe([p], TODAY) == []
 
-    def test_stale_and_future_dates(self):
-        old = self._product(as_at=TODAY - timedelta(days=ss.STATIC_STALE_DAYS + 1))
-        future = self._product(ticker="U", as_at=TODAY + timedelta(days=1))
-        f = ss.audit_universe([old, future], TODAY)
-        assert any("days old" in x for x in f) and any("future" in x for x in f)
-
-    def test_zero_mer_and_tiny_size(self):
-        f = ss.audit_universe([self._product(mer_pct=0, size_aud_m=1)], TODAY)
-        assert any("MER is 0" in x for x in f) and any("millions" in x for x in f)
+    def test_duplicate_names(self):
+        f = ss.audit_universe([_product(), _product(ticker="U")], TODAY)
+        assert any("same name" in x for x in f)
 
 
 class TestLoadHistory:
@@ -297,26 +463,147 @@ class TestLoadHistory:
         assert ss.load_price_history(str(tmp_path), "ZZZ") is None
         assert ss.load_distributions(str(tmp_path), "ZZZ") == []
 
-    def test_blank_and_duplicate_rows(self, tmp_path):
+    def test_empty_file_is_no_rows_not_an_error(self, tmp_path):
+        (tmp_path / "T.csv").write_text("")
+        assert ss.load_price_history(str(tmp_path), "T") == []
+        (tmp_path / "T.dividends.csv").write_text("")
+        assert ss.load_distributions(str(tmp_path), "T") == []
+
+    def test_blank_null_and_duplicate_rows(self, tmp_path):
         (tmp_path / "T.csv").write_text(
-            "Date,Close,Volume\n2026-01-02,10,100\n2026-01-03,,\n2026-01-02,11,50\n2026-01-05,12,\n")
+            "Date,Close,Volume\n2026-01-02,10,100\n2026-01-03,,\n2026-01-04,null,null\n2026-01-02,11,50\n2026-01-05,12,\n")
         rows = ss.load_price_history(str(tmp_path), "T")
         assert [(r["date"].isoformat(), r["close"], r["volume"]) for r in rows] == [
-            ("2026-01-02", 11.0, 50.0), ("2026-01-05", 12.0, 0.0)]
+            ("2026-01-02", 11.0, 50.0), ("2026-01-05", 12.0, None)]
+
+    def test_missing_volume_column_means_unknown_not_zero(self, tmp_path):
+        (tmp_path / "T.csv").write_text("date,close\n2026-01-02,10\n")
+        assert ss.load_price_history(str(tmp_path), "T")[0]["volume"] is None
+
+    def test_bom_and_trailing_comma(self, tmp_path):
+        (tmp_path / "T.csv").write_text("date,close,volume\n2026-01-02,10,100,\n", encoding="utf-8-sig")
+        assert ss.load_price_history(str(tmp_path), "T")[0]["close"] == 10.0
 
     def test_missing_close_column(self, tmp_path):
         (tmp_path / "T.csv").write_text("date,price\n2026-01-02,10\n")
         with pytest.raises(ss.ScreenerError, match="close"):
             ss.load_price_history(str(tmp_path), "T")
 
-    def test_negative_close_rejected(self, tmp_path):
+    def test_bad_cell_is_a_named_error(self, tmp_path):
         (tmp_path / "T.csv").write_text("date,close,volume\n2026-01-02,-10,1\n")
-        with pytest.raises(ss.ScreenerError, match="close"):
+        with pytest.raises(ss.ScreenerError, match="line 2: close"):
+            ss.load_price_history(str(tmp_path), "T")
+        (tmp_path / "T.csv").write_text("date,close,volume\n2026-01-02,abc,1\n")
+        with pytest.raises(ss.ScreenerError, match="line 2: close"):
             ss.load_price_history(str(tmp_path), "T")
 
-    def test_dividends_skip_zero_and_blank(self, tmp_path):
-        (tmp_path / "T.dividends.csv").write_text("date,amount\n2026-01-02,0\n2026-02-02,\n2026-03-02,0.5\n")
-        assert ss.load_distributions(str(tmp_path), "T") == [{"date": date(2026, 3, 2), "amount": 0.5}]
+    def test_dividends_skip_zero_blank_and_collapse_duplicates(self, tmp_path):
+        (tmp_path / "T.dividends.csv").write_text(
+            "date,amount\n2026-01-02,0\n2026-02-02,\n2026-03-02,0.5\n2026-03-02,0.5\n2026-03-02,0.7\n")
+        rows, dups = ss.load_distributions_report(str(tmp_path), "T")
+        assert rows == [{"date": date(2026, 3, 2), "amount": 0.5}, {"date": date(2026, 3, 2), "amount": 0.7}]
+        assert dups == 1
+
+
+# ---------------------------------------------------------------------------
+# Filters and scoring in isolation
+# ---------------------------------------------------------------------------
+
+class TestApplyFilters:
+    F = dict(ss.DEFAULT_FILTERS)
+
+    def test_boundaries_are_inclusive(self):
+        cap = ss.ROLE_RULES["core_au"]["mer_cap"]
+        assert ss.apply_filters(_product(mer_pct=cap), _metrics(), self.F, TODAY)[0] == []
+        assert any("MER" in x for x in ss.apply_filters(_product(mer_pct=cap + 0.01), _metrics(), self.F, TODAY)[0])
+        assert ss.apply_filters(_product(size_aud_m=100.0), _metrics(), self.F, TODAY)[0] == []
+        assert any("fund size" in x for x in ss.apply_filters(_product(size_aud_m=99.9), _metrics(), self.F, TODAY)[0])
+        assert ss.apply_filters(_product(), _metrics(price_age_days=10), self.F, TODAY)[0] == []
+        assert any("older" in x for x in ss.apply_filters(_product(), _metrics(price_age_days=11), self.F, TODAY)[0])
+
+    def test_thin_volume_is_a_note_for_etfs_and_an_exclusion_for_lics(self):
+        excl, warn = ss.apply_filters(_product(), _metrics(adv_aud=10_000.0), self.F, TODAY)
+        assert excl == [] and any("thin on-screen volume" in w for w in warn)
+        excl, _ = ss.apply_filters(_product(structure="lic", role="income"), _metrics(adv_aud=10_000.0), self.F, TODAY)
+        assert any("median daily value traded" in x for x in excl)
+
+    def test_unknown_liquidity_is_a_note(self):
+        excl, warn = ss.apply_filters(_product(), _metrics(adv_aud=None), self.F, TODAY)
+        assert excl == [] and any("liquidity not assessed" in w for w in warn)
+
+    def test_distribution_count_notes(self):
+        _, warn = ss.apply_filters(_product(), _metrics(ttm_dist_count=3), self.F, TODAY)
+        assert any("3 distributions in the last year, 4 expected: dividend data may be incomplete" in w for w in warn)
+        _, warn = ss.apply_filters(_product(), _metrics(ttm_dist_count=5, cash_yield_pct=5.0, scoring_yield_pct=4.0),
+                                   self.F, TODAY)
+        assert any("5 distributions" in w and "most recent 4" in w for w in warn)
+        _, warn = ss.apply_filters(_product(), _metrics(), self.F, TODAY)
+        assert not any("distributions in the last year" in w for w in warn)
+
+    def test_history_length_notes(self):
+        _, warn = ss.apply_filters(_product(), _metrics(history_days=200), self.F, TODAY)
+        assert any("under one year" in w for w in warn)
+        _, warn = ss.apply_filters(_product(), _metrics(history_days=549), self.F, TODAY)
+        assert any("549 days of history" in w for w in warn)
+        _, warn = ss.apply_filters(_product(), _metrics(history_days=1096), self.F, TODAY)
+        assert not any("days of history" in w for w in warn)
+
+    def test_yield_sanity_boundary(self):
+        _, warn = ss.apply_filters(_product(), _metrics(cash_yield_pct=12.0), self.F, TODAY)
+        assert not any("unusually high" in w for w in warn)
+        _, warn = ss.apply_filters(_product(), _metrics(cash_yield_pct=12.01), self.F, TODAY)
+        assert any("unusually high" in w for w in warn)
+
+    def test_file_level_notes(self):
+        _, warn = ss.apply_filters(_product(), _metrics(future_rows=2, duplicate_dists=1), self.F, TODAY)
+        assert any("2 price rows dated after today" in w for w in warn)
+        assert any("1 duplicated distribution rows" in w for w in warn)
+
+    def test_no_price_reason_is_passed_through(self):
+        excl, _ = ss.apply_filters(_product(), {"has_prices": False, "reason": "price file has no usable rows"},
+                                   self.F, TODAY)
+        assert excl == ["price file has no usable rows"]
+
+
+class TestScoreProduct:
+    def test_hand_computed_core_au(self):
+        p = _product(mer_pct=0.125, size_aud_m=1000.0, franking_pct=75.0)
+        m = _metrics(adv_aud=1e6, cash_yield_pct=2.75, scoring_yield_pct=2.75, vol_pct=12.5, mdd_pct=20.0)
+        s = ss.score_product(p, m)
+        gross = 2.75 * (1 + 0.75 * 0.3 / 0.7)
+        expected = {"cost": 50.0, "liquidity": 50.0, "size": 50.0, "income": 100 * gross / 5.5,
+                    "stability": 50.0, "drawdown": 50.0}
+        for k, v in expected.items():
+            assert s["components"][k] == pytest.approx(v, abs=0.05), k
+        w = ss.ROLE_RULES["core_au"]["weights"]
+        assert s["total"] == pytest.approx(sum(w[k] * expected[k] for k in w) / 100, abs=0.06)
+        assert s["gross_yield_pct"] == pytest.approx(gross)
+
+    def test_hand_computed_cash_uses_its_own_rules(self):
+        p = _product(role="cash", asset_class="defensive", growth_pct=0, mer_pct=0.15, size_aud_m=100.0, franking_pct=0)
+        m = _metrics(adv_aud=1e5, cash_yield_pct=4.5, scoring_yield_pct=4.5, vol_pct=1.0, mdd_pct=0.5)
+        s = ss.score_product(p, m)
+        assert s["components"] == {"cost": 50.0, "liquidity": 0.0, "size": 0.0, "income": 100.0,
+                                   "stability": 50.0, "drawdown": 50.0}
+        assert s["total"] == pytest.approx(47.5)
+
+    def test_tax_rate_changes_the_gross_up(self):
+        p = _product(franking_pct=100.0)
+        m = _metrics(cash_yield_pct=4.0, scoring_yield_pct=4.0)
+        assert ss.score_product(p, m, tax_rate=0.25)["gross_yield_pct"] == pytest.approx(4.0 * (1 + 0.25 / 0.75))
+
+    def test_overlapping_payments_are_scored_on_expected_count(self):
+        p = _product(franking_pct=0)
+        m = _metrics(cash_yield_pct=5.0, scoring_yield_pct=4.0, ttm_dist_count=5)
+        s = ss.score_product(p, m)
+        assert s["components"]["income"] == pytest.approx(100 * 4.0 / 5.5, abs=0.05)
+        assert any("most recent 4" in n for n in s["notes"])
+
+    def test_unknowns_score_neutral_or_zero(self):
+        s = ss.score_product(_product(), _metrics(adv_aud=None, vol_pct=None, mdd_pct=None))
+        assert s["components"]["liquidity"] == 0.0
+        assert s["components"]["stability"] == 50.0 and s["components"]["drawdown"] == 50.0
+        assert len(s["notes"]) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -324,26 +611,37 @@ class TestLoadHistory:
 # ---------------------------------------------------------------------------
 
 class TestScreen:
-    def test_as_of_defaults_to_newest_price_date(self, universe):
+    def test_as_of_defaults_to_newest_price_date_on_or_before_today(self, universe):
         s = ss.screen(universe, str(FIXTURE_DIR), dict(ss.DEFAULT_FILTERS), TODAY)
         assert s["as_of"] == AS_OF
 
     def test_cheaper_bigger_cash_fund_ranks_first(self, screened):
         assert by_ticker(screened, "CASHX")["rank_in_role"] == 1
-        assert by_ticker(screened, "CASHY")["rank_in_role"] == 2
+        assert by_ticker(screened, "CASHY")["rank_in_role"] > 1
+
+    def test_accruing_cash_fund_is_not_penalised_for_paying_out(self, screened):
+        e = by_ticker(screened, "PAYX")
+        assert e["metrics"]["vol_pct"] < 0.3 and e["metrics"]["mdd_pct"] < 0.1
+        assert e["score"]["components"]["stability"] > 85 and e["score"]["components"]["drawdown"] > 90
 
     @pytest.mark.parametrize("ticker,fragment", [
         ("HYBX", "APRA"),
         ("PRICY", "MER 0.35% is above"),
         ("TINYX", "fund size"),
-        ("THINX", "median daily value traded"),
+        ("THINL", "median daily value traded"),
         ("STALE", "days older than the as-of date"),
         ("NODATA", "no price history"),
+        ("RICHX", "no parcel size given can buy"),
     ])
     def test_exclusions_carry_reasons(self, screened, ticker, fragment):
         e = by_ticker(screened, ticker)
         assert any(fragment in r for r in e["exclusions"]), e["exclusions"]
         assert e["rank_in_role"] is None
+
+    def test_thin_etf_survives_with_a_note(self, screened):
+        e = by_ticker(screened, "THINX")
+        assert e["exclusions"] == [] and any("thin on-screen volume" in w for w in e["warnings"])
+        assert e["score"]["components"]["liquidity"] == 0.0
 
     def test_allow_hybrids_flag(self, universe):
         filters = dict(ss.DEFAULT_FILTERS, allow_hybrids=True)
@@ -352,26 +650,18 @@ class TestScreen:
 
     @pytest.mark.parametrize("ticker,fragment", [
         ("HIYLD", "unusually high"),
+        ("HIYLD", "active fund"),
         ("LICX", "premium or discount to NTA"),
         ("OLDFCT", "static facts dated 2025-01-01"),
-        ("RICHX", "marketable minimum"),
-        ("HIYLD", "active fund"),
+        ("STALE", "3 distributions in the last year, 4 expected"),
     ])
     def test_warnings(self, screened, ticker, fragment):
         e = by_ticker(screened, ticker)
         assert any(fragment in w for w in e["warnings"]), e["warnings"]
 
-    def test_suspicious_yield_is_not_rewarded(self, screened):
-        e = by_ticker(screened, "HIYLD")
-        assert e["metrics"]["cash_yield_pct"] > ss.YIELD_SANITY_CAP_PCT
-        assert e["score"]["components"]["income"] == 50.0
-        assert any("unverified" in n for n in e["score"]["notes"])
-        # The same product with a sane yield would have scored full income points.
-        sane = dict(e["metrics"], cash_yield_pct=8.0)
-        assert ss.score_product(e["product"], sane)["components"]["income"] == 100.0
-
-    def test_survivors_have_no_yield_warning(self, screened):
+    def test_quarterly_payer_with_four_payments_has_no_count_note(self, screened):
         e = by_ticker(screened, "AUEQX")
+        assert not any("distributions in the last year" in w for w in e["warnings"])
         assert not any("unusually high" in w for w in e["warnings"])
 
     def test_ranks_follow_scores_within_each_role(self, screened):
@@ -387,6 +677,7 @@ class TestScreen:
                 continue
             s = e["score"]
             assert sum(s["weights"].values()) == 100
+            assert set(s["components"]) == set(ss.COMPONENTS)
             assert all(0 <= v <= 100 for v in s["components"].values())
             expected = sum(s["weights"][k] * s["components"][k] for k in s["components"]) / 100
             assert s["total"] == pytest.approx(expected, abs=0.15)
@@ -397,20 +688,52 @@ class TestScreen:
         assert au["score"]["gross_yield_pct"] > au["metrics"]["cash_yield_pct"]
         assert intl["score"]["gross_yield_pct"] == pytest.approx(intl["metrics"]["cash_yield_pct"])
 
+    def test_suspicious_yield_is_not_rewarded(self, screened):
+        e = by_ticker(screened, "HIYLD")
+        assert e["metrics"]["cash_yield_pct"] > ss.YIELD_SANITY_CAP_PCT
+        assert e["score"]["components"]["income"] == 50.0
+        sane = dict(e["metrics"], cash_yield_pct=8.0, scoring_yield_pct=8.0)
+        assert ss.score_product(e["product"], sane)["components"]["income"] == 100.0
+
     def test_parcels_computed_for_priced_products(self, screened):
         e = by_ticker(screened, "AUEQX")
         assert [p["parcel_aud"] for p in e["parcels"]] == [10_000.0, 25_000.0]
         assert all(p["units"] > 0 for p in e["parcels"])
         assert by_ticker(screened, "NODATA")["parcels"] == []
 
-    def test_high_unit_price_buys_zero_units(self, screened):
-        e = by_ticker(screened, "RICHX")
-        assert e["parcels"][0]["units"] == 0
-
     def test_lic_franking_credit_value_is_full_company_rate(self, screened):
         e = by_ticker(screened, "LICX")
         cash = e["metrics"]["cash_yield_pct"]
         assert e["score"]["franking_credit_yield_pct"] == pytest.approx(cash * 0.3 / 0.7)
+
+    def test_one_bad_file_excludes_one_product(self, universe, fixture_copy):
+        (fixture_copy / "CASHX.csv").write_text("date,close,volume\n2026-01-02,n/a,1\n2026-01-03,abc,1\n")
+        s = ss.screen(universe, str(fixture_copy), dict(ss.DEFAULT_FILTERS), TODAY, as_of=AS_OF)
+        e = by_ticker(s, "CASHX")
+        assert any("history file unreadable" in x and "line 3: close" in x for x in e["exclusions"])
+        assert by_ticker(s, "CASHY")["exclusions"] == []
+
+    def test_future_dated_row_does_not_move_as_of(self, universe, fixture_copy):
+        with open(fixture_copy / "CASHY.csv", "a") as fh:
+            fh.write("2062-09-04,99.0,100000\n")
+        s = ss.screen(universe, str(fixture_copy), dict(ss.DEFAULT_FILTERS), TODAY)
+        assert s["as_of"] == AS_OF
+        assert by_ticker(s, "CASHX")["exclusions"] == []
+        e = by_ticker(s, "CASHY")
+        assert e["exclusions"] == [] and any("1 price rows dated after today" in w for w in e["warnings"])
+
+    def test_duplicate_distribution_rows_are_collapsed_and_noted(self, universe, fixture_copy):
+        text = (fixture_copy / "AUEQX.dividends.csv").read_text()
+        (fixture_copy / "AUEQX.dividends.csv").write_text(text + text.split("\n", 1)[1])
+        s = ss.screen(universe, str(fixture_copy), dict(ss.DEFAULT_FILTERS), TODAY, as_of=AS_OF)
+        e = by_ticker(s, "AUEQX")
+        assert e["metrics"]["ttm_dist_count"] == 4
+        assert any("duplicated distribution rows were collapsed" in w for w in e["warnings"])
+
+    def test_history_after_as_of_says_so(self, universe):
+        s = ss.screen(universe, str(FIXTURE_DIR), dict(ss.DEFAULT_FILTERS), TODAY, as_of=date(2020, 1, 1))
+        e = by_ticker(s, "CASHX")
+        assert any("history starts 2023-09-04, after the as-of date" in x for x in e["exclusions"])
 
 
 # ---------------------------------------------------------------------------
@@ -419,19 +742,19 @@ class TestScreen:
 
 class TestAllocateParcels:
     def test_largest_remainder_sums_to_n(self):
-        alloc = ss.allocate_parcels(ss.TEMPLATES["balanced"], 6)
+        alloc = ss.allocate_parcels(ss.TEMPLATES["balanced"]["mix"], 6)
         assert sum(alloc.values()) == 6
         assert alloc == {"cash": 1, "defensive": 2, "core_au": 1, "core_intl": 1, "diversifier": 1}
 
     def test_small_n_drops_small_roles(self):
-        assert ss.allocate_parcels(ss.TEMPLATES["simple"], 3) == {"defensive": 1, "all_in_one": 2}
+        assert ss.allocate_parcels(ss.TEMPLATES["simple"]["mix"], 3) == {"defensive": 1, "all_in_one": 2}
 
     def test_one_parcel_goes_to_largest_weight(self):
-        assert ss.allocate_parcels(ss.TEMPLATES["conservative"], 1) == {"defensive": 1}
+        assert ss.allocate_parcels(ss.TEMPLATES["conservative"]["mix"], 1) == {"defensive": 1}
 
     def test_zero_parcels_rejected(self):
         with pytest.raises(ss.ScreenerError):
-            ss.allocate_parcels(ss.TEMPLATES["balanced"], 0)
+            ss.allocate_parcels(ss.TEMPLATES["balanced"]["mix"], 0)
 
 
 class TestIllustrate:
@@ -442,24 +765,55 @@ class TestIllustrate:
         assert {l["role"] for l in ill["lines"]} == set(ill["parcels_by_role"])
         assert all(l["units"] > 0 for l in ill["lines"])
         assert 0 < ill["defensive_share_pct"] < 100
+        assert ill["brokerage_total_aud"] == pytest.approx(60.0)
+        assert sum(ill["achieved_pct"].values()) == pytest.approx(100.0)
         dc = ill["drawdown_cover"]
         assert dc["minimum_factor_pct"] == 4.0
         assert dc["annual_minimum_aud"] == pytest.approx(20_000.0)
-        defensive = sum(l["value_aud"] for l in ill["lines"] if l["role"] in ("cash", "defensive"))
+        cash = sum(l["value_aud"] for l in ill["lines"] if l["role"] == "cash")
+        defensive = sum(l["value_aud"] * (100 - l["growth_pct"]) / 100 for l in ill["lines"])
+        assert dc["years_covered_by_cash"] == pytest.approx(cash / 20_000.0)
         assert dc["years_covered_by_cash_and_defensive"] == pytest.approx(defensive / 20_000.0)
+        assert ill["note"] == ss.ILLUSTRATION_NOTE
 
-    def test_unbuyable_product_is_skipped_not_allocated_zero_units(self, screened):
-        ill = ss.illustrate(screened, "balanced", 6, 15_000.0)
+    def test_age_and_balance_are_validated(self, screened):
+        with pytest.raises(ss.ScreenerError, match="preservation age"):
+            ss.illustrate(screened, "balanced", 6, 15_000.0, age=59)
+        with pytest.raises(ss.ScreenerError, match="--age"):
+            ss.illustrate(screened, "balanced", 6, 15_000.0, age=200)
+        with pytest.raises(ss.ScreenerError, match="--balance must be positive"):
+            ss.illustrate(screened, "balanced", 6, 15_000.0, balance_aud=-5.0)
+
+    def test_older_member_uses_higher_factor(self, screened):
+        ill = ss.illustrate(screened, "balanced", 6, 15_000.0, balance_aud=500_000.0, age=80)
+        assert ill["drawdown_cover"]["minimum_factor_pct"] == 7.0
+        assert ill["drawdown_cover"]["annual_minimum_aud"] == 35_000.0
+
+    def test_unverified_yield_is_left_out_of_the_weighted_figure(self, screened):
+        ill = ss.illustrate(screened, "income_tilt", 12, 10_000.0)
+        hi = [l for l in ill["lines"] if l["ticker"] == "HIYLD"]
+        assert hi and all(l["yield_unverified"] for l in hi)
+        verified = [l for l in ill["lines"] if not l["yield_unverified"]]
+        expected = sum(l["value_aud"] * l["gross_yield_pct"] for l in verified) / sum(l["value_aud"] for l in verified)
+        assert ill["weighted_gross_yield_pct"] == pytest.approx(expected)
+        assert ill["unverified_yield_lines"] == len(hi)
+
+    def test_simple_template_respects_the_growth_band(self, screened):
+        ill = ss.illustrate(screened, "simple", 6, 10_000.0)
+        chosen = {l["ticker"] for l in ill["lines"] if l["role"] == "all_in_one"}
+        assert chosen == {"ALLX"} and "ALLGX" in ill["skipped_outside_growth_band"]
+        # All-growth fund inside the sleeve would have counted as 0% defensive; ALLX counts half.
+        allx_value = sum(l["value_aud"] for l in ill["lines"] if l["ticker"] == "ALLX")
+        cash_def = sum(l["value_aud"] for l in ill["lines"] if l["role"] in ("cash", "defensive"))
+        assert ill["defensive_share_pct"] == pytest.approx((cash_def + allx_value / 2) / ill["deployed_aud"] * 100)
+
+    def test_unbuyable_product_is_skipped(self, universe):
+        s = ss.screen(universe, str(FIXTURE_DIR), dict(ss.DEFAULT_FILTERS), TODAY, as_of=AS_OF,
+                      parcels=(100_000.0,))          # RICHX becomes buyable at this size...
+        assert by_ticker(s, "RICHX")["exclusions"] == []
+        ill = ss.illustrate(s, "balanced", 6, 15_000.0)  # ...but not with a 15k illustration parcel
         assert "RICHX" in ill["skipped_not_marketable"]
         assert all(l["ticker"] != "RICHX" for l in ill["lines"])
-        assert any(l["role"] == "diversifier" and l["ticker"] == "GOLDX" for l in ill["lines"])
-
-    def test_role_where_nothing_is_buyable_is_unfilled(self, universe):
-        only_rich = [p for p in universe if p["role"] != "diversifier" or p["ticker"] == "RICHX"]
-        s = ss.screen(only_rich, str(FIXTURE_DIR), dict(ss.DEFAULT_FILTERS), TODAY, as_of=AS_OF)
-        ill = ss.illustrate(s, "balanced", 6, 15_000.0)
-        assert ill["unfilled_roles"] == ["diversifier"] and ill["skipped_not_marketable"] == ["RICHX"]
-        assert "cannot buy a marketable holding: RICHX" in ss.render_illustration(ill)
 
     def test_role_without_survivors_is_reported(self, universe):
         thin = [p for p in universe if p["role"] != "diversifier" or p["ticker"] == "TINYX"]
@@ -472,14 +826,17 @@ class TestIllustrate:
         with pytest.raises(ss.ScreenerError):
             ss.illustrate(screened, "yolo", 3, 10_000.0)
 
-    def test_many_parcels_cycle_over_top_products(self, screened):
-        ill = ss.illustrate(screened, "simple", 10, 10_000.0)
-        cash_lines = [l for l in ill["lines"] if l["role"] == "cash"]
-        assert cash_lines and cash_lines[0]["ticker"] == "CASHX"
+    def test_rendering_aggregates_repeated_parcels(self, screened):
+        ill = ss.illustrate(screened, "simple", 10, 10_000.0, brokerage_aud=9.95)
+        text = ss.render_illustration(ill)
+        assert re.search(r"all_in_one +ALLX .* 7 x \d+ = \d+ units", text)
+        assert "plus brokerage AUD 99.50 over 10 trades" in text
+        assert "(50/50 growth/defensive inside)" in text
+        assert "target 70%" in text and ss.ILLUSTRATION_NOTE in text
 
 
 # ---------------------------------------------------------------------------
-# Optional fetch (yfinance stubbed; the sandbox forbids the network anyway)
+# Optional fetch (network stubbed; the sandbox forbids the real thing)
 # ---------------------------------------------------------------------------
 
 class _Index:
@@ -512,47 +869,44 @@ class _Frame:
         return _Series({d: row["Dividends"] for d, row in self._rows})
 
 
-class TestFetchHistory:
-    def _install_fake(self, monkeypatch, frames):
-        import types
+def _install_fake_yfinance(monkeypatch, frames):
+    import types
 
-        class Ticker:
-            def __init__(self, symbol):
-                self.symbol = symbol
+    class Ticker:
+        def __init__(self, symbol):
+            self.symbol = symbol
 
-            def history(self, **kw):
-                return frames[self.symbol]
+        def history(self, **kw):
+            frame = frames[self.symbol]
+            if isinstance(frame, Exception):
+                raise frame
+            return frame
 
-        monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=Ticker))
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=Ticker))
 
+
+class TestFetchHistoryYfinance:
     def test_writes_csv_layout(self, monkeypatch, tmp_path):
         frames = {
             "VAS.AX": _Frame([
                 (date(2026, 1, 2), {"Close": 100.5, "Volume": 1000, "Dividends": 0.0}),
                 (date(2026, 1, 5), {"Close": float("nan"), "Volume": 0, "Dividends": 0.0}),
-                (date(2026, 1, 6), {"Close": 101.0, "Volume": 2000, "Dividends": 1.25}),
+                (date(2026, 1, 6), {"Close": 101.0, "Volume": float("nan"), "Dividends": 1.25}),
             ]),
             "ZZZ.AX": _Frame([]),
+            "NAN.AX": _Frame([(date(2026, 1, 2), {"Close": float("nan"), "Volume": 1, "Dividends": 0.0})]),
         }
-        self._install_fake(monkeypatch, frames)
-        result = ss.fetch_history(["VAS", "ZZZ"], str(tmp_path), backend="yfinance")
-        assert result == {"fetched": ["VAS"], "empty": ["ZZZ"], "failed": {}}
+        _install_fake_yfinance(monkeypatch, frames)
+        result = ss.fetch_history(["VAS", "ZZZ", "NAN"], str(tmp_path), backend="yfinance")
+        assert result == {"fetched": ["VAS"], "empty": ["ZZZ", "NAN"], "failed": {}}
         prices = ss.load_price_history(str(tmp_path), "VAS")
         assert [(r["date"].isoformat(), r["close"], r["volume"]) for r in prices] == [
-            ("2026-01-02", 100.5, 1000.0), ("2026-01-06", 101.0, 2000.0)]
+            ("2026-01-02", 100.5, 1000.0), ("2026-01-06", 101.0, 0.0)]
         assert ss.load_distributions(str(tmp_path), "VAS") == [{"date": date(2026, 1, 6), "amount": 1.25}]
+        assert not (tmp_path / "NAN.csv").exists()
 
     def test_exception_per_ticker_is_reported_not_raised(self, monkeypatch, tmp_path):
-        import types
-
-        class Ticker:
-            def __init__(self, symbol):
-                pass
-
-            def history(self, **kw):
-                raise RuntimeError("boom")
-
-        monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(Ticker=Ticker))
+        _install_fake_yfinance(monkeypatch, {"VAS.AX": RuntimeError("boom")})
         result = ss.fetch_history(["VAS"], str(tmp_path), backend="yfinance")
         assert result["fetched"] == [] and "RuntimeError" in result["failed"]["VAS"]
 
@@ -585,40 +939,46 @@ def yahoo_payload(closes, volumes, dividends=None, offset=SYDNEY):
 
 class TestParseYahooChart:
     def test_rows_and_dividends_in_sydney_dates(self):
-        payload = yahoo_payload([100.5, None, 101.0], [1000, None, 2000],
-                                {"1767747600": {"amount": 1.25, "date": 1767747600}})
+        payload = yahoo_payload([100.5, None, 101.0], [1000, 500, None],
+                                {"1767740400": {"amount": 1.25, "date": 1767740400}})
         rows, divs = ss.parse_yahoo_chart(payload)
+        # a null volume on a real close is kept (as 0), a null close is dropped
         assert [(r["date"].isoformat(), r["close"], r["volume"]) for r in rows] == [
-            ("2026-01-05", 100.5, 1000.0), ("2026-01-07", 101.0, 2000.0)]
+            ("2026-01-05", 100.5, 1000.0), ("2026-01-07", 101.0, 0.0)]
         assert divs == [{"date": date(2026, 1, 7), "amount": 1.25}]
 
     def test_offset_moves_the_date(self):
-        # Without the exchange offset the same stamps fall on the previous UTC day.
         rows, _ = ss.parse_yahoo_chart(yahoo_payload([1.0], [1], offset=0))
         assert rows[0]["date"] == date(2026, 1, 4)
 
-    def test_error_and_bad_shape(self):
+    def test_error_and_bad_shapes(self):
         with pytest.raises(ss.ScreenerError, match="Yahoo error: No data"):
             ss.parse_yahoo_chart({"chart": {"result": None, "error": {"code": "Not Found", "description": "No data"}}})
-        with pytest.raises(ss.ScreenerError, match="unexpected shape"):
-            ss.parse_yahoo_chart({"chart": {"result": [{"meta": {}}]}})
-        with pytest.raises(ss.ScreenerError, match="unexpected shape"):
-            ss.parse_yahoo_chart("not json at all")
+        for bad in ({"chart": {"result": [{"meta": {}}]}}, "not json at all",
+                    {"chart": {"result": [{"timestamp": [1], "indicators": {"quote": [{"close": {"0": 1}}]}}]}}):
+            with pytest.raises(ss.ScreenerError, match="unexpected shape"):
+                ss.parse_yahoo_chart(bad)
+
+    def test_none_timestamp_is_skipped(self):
+        payload = yahoo_payload([1.0, 2.0], [1, 1])
+        payload["chart"]["result"][0]["timestamp"] = [None, STAMPS[1]]
+        rows, _ = ss.parse_yahoo_chart(payload)
+        assert len(rows) == 1 and rows[0]["close"] == 2.0
 
     def test_zero_and_junk_dividends_skipped(self):
         payload = yahoo_payload([1.0], [1], {"a": {"amount": 0, "date": STAMPS[0]}, "b": {"amount": "x"},
-                                             "c": {"amount": 0.5, "date": STAMPS[0]}})
+                                             "c": {"amount": 0.5, "date": STAMPS[0]}, "d": None})
         _, divs = ss.parse_yahoo_chart(payload)
         assert divs == [{"date": date(2026, 1, 5), "amount": 0.5}]
 
     def test_no_timestamps_means_no_rows(self):
-        payload = yahoo_payload([], [])
-        assert ss.parse_yahoo_chart(payload) == ([], [])
+        assert ss.parse_yahoo_chart(yahoo_payload([], [])) == ([], [])
 
 
 class TestFetchHistoryYahoo:
     def test_writes_files_and_reports_failures(self, monkeypatch, tmp_path):
         calls = []
+        progressed = []
 
         def fake_get(url, timeout=20.0):
             calls.append(url)
@@ -627,21 +987,25 @@ class TestFetchHistoryYahoo:
                                      {"x": {"amount": 1.25, "date": STAMPS[2]}})
             if "ZZZ.AX" in url:
                 return yahoo_payload([], [])
+            if "ODD.AX" in url:
+                return {"chart": {"result": [{"timestamp": [1], "indicators": {"quote": [{"close": {"0": 1}}]}}]}}
             raise ss.ScreenerError("HTTP 404 from https://query2.finance.yahoo.com/v8/finance/chart/BAD.AX")
 
         monkeypatch.setattr(ss, "_http_get_json", fake_get)
         monkeypatch.setattr(ss.time, "sleep", lambda s: None)
-        result = ss.fetch_history(["VAS", "ZZZ", "BAD"], str(tmp_path), years=3)
-        assert result["fetched"] == ["VAS"] and result["empty"] == ["ZZZ"]
-        assert "HTTP 404" in result["failed"]["BAD"]
-        assert all("range=3y" in u and "events=div" in u and u.endswith("false") for u in calls)
+        result = ss.fetch_history(["VAS", "ZZZ", "BAD", "ODD"], str(tmp_path), years=5, progress=progressed.append)
+        assert result["fetched"] == ["VAS"] and result["empty"] == ["ZZZ"] and progressed == ["VAS"]
+        assert "HTTP 404" in result["failed"]["BAD"] and "unexpected shape" in result["failed"]["ODD"]
+        assert all("range=5y" in u and "events=div" in u and u.endswith("false") for u in calls)
         prices = ss.load_price_history(str(tmp_path), "VAS")
         assert [(r["date"].isoformat(), r["close"]) for r in prices] == [
             ("2026-01-05", 100.5), ("2026-01-06", 100.0), ("2026-01-07", 101.0)]
         assert ss.load_distributions(str(tmp_path), "VAS") == [{"date": date(2026, 1, 7), "amount": 1.25}]
         assert not (tmp_path / "ZZZ.csv").exists()
+        assert not any(p.name.startswith(".tmp-") for p in tmp_path.iterdir())
 
     def test_http_errors_are_screener_errors(self, monkeypatch):
+        import http.client
         import urllib.error
         import urllib.request
 
@@ -659,14 +1023,19 @@ class TestFetchHistoryYahoo:
         with pytest.raises(ss.ScreenerError, match="Install Certificates"):
             ss._http_get_json("https://example.invalid/chart/VAS.AX")
 
-    def test_fetch_only_cli(self, monkeypatch, tmp_path, capsys):
-        monkeypatch.setattr(ss, "_http_get_json", lambda url, timeout=20.0: yahoo_payload([50.0] * 3, [100] * 3))
-        monkeypatch.setattr(ss.time, "sleep", lambda s: None)
-        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "d"), "--fetch-only",
-                        "--only-role", "cash"])
-        err = capsys.readouterr().err
-        assert code == 0 and "fetched 2 of 2" in err
-        assert (tmp_path / "d" / "CASHX.csv").exists() and (tmp_path / "d" / "CASHY.dividends.csv").exists()
+        def raise_incomplete(req, timeout=0):
+            raise http.client.IncompleteRead(b"partial")
+
+        monkeypatch.setattr(urllib.request, "urlopen", raise_incomplete)
+        with pytest.raises(ss.ScreenerError, match="IncompleteRead"):
+            ss._http_get_json("https://example.invalid/chart/VAS.AX")
+
+    def test_write_failure_leaves_no_partial_file(self, monkeypatch, tmp_path):
+        rows = [{"date": date(2026, 1, 5), "close": 1.0, "volume": 1.0}, {"date": date(2026, 1, 6), "close": "bad", "volume": 1.0}]
+        with pytest.raises(Exception):
+            ss.write_history_csvs(str(tmp_path), "VAS", rows, [])
+        assert not (tmp_path / "VAS.csv").exists()
+        assert not any(p.name.startswith(".tmp-") for p in tmp_path.iterdir())
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +1052,20 @@ def run_cli(capsys, *extra):
     return code, captured.out, captured.err
 
 
+def run_json(capsys, tmp_path, *extra):
+    out_file = tmp_path / "out.json"
+    code, out, err = run_cli(capsys, "--json", str(out_file), *extra)
+    assert code == 0, err
+    return json.loads(out_file.read_text()), out, err
+
+
+def product_from(payload, ticker):
+    for e in payload["results"]:
+        if e["product"]["ticker"] == ticker:
+            return e
+    raise KeyError(ticker)
+
+
 class TestCli:
     def test_default_run_prints_disclaimer_and_tables(self, capsys):
         code, out, err = run_cli(capsys)
@@ -692,51 +1075,105 @@ class TestCli:
         for role in ss.ROLES:
             assert f"== {ss.ROLE_LABELS[role]} ==" in out
         assert "excluded: no price history" in out
+        assert "score = 0-100 fit" in out and "NO brokerage deducted" in out
         assert "universe check: OLDFCT" in err
 
     def test_hide_excluded(self, capsys):
         code, out, _ = run_cli(capsys, "--hide-excluded")
         assert code == 0 and "NODATA" not in out and "CASHX" in out
+        code, out, _ = run_cli(capsys, "--hide-excluded", "--only-role", "diversifier", "--min-size", "5000")
+        assert code == 0 and "all 4 products in this role were excluded" in out
 
     def test_explain_shows_arithmetic(self, capsys):
         code, out, _ = run_cli(capsys, "--explain", "aueqx")
         assert code == 0
-        assert "grossed-up yield" in out and "x weight" in out and "score" in out
+        assert "x weight" in out and "score" in out and "hedged n/a" in out
+        m = re.search(r"grossed-up yield = ([\d.]+)% x \(1 \+ 75% x 0.30/0.70\) = ([\d.]+)%", out)
+        assert m and float(m.group(2)) == pytest.approx(float(m.group(1)) * (1 + 0.75 * 0.3 / 0.7), abs=0.01)
         assert "AUD 10,000 parcel" in out
 
-    def test_explain_unknown_ticker(self, capsys):
+    def test_explain_zero_unit_parcel(self, capsys):
+        code, out, _ = run_cli(capsys, "--explain", "RICHX")
+        assert code == 0 and "cannot buy a single unit" in out and "n/a of value" not in out
+
+    def test_explain_unknown_and_removed_tickers(self, capsys):
         code, _, err = run_cli(capsys, "--explain", "ZZZ")
         assert code == 2 and "not in the universe" in err
+        code, _, err = run_cli(capsys, "--explain", "CASHX", "--exclude", "CASHX")
+        assert code == 2 and "removed by --exclude" in err
 
     def test_illustrate_and_outputs(self, capsys, tmp_path):
-        j = tmp_path / "out.json"
         md = tmp_path / "out.md"
-        code, out, _ = run_cli(capsys, "--illustrate", "balanced", "--n-parcels", "6", "--parcel", "15000",
-                               "--balance", "500000", "--json", str(j), "--markdown", str(md))
-        assert code == 0
+        payload, out, _ = run_json(capsys, tmp_path, "--illustrate", "balanced", "--n-parcels", "6", "--parcel",
+                                   "15000", "--balance", "500000", "--markdown", str(md))
         assert "Illustrative structure 'balanced'" in out
-        assert "cover 1" in out or "years of it" in out
-        payload = json.loads(j.read_text())
         assert payload["as_of"] == "2026-09-04"
-        assert payload["illustration"]["template"] == "balanced"
-        assert len(payload["results"]) == 18
+        ill = payload["illustration"]
+        assert ill["template"] == "balanced" and len(ill["lines"]) == 6
+        m = re.search(r"cash plus bonds/credit ([\d.]+) years", out)
+        assert m and float(m.group(1)) == pytest.approx(ill["drawdown_cover"]["years_covered_by_cash_and_defensive"], abs=0.06)
+        assert len(payload["results"]) == 21
         text = md.read_text()
-        assert text.startswith("# SMSF screener output") and "| CASHX |" in text
+        assert text.startswith("# SMSF screener output") and "| CASHX |" in text and "not a recommendation" in text
+
+    @pytest.mark.parametrize("flag,ticker,check", [
+        (["--allow-hybrids"], "HYBX", lambda e: e["exclusions"] == []),
+        (["--min-size", "10"], "TINYX", lambda e: e["exclusions"] == []),
+        (["--min-adv", "1"], "THINL", lambda e: e["exclusions"] == []),
+        (["--max-price-age", "90"], "STALE", lambda e: e["exclusions"] == []),
+        (["--brokerage", "9.95"], "AUEQX", lambda e: e["parcels"][0]["brokerage_aud"] == 9.95 and
+         e["parcels"][0]["units"] == ss.parcel_plan(e["metrics"]["last_price"], 10_000.0, 9.95)["units"]),
+        (["--company-tax-rate", "0.25"], "LICX", lambda e: e["score"]["gross_yield_pct"] ==
+         pytest.approx(e["metrics"]["cash_yield_pct"] * (1 + 0.25 / 0.75))),
+    ])
+    def test_flags_reach_the_engine(self, capsys, tmp_path, flag, ticker, check):
+        payload, _, _ = run_json(capsys, tmp_path, *flag)
+        assert check(product_from(payload, ticker))
+
+    def test_illustration_flags_reach_the_engine(self, capsys, tmp_path):
+        payload, _, _ = run_json(capsys, tmp_path, "--illustrate", "balanced", "--n-parcels", "3", "--age", "80",
+                                 "--balance", "500000")
+        ill = payload["illustration"]
+        assert len(ill["lines"]) == 3
+        assert ill["drawdown_cover"]["minimum_factor_pct"] == 7.0
+        assert ill["drawdown_cover"]["annual_minimum_aud"] == 35_000.0
+
+    def test_illustration_only_flags_without_illustrate_are_noted(self, capsys):
+        code, _, err = run_cli(capsys, "--balance", "800000", "--age", "76")
+        assert code == 0 and "--balance only affects --illustrate" in err and "--age only affects" in err
 
     def test_single_parcel_flag(self, capsys):
         code, out, _ = run_cli(capsys, "--parcel", "20000")
         assert code == 0 and "u@20k" in out and "u@10k" not in out
+        code, out, _ = run_cli(capsys, "--parcel", "12500", "--parcel", "500")
+        assert code == 0 and "u@12.5k" in out and "u@0.5k" in out
 
-    def test_bad_parcel(self, capsys):
-        code, _, err = run_cli(capsys, "--parcel", "-5")
-        assert code == 2 and "must be positive" in err
+    @pytest.mark.parametrize("args,fragment", [
+        (["--parcel", "-5"], "--parcel"),
+        (["--parcel", "nan"], "--parcel"),
+        (["--parcel", "inf"], "--parcel"),
+        (["--brokerage", "nan"], "--brokerage"),
+        (["--min-adv", "nan"], "--min-adv"),
+        (["--illustrate", "balanced", "--balance", "-5"], "--balance"),
+        (["--illustrate", "balanced", "--balance", "nan"], "--balance"),
+        (["--illustrate", "balanced", "--age", "59"], "preservation age"),
+        (["--illustrate", "balanced", "--age", "200"], "--age"),
+        (["--illustrate", "balanced", "--n-parcels", "0"], "--n-parcels"),
+        (["--company-tax-rate", "1.5"], "--company-tax-rate"),
+        (["--years", "0"], "--years"),
+    ])
+    def test_bad_numbers_exit_2_with_the_flag_named(self, capsys, args, fragment):
+        code, _, err = run_cli(capsys, *args)
+        assert code == 2 and fragment in err
 
     def test_only_role_and_exclude(self, capsys):
-        code, out, _ = run_cli(capsys, "--only-role", "cash", "--exclude", "cashy")
+        code, out, err = run_cli(capsys, "--only-role", "cash", "--exclude", "cashy", "--exclude", "VSA")
         assert code == 0 and "CASHX" in out and "CASHY" not in out and "AUEQX" not in out
+        assert "--exclude VSA matches nothing" in err
 
     def test_exclude_everything(self, capsys):
-        code, _, err = run_cli(capsys, "--only-role", "cash", "--exclude", "CASHX", "--exclude", "CASHY")
+        code, _, err = run_cli(capsys, "--only-role", "cash", "--exclude", "CASHX", "--exclude", "CASHY",
+                               "--exclude", "PAYX")
         assert code == 2 and "no products left" in err
 
     def test_audit_universe_reports_and_exits_nonzero(self, capsys):
@@ -744,15 +1181,17 @@ class TestCli:
         assert code == 1 and "OLDFCT" in out
 
     def test_audit_real_universe_is_clean(self, capsys):
+        products = ss.load_universe(str(REAL_UNIVERSE))
+        today = max(TODAY, max(p["as_at"] for p in products)).isoformat()
         code = ss.main(["--universe", str(REAL_UNIVERSE), "--data-dir", str(FIXTURE_DIR),
-                        "--today", "2026-09-06", "--audit-universe"])
+                        "--today", today, "--audit-universe"])
         assert code == 0
         assert "no anomalies" in capsys.readouterr().out
 
     def test_rules_prints_policy(self, capsys):
         assert ss.main(["--rules"]) == 0
         out = capsys.readouterr().out
-        assert "MER cap" in out and "balanced" in out and "95+ 14%" in out
+        assert "MER cap" in out and "balanced" in out and "95+ 14%" in out and "growth share <= 70%" in out
 
     def test_missing_data_dir(self, capsys, tmp_path):
         code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "nope"), "--today", "2026-09-06"])
@@ -762,11 +1201,61 @@ class TestCli:
         code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path), "--today", "2026-09-06"])
         assert code == 2 and "no price history found" in capsys.readouterr().err
 
+    def test_output_paths_are_checked_before_anything_prints(self, capsys, tmp_path):
+        code, out, err = run_cli(capsys, "--json", str(tmp_path))
+        assert code == 2 and "is a directory" in err and out == ""
+        code, out, err = run_cli(capsys, "--markdown", str(tmp_path / "nope" / "x.md"))
+        assert code == 2 and "does not exist" in err and out == ""
+
+    def test_as_of_after_today_rejected(self, capsys):
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(FIXTURE_DIR), "--today", "2026-09-06",
+                        "--as-of", "2026-09-07"])
+        assert code == 2 and "after today" in capsys.readouterr().err
+
     def test_fetch_without_yfinance(self, capsys, monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, "yfinance", None)
         code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path), "--fetch-only",
                         "--fetch-backend", "yfinance"])
         assert code == 2 and "yfinance is not installed" in capsys.readouterr().err
+
+    def test_fetch_only_exit_codes(self, monkeypatch, tmp_path, capsys):
+        good = lambda url, timeout=20.0: yahoo_payload([50.0] * 3, [100] * 3)  # noqa: E731
+        monkeypatch.setattr(ss.time, "sleep", lambda s: None)
+        monkeypatch.setattr(ss, "_http_get_json", good)
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "d"), "--fetch-only",
+                        "--only-role", "cash"])
+        err = capsys.readouterr().err
+        assert code == 0 and "fetched 3 of 3" in err
+        assert (tmp_path / "d" / "CASHX.csv").exists() and (tmp_path / "d" / "PAYX.dividends.csv").exists()
+
+        def partial(url, timeout=20.0):
+            if "CASHY" in url:
+                raise ss.ScreenerError("HTTP 404 from x")
+            return good(url)
+
+        monkeypatch.setattr(ss, "_http_get_json", partial)
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "d"), "--fetch-only",
+                        "--only-role", "cash"])
+        assert code == 1 and "failed CASHY: HTTP 404" in capsys.readouterr().err
+
+        monkeypatch.setattr(ss, "_http_get_json", lambda url, timeout=20.0: (_ for _ in ()).throw(ss.ScreenerError("down")))
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "d"), "--fetch-only",
+                        "--only-role", "cash"])
+        assert code == 2 and "nothing fetched" in capsys.readouterr().err
+
+    def test_fetch_then_screen_uses_the_years_flag(self, monkeypatch, tmp_path, capsys):
+        calls = []
+
+        def fake(url, timeout=20.0):
+            calls.append(url)
+            return yahoo_payload([50.0] * 3, [100] * 3)
+
+        monkeypatch.setattr(ss.time, "sleep", lambda s: None)
+        monkeypatch.setattr(ss, "_http_get_json", fake)
+        code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(tmp_path / "d"), "--fetch", "--years", "5",
+                        "--only-role", "cash", "--today", "2026-01-08"])
+        out = capsys.readouterr().out
+        assert code == 0 and all("range=5y" in u for u in calls) and "== Cash bucket ==" in out
 
     def test_bad_dates(self, capsys):
         code = ss.main(["--universe", str(UNIVERSE), "--data-dir", str(FIXTURE_DIR), "--today", "6/9/2026"])
@@ -780,14 +1269,46 @@ class TestCli:
 
 class TestRendering:
     def test_json_is_sorted_and_round_trips_dates(self, screened):
-        payload = json.loads(ss.to_json(screened))
+        text = ss.to_json(screened)
+        payload = json.loads(text)
         assert payload["today"] == "2026-09-06"
         assert payload["results"][0]["product"]["as_at"] == "2026-06-30"
+        assert text == json.dumps(payload, indent=2, sort_keys=True)
+        assert product_from(payload, "CASHX")["rank_in_role"] == 1
 
-    def test_markdown_has_a_row_per_product(self, screened):
+    def test_markdown_rows_have_as_many_cells_as_the_header(self, screened):
         text = ss.render_markdown(screened)
+        header_cells = None
+        for line in text.splitlines():
+            if line.startswith("| # |"):
+                header_cells = line.count("|")
+            elif line.startswith("| ") and header_cells:
+                assert line.count("|") == header_cells, line
         for e in screened["results"]:
             assert f"| {e['product']['ticker']} |" in text
 
-    def test_text_output_is_ascii_safe(self, screened):
-        ss.render_text(screened).encode("ascii")
+    def test_text_output_is_ascii_safe_and_long_names_are_cut_at_words(self, screened):
+        text = ss.render_text(screened)
+        text.encode("ascii")
+        long = json.loads(ss.to_json(screened))
+        long["results"][0]["product"]["name"] = "Fixture Fund With A Deliberately Overlong Name (managed fund)"
+        e = dict(screened["results"][0])
+        e["product"] = dict(e["product"], name=long["results"][0]["product"]["name"])
+        text = ss.render_text(dict(screened, results=[e] + screened["results"][1:]))
+        assert "Fixture Fund With A Deliberately.." in text
+        assert "(managed fund)" not in text.split("== ")[1]
+
+    def test_footnote_mentions_brokerage_when_given(self, screened):
+        assert "after AUD 10.00 brokerage" in ss.render_text(screened)
+
+
+class TestFixtureGenerator:
+    def test_generator_reproduces_the_committed_fixtures(self, tmp_path, monkeypatch):
+        gen = _load("make_smsf_fixtures", "tools/make_smsf_fixtures.py")
+        monkeypatch.setattr(gen, "FIXTURE_DIR", str(tmp_path))
+        gen.main()
+        produced = sorted(p.name for p in tmp_path.iterdir())
+        committed = sorted(p.name for p in FIXTURE_DIR.iterdir())
+        assert produced == committed
+        for name in produced:
+            assert (tmp_path / name).read_bytes() == (FIXTURE_DIR / name).read_bytes(), name
