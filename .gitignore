@@ -38,3 +38,7 @@ htmlcov/
 # Environment / secrets
 .env
 .env.*
+
+# Price and distribution history downloaded by smsf_screener.py --fetch. Regenerate
+# with --fetch rather than committing it; tests use tests/fixtures/smsf/ instead.
+data/
