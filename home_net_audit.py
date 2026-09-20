@@ -741,12 +741,21 @@ def local_network_denied_note(what):
     have UPnP disabled. All three sent the reader somewhere useless, and the
     last two sent them somewhere actively wrong, since no amount of privilege
     or router configuration changes a permission the job cannot be granted.
+
+    "Cannot be granted" turned out to be true only of a bare script. The approval
+    attaches to a signed app, and a LaunchAgent that runs zsh and an unsigned
+    python gives macOS nothing to attach it to — so no prompt is ever shown and
+    nothing appears in System Settings to switch on. Run through an app bundle,
+    the same job is asked once and then works: tools/audit_launcher builds one.
+    Measured on macOS 26.7, which is why the note now names the fix.
     """
     return (f"{what} was refused by the OS, not answered by the network. On macOS "
             "this is Local Network privacy denying a background (launchd/cron) job "
             "access to its own subnet; the same audit run from a terminal works. "
-            "It is not a privilege problem and sudo does not help — run the audit "
-            "interactively for this check.")
+            "It is not a privilege problem and sudo does not help. Either run the "
+            "audit interactively for this check, or have the scheduled job start "
+            "it through the launcher app built by tools/audit_launcher/build.sh, "
+            "which macOS can grant Local Network access to.")
 
 
 def probe_port(host, port, timeout=0.6):
@@ -6315,7 +6324,9 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None):
                   "same audit run from a terminal can. Routed hosts on other subnets\n"
                   "           still answer, which is why an upstream modem can scan "
                   "cleanly in the\n           same run. Run the audit interactively to "
-                  "scan this host.")
+                  "scan this host, or start\n           the scheduled job through the "
+                  "launcher app built by\n           tools/audit_launcher/build.sh, which "
+                  "macOS can grant this access to.")
         return None
     print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
     for p in open_ports:
