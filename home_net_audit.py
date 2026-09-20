@@ -3360,7 +3360,34 @@ def describe_returning_devices(old, new, labels=None):
     return "\n".join(lines)
 
 
-def diff_baseline(old, new):
+def describe_mac(mac, labels=None, *states):
+    """`mac` with what is known about it in brackets: the owner's label, or
+    failing that the vendor recorded for it in one of `states`.
+
+    For the change lines. "Device(s) gone: 34:64:a9:cc:57:2e" makes the reader
+    look an address up; "34:64:a9:cc:57:2e [HP Printer]" does not. Only two kinds
+    of text are ever added, and neither is the device's to choose: a label the
+    owner typed, and a vendor name from the OUI registry. What a device ANNOUNCES
+    about itself is deliberately left out — these lines sit at the top of the
+    email and are read first, and a name is free to claim.
+    """
+    # Square brackets, because labels often carry round ones of their own
+    # ("Tuya device A (6d:c6)"). _banner_text rather than _device_name_text: that
+    # one trims a trailing dot, which is right for a DNS name and wrong for
+    # "Apple, Inc."
+    label = (labels or {}).get(mac)
+    if isinstance(label, str) and _banner_text(label, 60):
+        return f"{mac} [{_banner_text(label, 60)}]"
+    for state in states:
+        for d in (state or {}).get("devices") or []:
+            if isinstance(d, dict) and str(d.get("mac", "")).lower() == mac:
+                vendor = _banner_text(d.get("vendor"), 60)
+                if vendor and vendor != PRIVATE_MAC_VENDOR:
+                    return f"{mac} [unlabelled; {vendor}]"
+    return mac
+
+
+def diff_baseline(old, new, labels=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
     #
@@ -3449,10 +3476,14 @@ def diff_baseline(old, new):
     # It is reported by describe_returning_devices — every time, by name — but
     # it is not a change. See "Remembering devices for longer than one run".
     appeared -= set(returning_devices(old, new))
+    # An arrival is described from this run, where it was seen; a departure from
+    # the baseline, the only place it still exists.
     if appeared:
-        notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
+        notes.append("NEW device(s) since baseline: "
+                     + ", ".join(describe_mac(m, labels, new) for m in sorted(appeared)))
     if vanished:
-        notes.append(f"Device(s) gone since baseline: {', '.join(sorted(vanished))}")
+        notes.append("Device(s) gone since baseline: "
+                     + ", ".join(describe_mac(m, labels, old) for m in sorted(vanished)))
     # A device that changes subnet leaves the MAC set completely unchanged, so
     # the two comparisons above are structurally blind to it — collect_devices
     # records a "subnet" per device precisely so this can be seen. It matters
@@ -3484,7 +3515,8 @@ def diff_baseline(old, new):
                 if devices_measured else []):
         was, now = old_subnets[mac], new_subnets[mac]
         if new_cov and was.isdisjoint(now) and was <= new_cov:
-            entry = f"{mac} ({', '.join(sorted(was))} -> {', '.join(sorted(now))})"
+            entry = (f"{describe_mac(mac, labels, new, old)} "
+                     f"({', '.join(sorted(was))} -> {', '.join(sorted(now))})")
             if old_cov and not now <= old_cov:
                 entry += " [the baseline never covered that destination]"
             moved.append(entry)
@@ -7419,7 +7451,7 @@ def action_compare_baseline(state):
         print("No data collected in this session to compare.")
         print("Run a Full Audit or individual checks first.")
         return
-    changes = diff_baseline(old, state)
+    changes = diff_baseline(old, state, load_labels())
     print(f"Baseline from: {old.get('timestamp', '?')}")
     # Above the verdict, because it qualifies the verdict: it is as true of a
     # short list of changes as it is of "No changes since baseline."
@@ -7718,7 +7750,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     if _freshness:
         print(_freshness)
     if old:
-        changes = diff_baseline(old, state)
+        changes = diff_baseline(old, state, load_labels())
         print(f"Baseline from: {old.get('timestamp', '?')}")
         _coverage = describe_comparison_coverage(old, state)
         if _coverage:
