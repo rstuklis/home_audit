@@ -38,6 +38,7 @@ import tempfile
 
 FLAG_RE = re.compile(r"^\s*\[(HIGH|MEDIUM|REVIEW|UNKNOWN)\s*\]\s*(.+?)\s*$")
 RULE_RE = re.compile(r"^={20,}\s*$")
+LINE_HEADER_RE = re.compile(r"^── (.+?) ─{2,}\s*$")
 NETWORK_RE = re.compile(r"^# NETWORK:\s*(.+?)\s+—")
 FROM_RE = re.compile(r"^\s*From (.+):\s*$")
 RISK_ORDER = {"HIGH": 0, "MEDIUM": 1, "REVIEW": 2, "UNKNOWN": 3}
@@ -70,7 +71,15 @@ def parse_report(text, fallback_name="network"):
         m = NETWORK_RE.match(line)
         if m:
             name = clean(m.group(1), 40)
-        # A section title is the line between two rules.
+        # A section title is the line between two rules (boxed style), or the
+        # text inside a one-line header (compact style). Both are read, since a
+        # stored report may predate the change and a fallback run may not use it.
+        m = LINE_HEADER_RE.match(line)
+        if m:
+            section = clean(m.group(1), 60)
+            origin = ""
+            i += 1
+            continue
         if RULE_RE.match(line) and i + 2 < len(lines) and RULE_RE.match(lines[i + 2]):
             section = clean(lines[i + 1], 60)
             origin = ""

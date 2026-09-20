@@ -6393,11 +6393,64 @@ def action_html_report(state):
 # Shared output helpers
 # ---------------------------------------------------------------------------
 
+HEADER_WIDTH = 64
+HEADER_BOXED = "boxed"
+HEADER_LINE = "line"
+_header_style = HEADER_BOXED
+
+
+@contextlib.contextmanager
+def header_style(style):
+    """Draw section headers in `style` for the duration of the block.
+
+    A full audit prints about twenty sections, and the boxed header costs three
+    lines each plus the blank before it. In a terminal that is what makes the
+    report scannable. In the emailed report — three audits long — it was a
+    third of the entire message: some 200 lines of rules and blanks. The line
+    style says the same thing in one line.
+    """
+    global _header_style
+    previous = _header_style
+    _header_style = style if style in (HEADER_BOXED, HEADER_LINE) else HEADER_BOXED
+    try:
+        yield
+    finally:
+        _header_style = previous
+
+
+def section_header(title=""):
+    """The header text for `title` in the current style, without the blank line
+    that precedes it. Kept separate from hr() so that anything which composes a
+    report as a string (render_host_sections_brief) draws headers identically."""
+    if _header_style == HEADER_LINE:
+        if not title:
+            return "─" * HEADER_WIDTH
+        lead = f"── {title} "
+        return lead + "─" * max(2, HEADER_WIDTH - len(lead))
+    rule = "=" * HEADER_WIDTH
+    return f"{rule}\n{title}\n{rule}" if title else rule
+
+
+_LINE_HEADER_RE = re.compile(r"^── (.+?) ─{2,}\s*$")
+
+
+def parse_section_header(lines, i):
+    """(title, lines consumed) if a section header starts at lines[i], else None.
+
+    Reads both styles, because a report can be produced in one and picked apart
+    in the other's terms — the captured host sections are.
+    """
+    m = _LINE_HEADER_RE.match(lines[i])
+    if m:
+        return m.group(1).strip(), 1
+    if (lines[i].startswith("=" * 20) and i + 2 < len(lines)
+            and lines[i + 2].startswith("=" * 20)):
+        return lines[i + 1].strip(), 3
+    return None
+
+
 def hr(title=""):
-    print("\n" + "=" * 64)
-    if title:
-        print(title)
-        print("=" * 64)
+    print("\n" + section_header(title))
 
 
 def print_network_info():
@@ -7146,9 +7199,10 @@ def capture_section(fn, *args, **kwargs):
 def _captured_section_title(text):
     """The title hr() printed at the top of a captured section, or a placeholder."""
     lines = text.splitlines()
-    for i in range(1, len(lines) - 1):
-        if lines[i - 1].startswith("=" * 20) and lines[i + 1].startswith("=" * 20):
-            return lines[i].strip()
+    for i in range(len(lines)):
+        found = parse_section_header(lines, i)
+        if found:
+            return found[0]
     return "this machine"
 
 
@@ -7170,9 +7224,7 @@ def render_host_sections_brief(sections):
     if quiet:
         names = ", ".join(t for t, _ in quiet)
         out.append("")
-        out.append("=" * 64)
-        out.append("THIS MAC (re-checked on this network)")
-        out.append("=" * 64)
+        out.extend(section_header("THIS MAC (re-checked on this network)").split("\n"))
         out.append(f"  Re-checked here and recorded in this network's baseline: {names}.")
         out.append("  Nothing rated HIGH or MEDIUM, and no listener that was not in the "
                    "baseline. The full")
@@ -7723,20 +7775,23 @@ def main():
         save_labels(labels)
         print(f"Labels saved ({len(labels)} total).\n")
 
-    state = action_full_audit(
-        full_scan=args.full,
-        no_vendors=args.no_vendors,
-        no_speedtest=args.no_speedtest,
-        upstream_ip=args.upstream,
-        tplink_password=tplink_password,
-        subnet_overrides=args.subnet,
-        extra_subnets=getattr(args, "extra_subnet", None),
-        probe_creds=args.probe_creds,
-        no_discovery=args.no_discovery,
-        no_names=args.no_names,
-        compact=args.compact,
-        host_sections_brief=args.host_sections_brief,
-    )
+    # One-line section headers whenever the report is compact: the boxed style
+    # was a third of the emailed report. Interactive and plain runs keep the box.
+    with header_style(HEADER_LINE if args.compact else HEADER_BOXED):
+        state = action_full_audit(
+            full_scan=args.full,
+            no_vendors=args.no_vendors,
+            no_speedtest=args.no_speedtest,
+            upstream_ip=args.upstream,
+            tplink_password=tplink_password,
+            subnet_overrides=args.subnet,
+            extra_subnets=getattr(args, "extra_subnet", None),
+            probe_creds=args.probe_creds,
+            no_discovery=args.no_discovery,
+            no_names=args.no_names,
+            compact=args.compact,
+            host_sections_brief=args.host_sections_brief,
+        )
 
     if args.no_save_baseline:
         pass
