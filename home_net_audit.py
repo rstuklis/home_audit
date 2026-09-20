@@ -40,6 +40,7 @@ import errno
 import hashlib
 import hmac
 import html
+import http.client
 import ipaddress
 import json
 import os
@@ -2759,6 +2760,9 @@ EVIDENCE = {
     "router_open_ports":   (MEASURED, "TCP connections this tool opened to the gateway", "Router port scan"),
     "upstream_open_ports": (MEASURED, "TCP connections this tool opened to the modem", "Upstream port scan"),
     "router_tls":          (MEASURED, "the certificate the gateway presented", "Router TLS"),
+    # Measured, because the tool asked and watched what came back. The DORMANT
+    # verdict in particular is a measurement of silence, and says so itself.
+    "upnp_listeners":      (MEASURED, "how port 1900 answered UPnP discovery and description requests", "UPnP listener probe"),
     "ipv6":                (MEASURED, "Router Advertisements seen on the link", "IPv6 routers"),
     "evil_twin":           (MEASURED, "beacons seen on the air", "Evil twin check"),
     # How many servers answered is a fact about the wire. What they offered is
@@ -4265,6 +4269,247 @@ def get_upnp_port_mappings(gateway):
     return mappings, None
 
 
+# ---------------------------------------------------------------------------
+# What is actually behind an open port 1900
+# ---------------------------------------------------------------------------
+
+# Paths the common UPnP stacks (miniupnpd, libupnp, Broadcom, Realtek) serve a
+# root device description from. A live stack answers at least one of these or
+# names its own in a discovery reply; a web server left running after the
+# feature was switched off answers 404 to all of them.
+UPNP_DESCRIPTION_PATHS = (
+    "/rootDesc.xml", "/igd.xml", "/gatedesc.xml", "/description.xml",
+    "/IGD.xml", "/upnp/IGD.xml", "/DeviceDescription.xml",
+)
+
+# The services that can forward a WAN port on request. Their presence is the
+# whole reason port 1900 is worth a second look; a media server is not.
+_UPNP_GATEWAY_MARKERS = ("internetgatewaydevice", "wanipconnection",
+                         "wanpppconnection")
+
+UPNP_LIVE_GATEWAY = "live-gateway"
+UPNP_LIVE_OTHER = "live-other"
+UPNP_DORMANT = "dormant"
+UPNP_UNKNOWN = "unknown"
+
+
+def _banner_text(value, limit=80):
+    """A header value from a device on the LAN, made safe to print."""
+    text = "".join(ch for ch in str(value or "") if ch.isprintable())
+    return text.strip()[:limit]
+
+
+SSDP_MULTICAST_ADDR = "239.255.255.250"
+
+
+def _ssdp_search(host, port=1900, wait=2.0, multicast=False):
+    """Send one SSDP M-SEARCH and collect the replies that came from `host`.
+
+    Unicast by default, straight at the host: a routed host (a modem upstream
+    of a mesh router) is not reachable by multicast at all. With `multicast`
+    the same question goes to the SSDP group instead, because some stacks —
+    MiniUPnPd on a Google Nest among them, measured — answer the group address
+    and ignore a unicast search entirely. Asking only one way reads a working
+    gateway as silent.
+
+    Returns (replies, refused) where `replies` is the text of every datagram
+    that came back FROM THAT HOST — anyone on the link can answer a discovery,
+    and somebody else's answer says nothing about this listener — and
+    `refused` is True when the OS never let the question leave.
+    """
+    dest = SSDP_MULTICAST_ADDR if multicast else host
+    msearch = ("M-SEARCH * HTTP/1.1\r\n"
+               f"HOST: {dest}:{port}\r\n"
+               "MAN: \"ssdp:discover\"\r\n"
+               "MX: 1\r\n"
+               "ST: ssdp:all\r\n"
+               "\r\n")
+    replies = []
+    refused = False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return [], e.errno in UNREACHABLE_ERRNOS
+    try:
+        sock.settimeout(wait)
+        sock.sendto(msearch.encode(), (dest, port))
+        deadline = time.time() + wait
+        # ssdp:all earns one datagram per device and service, so keep reading
+        # until the window closes. Capped: the count is set by the responder.
+        while time.time() < deadline and len(replies) < 32:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            if addr[0] == host:
+                replies.append(data.decode("utf-8", "ignore"))
+    except OSError as e:
+        refused = e.errno in UNREACHABLE_ERRNOS
+    finally:
+        sock.close()
+    return replies, refused
+
+
+def _http_get_plain(host, port, path, timeout=3.0, limit=65536):
+    """One plain GET. Returns (status, server_header, body) or None if no HTTP came back.
+
+    http.client rather than urllib on purpose: it follows no redirects and
+    reads no proxy settings, so the request goes to the host being asked about
+    and nowhere a device on the LAN might prefer to send it.
+    """
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", path, headers={"User-Agent": "home_net_audit",
+                                           "Connection": "close"})
+        resp = conn.getresponse()
+        body = resp.read(limit).decode("utf-8", "ignore")
+        return resp.status, resp.getheader("Server") or "", body
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def _looks_like_upnp_description(body):
+    return "urn:schemas-upnp-org" in (body or "").lower()
+
+
+def classify_upnp_listener(host, port=1900, onlink=None):
+    """Work out what an open TCP port 1900 is actually doing.
+
+    A port scan can only say the port accepted a connection. That is the same
+    answer for a router that will forward a WAN port to anyone who asks and for
+    one whose UPnP was switched off while the SDK's little web server stayed
+    up — and the second case is common enough (libupnp-based modems do it) that
+    the bare "[REVIEW] 1900" sends people to disable a feature they already
+    disabled. So ask the listener the two things a live UPnP stack answers:
+
+      * an SSDP discovery — unicast to the host itself, and by multicast as
+        well unless the host is known to be off-link, where multicast cannot
+        reach it;
+      * a GET for a device description, at the advertised LOCATION if discovery
+        gave one and at the well-known paths either way.
+
+    Returns {"state", "risk", "server", "summary", "caveat"} where state is one
+    of UPNP_LIVE_GATEWAY / UPNP_LIVE_OTHER / UPNP_DORMANT / UPNP_UNKNOWN.
+
+    The two live verdicts rest on something the device said, which it had no
+    reason to say unless true. DORMANT rests on silence, and silence is weaker:
+    it is reported as what was observed, never as "UPnP is off". `onlink` sharpens
+    that — False means multicast discovery was never possible from here, so a
+    stack that ignores unicast searches cannot be told from a dormant one.
+    """
+    replies, refused = _ssdp_search(host, port)
+    if not replies and onlink is not False:
+        # Default multicast TTL is 1, so this never leaves the local link.
+        replies, mc_refused = _ssdp_search(host, port, multicast=True)
+        refused = refused or mc_refused
+
+    server = ""
+    http_answered = False
+    descriptions = []
+
+    # A LOCATION is only followed back to the host that was asked, over plain
+    # http — the same rule get_upnp_port_mappings applies, for the same reason.
+    targets = []
+    for text in replies:
+        m = re.search(r"(?im)^LOCATION:\s*(\S+)", text)
+        if m and _upnp_url_points_at(m.group(1), host):
+            parts = urllib.parse.urlsplit(m.group(1))
+            if parts.scheme == "http":
+                target = (parts.port or 80, parts.path or "/")
+                if target not in targets:
+                    targets.append(target)
+        if not server:
+            sm = re.search(r"(?im)^SERVER:\s*(.+)$", text)
+            if sm:
+                server = _banner_text(sm.group(1))
+    targets = targets[:4] + [(port, path) for path in ("/",) + UPNP_DESCRIPTION_PATHS]
+
+    for t_port, t_path in targets:
+        got = _http_get_plain(host, t_port, t_path)
+        if got is None:
+            # Nothing on this port speaks HTTP; the remaining well-known paths
+            # on the same port would only repeat the timeout.
+            if t_port == port:
+                break
+            continue
+        status, srv, body = got
+        if t_port == port:
+            http_answered = True
+        if srv and not server:
+            server = _banner_text(srv)
+        if status == 200 and _looks_like_upnp_description(body):
+            descriptions.append(body)
+            break
+
+    said = "\n".join(replies + descriptions).lower()
+    verdict = {"server": server, "caveat": ""}
+
+    if any(marker in said for marker in _UPNP_GATEWAY_MARKERS):
+        verdict.update(
+            state=UPNP_LIVE_GATEWAY, risk="REVIEW",
+            summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
+                     "ports for any device that asks; turn UPnP off on this "
+                     "device unless something needs it."))
+    elif replies or descriptions:
+        verdict.update(
+            state=UPNP_LIVE_OTHER, risk="INFO",
+            summary=("LIVE, but not a gateway service — UPnP answered without "
+                     "offering port forwarding (typically media or USB sharing). "
+                     "It cannot open WAN ports."))
+    elif http_answered:
+        verdict.update(
+            state=UPNP_DORMANT, risk="INFO",
+            summary=("DORMANT — the port is open but nothing behind it answered "
+                     "as UPnP: no reply to discovery, no device description. "
+                     "Typical of a UPnP web server left running after the "
+                     "feature was switched off."))
+        if onlink is False:
+            verdict["caveat"] = (
+                "This host is on another subnet, so only unicast discovery could "
+                "be tried; a stack that answers multicast alone would look the "
+                "same. Confirm against the device's own UPnP setting.")
+        else:
+            verdict["caveat"] = (
+                "Silence is weaker evidence than an answer: this is what was "
+                "observed, not proof the feature is off.")
+    else:
+        verdict.update(
+            state=UPNP_UNKNOWN, risk="REVIEW",
+            summary=(local_network_denied_note("The UPnP probe") if refused else
+                     "UNKNOWN — the port accepted a connection but answered "
+                     "neither discovery nor HTTP, so what is listening could "
+                     "not be determined."))
+    return verdict
+
+
+def describe_upnp_listener(verdict, indent="           "):
+    """The lines audit_host prints under an open port 1900."""
+    width = 78 - len(indent)
+    lines = []
+    for text in (verdict.get("summary"), verdict.get("caveat")):
+        if not text:
+            continue
+        line = ""
+        for word in text.split():
+            if line and len(line) + 1 + len(word) > width:
+                lines.append(indent + line)
+                line = word
+            else:
+                line = f"{line} {word}".strip()
+        if line:
+            lines.append(indent + line)
+    if verdict.get("server"):
+        lines.append(f"{indent}Server banner: {verdict['server']}")
+    return lines
+
+
 def action_upnp_dump():
     hr("UPnP PORT MAPPING DUMP")
     gateway = get_default_gateway()
@@ -5292,7 +5537,7 @@ RENDERED_STATE_KEYS = frozenset({
     "devices", "scanned_subnets", "wifi", "wifi_bssids", "arp_spoof", "firewall",
     "sharing", "default_creds", "speed_download_mbps", "speed_upload_mbps",
     "upnp", "dhcp", "listening", "router_hostname", "evil_twin", "ipv6",
-    "ipv6_routers", "interception", "router_tls", "dsl",
+    "ipv6_routers", "interception", "router_tls", "dsl", "upnp_listeners",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
 })
@@ -5396,8 +5641,16 @@ def generate_html_report(state, output_path=None):
         if ports:
             rows = []
             colours = []
+            listeners = state.get("upnp_listeners")
+            probed = (listeners.get(state.get("gateway"))
+                      if isinstance(listeners, dict) else None)
             for p in ports:
                 svc, risk, note = PORTS_OF_INTEREST.get(p, ("unknown", "REVIEW", "Investigate."))
+                if p == 1900 and isinstance(probed, dict) and probed.get("summary"):
+                    # The probe's verdict, not the generic warning it replaces:
+                    # the table must not contradict the section below it.
+                    risk = probed.get("risk", risk)
+                    note = probed["summary"]
                 rows.append([str(p), svc, risk_badge(risk), note])
                 colours.append(RISK_COLOUR.get(risk, ""))
             body = table(["Port", "Service", "Risk", "Note"], rows, colours)
@@ -5663,6 +5916,26 @@ def generate_html_report(state, output_path=None):
             body = f"<p>{risk_badge('OK')} No open ports found on the upstream modem.</p>"
         sections_html += section("Upstream Modem Ports", body)
 
+    # What an open port 1900 turned out to be
+    listeners = state.get("upnp_listeners")
+    if isinstance(listeners, dict) and listeners:
+        rows = []
+        colours = []
+        for listener_host, v in sorted(listeners.items()):
+            if not isinstance(v, dict):
+                continue
+            risk = v.get("risk", "REVIEW")
+            finding = " ".join(t for t in (v.get("summary"), v.get("caveat")) if t)
+            rows.append([listener_host, risk_badge(risk), finding,
+                         v.get("server") or "not given"])
+            colours.append(RISK_COLOUR.get(str(risk).upper(), ""))
+        if rows:
+            body = ("<p>Port 1900 was open, which a port scan reports the same way "
+                    "whether UPnP is working or switched off. Each listener was "
+                    "asked directly.</p>"
+                    + table(["Host", "Risk", "Finding", "Server banner"], rows, colours))
+            sections_html += section("UPnP Listener Probe", body)
+
     # DSL line stats
     if "dsl" in state:
         d = state["dsl"]
@@ -5822,10 +6095,17 @@ def print_network_info():
 # Individual audit actions (original)
 # ---------------------------------------------------------------------------
 
-def audit_host(label, host, full_scan=False):
+def audit_host(label, host, full_scan=False, onlink=None, verdicts=None):
     """Port-scan one host, print a risk-annotated summary, and return open ports.
 
     Shared by action_port_scan and action_full_audit (previously duplicated).
+
+    An open port 1900 is followed up with classify_upnp_listener, because "open"
+    is the same answer for live UPnP and for a web server left behind when UPnP
+    was switched off. `onlink` says whether the host shares a subnet with this
+    machine (None = not known) and only tempers that verdict's wording. If
+    `verdicts` is a dict, the verdict is stored in it under the host's address
+    so the caller can keep it; the return value stays the list of ports.
     """
     port_set = range(1, 65536) if full_scan else COMMON_PORTS
     n = "all 65535" if full_scan else str(len(COMMON_PORTS))
@@ -5854,6 +6134,15 @@ def audit_host(label, host, full_scan=False):
     for p in open_ports:
         svc, risk, note = PORTS_OF_INTEREST.get(
             p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
+        if p == 1900:
+            verdict = classify_upnp_listener(host, p, onlink=onlink)
+            if verdicts is not None:
+                verdicts[host] = verdict
+            print(f"  [{verdict['risk']:6}] {p:>5}  {svc:<14} "
+                  "UPnP port. Probed to see what is behind it:")
+            for line in describe_upnp_listener(verdict):
+                print(line)
+            continue
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
     tls = check_tls(host)
     if tls.get("sha256"):
@@ -5868,17 +6157,19 @@ def audit_host(label, host, full_scan=False):
 
 def action_port_scan(full_scan=False, upstream_ip=None):
     hr("PORT SCAN")
-    _, _, gateway = print_network_info()
+    interfaces, _, gateway = print_network_info()
 
     open_ports = []
     if gateway:
-        open_ports = audit_host("default gateway", gateway, full_scan)
+        open_ports = audit_host("default gateway", gateway, full_scan,
+                                onlink=is_onlink(gateway, interfaces))
     else:
         print("Could not determine default gateway.")
 
     if upstream_ip:
         hr("UPSTREAM MODEM")
-        audit_host("upstream modem", upstream_ip, full_scan)
+        audit_host("upstream modem", upstream_ip, full_scan,
+                   onlink=is_onlink(upstream_ip, interfaces))
 
     return gateway, open_ports
 
@@ -6230,12 +6521,21 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     # Port scan
     hr("ROUTER / GATEWAY PORT SCAN")
+    # What an open port 1900 turned out to be, per scanned host. Only present
+    # when a scan found one, so a run with nothing to classify gains no key.
+    upnp_listeners = {}
     if gateway:
-        state["router_open_ports"] = audit_host("default gateway", gateway, full_scan)
+        state["router_open_ports"] = audit_host(
+            "default gateway", gateway, full_scan,
+            onlink=is_onlink(gateway, interfaces), verdicts=upnp_listeners)
         state["router_tls"] = check_tls(gateway)
     if upstream_ip:
         hr("UPSTREAM MODEM")
-        state["upstream_open_ports"] = audit_host("upstream modem", upstream_ip, full_scan)
+        state["upstream_open_ports"] = audit_host(
+            "upstream modem", upstream_ip, full_scan,
+            onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners)
+    if upnp_listeners:
+        state["upnp_listeners"] = upnp_listeners
 
     # DSL stats
     if tplink_password:
