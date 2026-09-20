@@ -706,14 +706,25 @@ def check_ipv6_routers(known=None):
                     "compare against yet — save one so a second router would show up."}
 
 
-def action_ipv6_routers(known=None):
+def action_ipv6_routers(known=None, compact=False):
     hr("IPv6 ROUTER ADVERTISEMENTS")
     result = check_ipv6_routers(known)
     neighbours = get_ipv6_neighbours()
     print(f"  IPv6 neighbours seen : {len(neighbours)}")
+    # Compact keeps the rows this section exists for — whoever is advertising
+    # as a router — and drops the rest. The others are privacy addresses that
+    # rotate by design, so the list differs on every run and says nothing by
+    # doing so; nothing is compared against it.
+    shown = 0
     for addr, n in sorted(neighbours.items()):
+        if compact and not n.get("router"):
+            continue
         flag = "  <-- advertising as a router" if n.get("router") else ""
         print(f"    {addr:<42} {n['mac']}{flag}")
+        shown += 1
+    if compact and len(neighbours) > shown:
+        print(f"    ({len(neighbours) - shown} ordinary neighbour(s) not listed; "
+              "run without --compact to see them)")
     print(f"  [{result['risk']:6}] {result['note']}")
     return result
 
@@ -2838,11 +2849,15 @@ def findings_by_evidence(state):
     return {cls: sorted(keys) for cls, keys in grouped.items()}
 
 
-def describe_evidence_basis(state):
+def describe_evidence_basis(state, compact=False):
     """The report block naming which findings came from the thing they describe.
 
     Silent when this run produced none of them, so a report with nothing to
     qualify gains no paragraph telling the reader that nothing needs qualifying.
+
+    `compact` keeps the list — which findings are second-hand is a fact about
+    this run — and folds the standing explanation of what that means into one
+    line, since a combined report would otherwise carry it once per network.
     """
     grouped = findings_by_evidence(state)
     dependent = [(cls, key)
@@ -2859,6 +2874,13 @@ def describe_evidence_basis(state):
     for cls, key in dependent:
         _cls, basis, label = EVIDENCE[key]
         lines.append(f"    [{_EVIDENCE_TAG[cls]:13}] {label:{width}}  — {basis}")
+    if compact:
+        lines.append("  A clean result from these is weak evidence; anything they admit "
+                     "to is strong.")
+        if independent:
+            lines.append(f"  The other {independent} finding(s) are this machine's own "
+                         "state or measurements.")
+        return "\n".join(lines)
     lines.append("")
     lines.append("  Take seriously anything they admit to: a router listing a port "
                  "mapping has")
@@ -5448,7 +5470,49 @@ def classify_listeners(services, system_ports):
     return {"system": system, "named": named, "unattributed": unattributed}
 
 
-def action_listening_services():
+EPHEMERAL_PORT_FLOOR = 49152
+
+
+def listener_fingerprint(services):
+    """The set a list of listeners is compared by.
+
+    Ports from 49152 up are handed out by the OS and move on every boot, so the
+    same daemon on a different dynamic port is the same listener: those are
+    compared by protocol and process alone. Everything below is compared by
+    number as well — a fixed port is a choice somebody made, and a new one is
+    exactly what this section is looking for.
+    """
+    prints = set()
+    for s in services or []:
+        if not isinstance(s, dict):
+            continue
+        try:
+            port = int(s.get("port"))
+        except (TypeError, ValueError):
+            continue
+        proto, proc = str(s.get("proto", "")), str(s.get("process", ""))
+        prints.add((proto, proc, "dynamic") if port >= EPHEMERAL_PORT_FLOOR
+                   else (proto, proc, port))
+    return prints
+
+
+def _describe_fingerprint(fp):
+    proto, proc, port = fp
+    where = "a dynamic port" if port == "dynamic" else f"port {port}"
+    return f"{proc if proc and proc != '?' else 'unattributed'} on {proto} {where}"
+
+
+def action_listening_services(compact=False, known=None):
+    """List this machine's listeners.
+
+    With `compact`, and only when nothing is listening that was not in `known`
+    (the baseline's list), the table is replaced by a line saying so. Anything
+    NEW always gets the full table, with the newcomer spelled out under it:
+    compact may shorten a report that has nothing new in it and nothing else.
+    A listener that went away does not hold the table open — short-lived system
+    sockets come and go all day, and a closed port is not what this section is
+    watching for — but it is still named.
+    """
     hr("LISTENING SERVICES AUDIT")
     print("  Checking what processes on this Mac accept inbound connections...")
     services = check_listening_services()
@@ -5466,6 +5530,19 @@ def action_listening_services():
     groups = classify_listeners(services, SYSTEM_PORTS)
     unattributed = groups["unattributed"]
     named = groups["named"]
+
+    now, before = listener_fingerprint(services), listener_fingerprint(known)
+    if compact and before and not (now - before):
+        names = sorted({s["process"] for s in named if s.get("process") not in ("", "?")})
+        print(f"\n  {len(services)} listener(s), none of them new since the baseline: "
+              f"{len(named)} named non-system"
+              + (f" ({', '.join(names)})" if names else "")
+              + f", {len(unattributed)} unattributed,")
+        print(f"  {len(services) - len(named) - len(unattributed)} system. Dynamic port "
+              "numbers are not compared. Table omitted (--compact).")
+        for fp in sorted(before - now, key=str):
+            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
+        return services
 
     print(f"\n  {'Port':<7} {'Proto':<6} {'Process':<22} Note")
     print(f"  {'-'*5:<7} {'-'*5:<6} {'-'*20:<22} {'-'*30}")
@@ -5492,6 +5569,11 @@ def action_listening_services():
         print(f"    Ports: {ports}{more}")
     if not named and not unattributed:
         print("\n  No unexpected listeners found.")
+    if compact and before and now != before:
+        for fp in sorted(now - before, key=str):
+            print(f"  + not in the baseline: {_describe_fingerprint(fp)}")
+        for fp in sorted(before - now, key=str):
+            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
 
     return services
 
@@ -7008,7 +7090,7 @@ def action_compare_baseline(state):
 def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
                       extra_subnets=None, probe_creds=False, no_discovery=False,
-                      no_names=False):
+                      no_names=False, compact=False):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -7138,7 +7220,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     state["wifi_bssids"] = remembered_bssids(
         (load_baseline() or {}).get("wifi_bssids"), twin["bssids"])
 
-    ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
+    ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"), compact=compact)
     state["ipv6"] = ra
     state["ipv6_routers"] = ra["routers"]
 
@@ -7149,7 +7231,8 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     state["sharing"] = [{"name": s["name"], "enabled": s["enabled"],
                           "risk": s["risk"], "note": s["note"]} for s in sharing]
 
-    listening = action_listening_services()
+    listening = action_listening_services(
+        compact=compact, known=(load_baseline() or {}).get("listening"))
     state["listening"] = listening
 
     rh = action_router_hostname()
@@ -7211,7 +7294,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     else:
         print("No baseline saved yet. Use option 5 after reviewing results.")
 
-    _basis = describe_evidence_basis(state)
+    _basis = describe_evidence_basis(state, compact=compact)
     if _basis:
         hr("EVIDENCE PROVENANCE")
         print(_basis)
@@ -7431,6 +7514,11 @@ def main():
     ap.add_argument("--no-names", action="store_true",
                     help="Skip asking devices what they call themselves "
                          "(mDNS, UPnP and the gateway's DNS)")
+    ap.add_argument("--compact", action="store_true",
+                    help="Shorter report for email: omit the listener table when it "
+                         "matches the baseline, list only the IPv6 neighbours that "
+                         "advertise as routers, and fold the provenance explanation. "
+                         "Anything that changed is always printed in full.")
     ap.add_argument("--no-save-baseline", action="store_true",
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
@@ -7473,7 +7561,8 @@ def main():
 
     cli_args_given = any([
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
-        args.full, args.no_vendors, args.no_names, args.no_save_baseline, args.label,
+        args.full, args.no_vendors, args.no_names, args.compact,
+        args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
         args.seal_baseline, args.publish_to, args.monitor,
@@ -7523,6 +7612,7 @@ def main():
         probe_creds=args.probe_creds,
         no_discovery=args.no_discovery,
         no_names=args.no_names,
+        compact=args.compact,
     )
 
     if args.no_save_baseline:
