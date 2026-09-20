@@ -6640,7 +6640,61 @@ def print_network_info():
 # Individual audit actions (original)
 # ---------------------------------------------------------------------------
 
-def audit_host(label, host, full_scan=False, onlink=None, verdicts=None):
+UPSTREAM_REFERENCE_MAX_AGE_MIN = 60
+
+
+def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
+    """What an earlier network in the same report saw when it scanned the modem.
+
+    A house with several networks behind one modem scans that modem once per
+    network, and from most of them the answer is the same. The wrapper passes
+    the baseline the first network just saved; this reads the two facts from it
+    that the modem section turns on — the open ports, and what an open port 1900
+    was classified as — so that a later network can say "same as from there"
+    instead of repeating the section.
+
+    Returns {"ports", "upnp_state", "network", "age_min"} or None. None whenever
+    the reference cannot honestly be called the same report: unreadable, no
+    modem scan in it, about this very network, or older than an hour.
+
+    The file is NOT trusted for anything the reader will see. The ports printed
+    are always the ones this run measured; the reference can only make the
+    section shorter when the two already agree, and a forged one that happens to
+    agree with reality has changed nothing.
+    """
+    try:
+        with open(path) as f:
+            record = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    state = record.get("state") if isinstance(record, dict) else None
+    if not isinstance(state, dict):
+        return None
+    ports = state.get("upstream_open_ports")
+    if not (isinstance(ports, list) and all(isinstance(p, int) for p in ports)):
+        return None
+    # A value carried forward from an older run was not measured in this report.
+    if "upstream_open_ports" in (state.get("carried_forward") or []):
+        return None
+    stamp = _parse_stamp(state.get("timestamp"))
+    now = now or datetime.now(timezone.utc)
+    if stamp is None or not (timedelta(0) <= now - stamp <= timedelta(minutes=UPSTREAM_REFERENCE_MAX_AGE_MIN)):
+        return None
+    subnets = [x for x in (state.get("scanned_subnets") or []) if isinstance(x, str)]
+    subnet = subnets[0] if subnets else None
+    if subnet and current_subnet and subnet == str(current_subnet):
+        return None
+    listeners = state.get("upnp_listeners")
+    verdict = listeners.get(upstream_ip) if isinstance(listeners, dict) else None
+    upnp_state = verdict.get("state") if isinstance(verdict, dict) else None
+    name = network_name_for_subnet(subnet, load_networks()) if subnet else ""
+    return {"ports": sorted(ports),
+            "upnp_state": upnp_state if isinstance(upnp_state, str) else None,
+            "network": _device_name_text(name or subnet or "an earlier network", 40),
+            "age_min": int((now - stamp).total_seconds() // 60)}
+
+
+def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None):
     """Port-scan one host, print a risk-annotated summary, and return open ports.
 
     Shared by action_port_scan and action_full_audit (previously duplicated).
@@ -6651,6 +6705,13 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None):
     machine (None = not known) and only tempers that verdict's wording. If
     `verdicts` is a dict, the verdict is stored in it under the host's address
     so the caller can keep it; the return value stays the list of ports.
+
+    `reference` (see load_upstream_reference) is what an earlier network in the
+    same report found on this host. When this scan agrees with it — the same
+    open ports and the same verdict on port 1900 — the section is printed in
+    brief: the measured ports, every line rated above INFO, the certificate, and
+    a pointer to the full section. Everything is still measured and returned;
+    any disagreement at all prints the section in full, with a note saying so.
     """
     port_set = range(1, 65536) if full_scan else COMMON_PORTS
     n = "all 65535" if full_scan else str(len(COMMON_PORTS))
@@ -6678,17 +6739,51 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None):
                   "macOS can grant this access to.")
         return None
     print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
+    # Classified before anything is printed, because whether the section can be
+    # brief depends on the verdict as much as on the port list.
+    verdict = None
+    if 1900 in open_ports:
+        verdict = classify_upnp_listener(host, 1900, onlink=onlink)
+        if verdicts is not None:
+            verdicts[host] = verdict
+
+    brief = False
+    if isinstance(reference, dict):
+        same_ports = sorted(open_ports) == reference.get("ports")
+        same_upnp = (verdict or {}).get("state") == reference.get("upnp_state")
+        brief = same_ports and same_upnp
+        if brief:
+            print(f"  The same open ports"
+                  + (f", and the same verdict on port 1900 ({verdict['state']})," if verdict else "")
+                  + f" as seen from {reference['network']} "
+                  f"{reference['age_min']} min ago. The full section is under that network;")
+            print("  below are only the lines rated above INFO, measured again from here.")
+        else:
+            # A note, deliberately not a rated finding. Networks behind one modem
+            # need not agree — a guest network is cut off from it by design and
+            # sees nothing, every week — so rating the difference would mint a
+            # permanent false flag. What is worth an alarm is this network's view
+            # CHANGING, and its own baseline comparison already watches for that.
+            what = "open ports" if not same_ports else "verdict on port 1900"
+            print(f"  Note: the {what} seen from here differ from what {reference['network']} "
+                  f"saw {reference['age_min']} min ago")
+            print(f"  ({reference['ports']}"
+                  + (f", port 1900 {reference['upnp_state']}" if reference.get("upnp_state") else "")
+                  + "), so this section is printed in full. A guest network that is")
+            print("  isolated from the modem is expected to differ.")
+
     for p in open_ports:
         svc, risk, note = PORTS_OF_INTEREST.get(
             p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
         if p == 1900:
-            verdict = classify_upnp_listener(host, p, onlink=onlink)
-            if verdicts is not None:
-                verdicts[host] = verdict
+            if brief and verdict["risk"] == "INFO":
+                continue
             print(f"  [{verdict['risk']:6}] {p:>5}  {svc:<14} "
                   "UPnP port. Probed to see what is behind it:")
             for line in describe_upnp_listener(verdict):
                 print(line)
+            continue
+        if brief and risk == "INFO":
             continue
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
     tls = check_tls(host)
@@ -7420,7 +7515,8 @@ def render_host_sections_brief(sections):
 def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
                       extra_subnets=None, probe_creds=False, no_discovery=False,
-                      no_names=False, compact=False, host_sections_brief=False):
+                      no_names=False, compact=False, host_sections_brief=False,
+                      upstream_reference=None):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -7447,7 +7543,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         hr("UPSTREAM MODEM")
         state["upstream_open_ports"] = audit_host(
             "upstream modem", upstream_ip, full_scan,
-            onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners)
+            onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners,
+            reference=(load_upstream_reference(upstream_reference, upstream_ip, _subnet)
+                       if upstream_reference else None))
     if upnp_listeners:
         state["upnp_listeners"] = upnp_listeners
 
@@ -7868,6 +7966,12 @@ def main():
                          "sharing services and listeners, but print them in a few "
                          "lines. Anything HIGH, MEDIUM or newly listening is still "
                          "printed in full.")
+    ap.add_argument("--upstream-reference", metavar="BASELINE_FILE",
+                    help="For the second and later networks of a multi-network "
+                         "report: the baseline an earlier network just saved. If "
+                         "this network's scan of the upstream modem agrees with it, "
+                         "the modem section is printed in brief. The scan still "
+                         "runs, and any disagreement prints the section in full.")
     ap.add_argument("--no-save-baseline", action="store_true",
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
@@ -7911,7 +8015,7 @@ def main():
     cli_args_given = any([
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
         args.full, args.no_vendors, args.no_names, args.compact,
-        args.host_sections_brief,
+        args.host_sections_brief, args.upstream_reference,
         args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
@@ -7967,6 +8071,7 @@ def main():
             no_names=args.no_names,
             compact=args.compact,
             host_sections_brief=args.host_sections_brief,
+        upstream_reference=args.upstream_reference,
         )
 
     if args.no_save_baseline:
