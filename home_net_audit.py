@@ -3339,10 +3339,23 @@ def diff_baseline(old, new):
             notes.append(f"Port(s) now closed on {host}: {sorted(old_ports - new_ports)}")
     old_bssids = set(old.get("wifi_bssids", []))
     new_bssids = set(new.get("wifi_bssids", []))
-    if new_bssids - old_bssids:
-        notes.append(
-            f"NEW access point advertising your SSID: {sorted(new_bssids - old_bssids)}. "
-            "A second AP broadcasting your network name is an evil twin.")
+    # Only against a list that has something in it. An empty one means BSSIDs
+    # had never been readable — the state of every Mac until the Wi-Fi helper is
+    # installed — and comparing against it reports the owner's entire mesh as
+    # evil twins on the first run that can finally see it. check_evil_twin makes
+    # the same distinction ("No baseline yet").
+    if old_bssids and new_bssids - old_bssids:
+        siblings, strangers = split_unexpected_bssids(
+            sorted(new_bssids - old_bssids), sorted(old_bssids))
+        if strangers:
+            notes.append(
+                f"NEW access point advertising your SSID: {strangers}. "
+                "A second AP broadcasting your network name is an evil twin.")
+        if siblings:
+            notes.append(
+                f"Another radio heard on a known access point: {siblings}. One octet "
+                "from a BSSID already in the baseline, so most likely the same unit's "
+                "other band rather than a new device.")
 
     old_offer = (old.get("dhcp") or {}).get("responders") or []
     new_offer = (new.get("dhcp") or {}).get("responders") or []
@@ -3757,6 +3770,124 @@ def parse_wifi_networks(text):
     return {k: v for k, v in networks.items() if v}
 
 
+# ---------------------------------------------------------------------------
+# The Wi-Fi helper: the one way past Location Services for a terminal tool
+# ---------------------------------------------------------------------------
+
+WIFI_HELPER_ENV = "HOME_NET_AUDIT_WIFI_HELPER"
+_WIFI_HELPER_RELPATH = "Applications/HomeAuditWiFi.app/Contents/MacOS/HomeAuditWiFi"
+
+
+def wifi_helper_path():
+    """Where the helper binary is expected. Resolved at call time, not import
+    time, so $HOME and the override are read when they are actually in force."""
+    return (os.environ.get(WIFI_HELPER_ENV)
+            or os.path.join(os.path.expanduser("~"), _WIFI_HELPER_RELPATH))
+
+
+def _normalise_bssid(value):
+    """'3c:28:6d:5e:20:8a' from whatever CoreWLAN printed, or None.
+
+    CoreWLAN drops leading zeros ('0:1a:2b:…'), and a baseline comparison is a
+    string comparison, so the same access point must always spell the same.
+    """
+    raw = str(value or "").strip().split(":")
+    if len(raw) != 6:
+        return None
+    try:
+        return ":".join(f"{int(x, 16):02x}" for x in raw)
+    except ValueError:
+        return None
+
+
+def read_wifi_helper(scan=False):
+    """Ask the HomeAuditWiFi helper app for the SSID and BSSIDs macOS withholds.
+
+    macOS gives the SSID and every BSSID only to a process with Location
+    Services access, and the advice this tool used to print — grant it to your
+    terminal — cannot be followed: Terminal never requests that access, and the
+    Location Services list has no way to add an app that has not asked. An app
+    that asks for itself can be approved, so tools/wifi_helper builds one. It
+    reads the Wi-Fi interface, prints one JSON object and exits.
+
+    Returns {"installed", "authorization", "ssid", "bssid", "bssids", "error"}.
+    Everything in the reply is validated before use: it arrives as text from
+    another program, and it ends up printed, compared and saved.
+
+    What this does to the evidence: the SSID and BSSIDs are still measurements
+    of beacons on the air, but read by a second program on this host rather
+    than by system_profiler. A compromised host could replace either.
+    """
+    path = wifi_helper_path()
+    result = {"installed": False, "authorization": None, "ssid": None,
+              "bssid": None, "bssids": [], "error": None}
+    if sys.platform != "darwin" or not os.path.isfile(path):
+        return result
+    result["installed"] = True
+
+    out = run([path] + (["--scan"] if scan else []), timeout=30)
+    try:
+        reply = json.loads(out) if out and out.strip() else None
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict) or reply.get("helper") != 1:
+        result["error"] = "the helper ran but did not return a reply this tool understands"
+        return result
+
+    auth = reply.get("authorization")
+    if auth in ("authorized", "denied", "restricted", "not_determined"):
+        result["authorization"] = auth
+    if reply.get("location_services_on") is False:
+        result["authorization"] = "location_services_off"
+
+    ssid = reply.get("ssid")
+    # 32 bytes is the 802.11 limit; printable, because it is about to be printed.
+    if (isinstance(ssid, str) and 0 < len(ssid.encode("utf-8")) <= 32
+            and ssid.isprintable()):
+        result["ssid"] = ssid
+    result["bssid"] = _normalise_bssid(reply.get("bssid"))
+
+    seen = reply.get("same_ssid_bssids")
+    found = []
+    for b in (seen if isinstance(seen, list) else [])[:64]:
+        nb = _normalise_bssid(b)
+        if nb and nb not in found:
+            found.append(nb)
+    # The access point this machine is associated with is advertising the SSID
+    # by definition, whether or not this particular scan happened to hear it.
+    if result["ssid"] and result["bssid"] and result["bssid"] not in found:
+        found.append(result["bssid"])
+    result["bssids"] = sorted(found)
+    if isinstance(reply.get("scan_error"), str):
+        result["error"] = _banner_text(reply["scan_error"], 120)
+    return result
+
+
+def wifi_name_withheld_note(helper, what="the connected SSID"):
+    """Why the SSID/BSSIDs could not be read, in words that can be acted on."""
+    app = os.path.dirname(os.path.dirname(os.path.dirname(wifi_helper_path())))
+    if not helper.get("installed"):
+        return (f"Could not read {what}. macOS withholds it from a process without "
+                "Location Services access, and a terminal cannot be given that "
+                "access: it never asks, and the list has no way to add it. Build "
+                "the small helper app that can ask — run tools/wifi_helper/build.sh "
+                "from the audit's folder, then approve its prompt. Running with sudo "
+                "does not help; the gate is the permission, not the user.")
+    auth = helper.get("authorization")
+    if auth == "location_services_off":
+        return (f"Could not read {what}: Location Services is switched off for this "
+                "Mac. Turn it on in System Settings > Privacy & Security > Location "
+                "Services.")
+    if auth in ("denied", "restricted", "not_determined"):
+        return (f"Could not read {what}: the Wi-Fi helper is installed but its "
+                f"Location Services access is '{auth}'. Allow \"Home Audit Wi-Fi\" in "
+                "System Settings > Privacy & Security > Location Services, or run:  "
+                f"open -W \"{app}\" --args --prompt")
+    detail = helper.get("error") or "it reported no network — is this Mac on Wi-Fi?"
+    return (f"Could not read {what}: the Wi-Fi helper has Location Services access "
+            f"but {detail}.")
+
+
 def check_evil_twin(ssid=None, known=None):
     """Flag a BSSID advertising your SSID that was not in the baseline.
 
@@ -3769,34 +3900,86 @@ def check_evil_twin(ssid=None, known=None):
     if ssid is None:
         ssid, _ = _parse_connected_wifi_block(out)
 
+    # system_profiler first, because it needs nothing installed. When macOS has
+    # redacted its answer, the helper app is the only reader left.
+    helper = None
     if not ssid or ssid == "<redacted>":
-        return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                "note": "Could not read the connected SSID. macOS withholds it "
-                        "from a process without Location Services access — grant "
-                        "it to this terminal in System Settings > Privacy & "
-                        "Security > Location Services. Running with sudo does "
-                        "not help; the gate is the permission, not the user."}
+        helper = read_wifi_helper(scan=True)
+        ssid = helper["ssid"]
+        if not ssid:
+            return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
+                    "note": wifi_name_withheld_note(helper)}
 
     bssids = networks.get(ssid, [])
     if not bssids:
+        if helper is None:
+            helper = read_wifi_helper(scan=True)
+        if helper["ssid"] == ssid:
+            bssids = list(helper["bssids"])
+    if not bssids:
         return {"ssid": ssid, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                "note": f"No BSSID visible for {ssid}. BSSIDs are withheld from a "
-                        "process without Location Services access — grant it in "
-                        "System Settings > Privacy & Security > Location Services. "
-                        "sudo does not reveal them."}
+                "note": wifi_name_withheld_note(helper, what=f"any BSSID for {ssid}")}
 
     known = list(known or [])
     unexpected = [b for b in bssids if b not in known] if known else []
-    if unexpected:
+    siblings, strangers = split_unexpected_bssids(unexpected, known)
+    if strangers:
         return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "HIGH",
-                "note": f"{ssid} is being advertised by {', '.join(unexpected)}, which "
+                "note": f"{ssid} is being advertised by {', '.join(strangers)}, which "
                         "was not in the baseline. A second access point broadcasting "
                         "your network name is an evil twin — clients may associate "
                         "with it instead of yours."}
+    if siblings:
+        return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "REVIEW",
+                "note": f"{ssid} is also advertised by {', '.join(siblings)}, not in the "
+                        "baseline but one octet away from an access point that is — "
+                        "almost certainly another radio on the same unit that earlier "
+                        "scans did not hear. It will be remembered from now on."}
     return {"ssid": ssid, "bssids": bssids, "unexpected": [], "risk": "OK",
             "note": f"{ssid} advertised by {len(bssids)} known BSSID(s)." if known
                     else f"{ssid} advertised by {', '.join(bssids)}. No baseline yet — "
                          "save one so a new access point would stand out."}
+
+
+def split_unexpected_bssids(unexpected, known):
+    """Sort BSSIDs not in the baseline into (siblings, strangers).
+
+    An access point has a radio per band, and their BSSIDs differ only in the
+    last octet: 38:8b:59:e0:f1:72 and :76 are one Google Nest. A scan is a
+    sample, so a known unit's second radio can go unheard for weeks and then
+    turn up — and calling that an evil twin is a HIGH alarm about the owner's
+    own hardware. A sibling shares its first five octets with a known BSSID and
+    is reported for review; anything else is a stranger and keeps the alarm.
+
+    This gives an attacker nothing they did not have. Someone who can choose
+    their BSSID can already clone a known one exactly, which no comparison of
+    addresses can see at all; picking a sibling instead is strictly louder.
+    """
+    prefixes = {b[:14] for b in (known or []) if isinstance(b, str) and len(b) == 17}
+    siblings = [b for b in unexpected if b[:14] in prefixes]
+    strangers = [b for b in unexpected if b[:14] not in prefixes]
+    return siblings, strangers
+
+
+def remembered_bssids(known, seen):
+    """The access points to treat as known next time: everything known, plus
+    everything heard now.
+
+    A Wi-Fi scan is a sample, not a census. A mesh node at the far end of the
+    house is heard by one scan and missed by the next, and saving only what this
+    run heard would forget it — so its return a week later reads as a NEW access
+    point copying the network, a HIGH alarm about the owner's own hardware. A run
+    that could not read BSSIDs at all would forget every one of them.
+
+    The set only grows. That costs nothing a smaller set would have caught: an
+    unknown BSSID is still reported on the run that first hears it, which is the
+    only run either design reports it on.
+    """
+    merged = []
+    for b in list(known or []) + list(seen or []):
+        if isinstance(b, str) and b not in merged:
+            merged.append(b)
+    return sorted(merged)
 
 
 def action_evil_twin(known=None):
@@ -3830,6 +4013,10 @@ def check_wifi_security():
     ssid_raw, block = _parse_connected_wifi_block(out)
     if ssid_raw and ssid_raw != "<redacted>":
         result["ssid"] = ssid_raw
+    elif ssid_raw == "<redacted>":
+        # Redacted means there IS a network and macOS will not name it here.
+        # No scan: this check only wants the name.
+        result["ssid"] = read_wifi_helper()["ssid"]
 
     # Security is scoped to the connected block only — never a neighbour's value.
     m = re.search(r"^\s*Security:\s*(.+?)\s*$", block, re.MULTILINE)
@@ -3883,7 +4070,7 @@ def action_wifi_security():
     hr("WI-FI SECURITY MODE")
     r = check_wifi_security()
     print(f"  SSID (network name) : "
-          f"{r['ssid'] or 'unknown (needs Location Services access)'}")
+          f"{r['ssid'] or 'unknown (needs Location Services access — see the evil twin check)'}")
     print(f"  Auth / encryption   : {r['auth'] or 'unknown'}")
     if r["cipher"]:
         print(f"  Cipher              : {r['cipher']}")
@@ -6628,7 +6815,8 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     twin = action_evil_twin((load_baseline() or {}).get("wifi_bssids"))
     state["evil_twin"] = twin
-    state["wifi_bssids"] = twin["bssids"]
+    state["wifi_bssids"] = remembered_bssids(
+        (load_baseline() or {}).get("wifi_bssids"), twin["bssids"])
 
     ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
     state["ipv6"] = ra
