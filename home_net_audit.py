@@ -1363,7 +1363,20 @@ def save_baseline(state, passphrase=None):
     Returns the record that was written. Passing no passphrase still chains and
     seals, but with a bare hash rather than an HMAC — see seal_payload.
     """
+    # Worked out BEFORE carrying forward, from what this run itself saw. After
+    # it, a run that skipped the sweep holds the previous device list as if it
+    # were its own, and every device in it would be stamped "seen just now".
+    # Done here, in the one function every save goes through, so the menu's
+    # save and the CLI's cannot drift apart. Inside the sealed state, so the
+    # memory cannot be padded with a stranger's MAC without breaking the seal.
+    memory = update_device_memory(load_baseline() or {}, state)
     state = carry_forward_unmeasured(state)
+    # Only when there is something to remember: a state that says nothing about
+    # devices gains no key telling the reader that nothing is remembered.
+    if memory:
+        state["device_memory"] = memory
+    else:
+        state.pop("device_memory", None)
     history = read_history()
     prev = history[-1]["seal"] if history else None
     seq = (history[-1]["seq"] + 1) if history else 1
@@ -3196,6 +3209,157 @@ def network_name_for_subnet(subnet_str, networks):
     return networks.get(key, networks.get(subnet_str, subnet_str))
 
 
+# ---------------------------------------------------------------------------
+# Remembering devices for longer than one run
+# ---------------------------------------------------------------------------
+#
+# The baseline is the last run, so "new" used to mean "not there last time". A
+# camera hub that misses one sweep — asleep, mid-reboot, slow to answer a ping —
+# is dropped from the baseline that run and reads as a NEW device on the next,
+# an hour later. On a house full of battery and Wi-Fi gadgets that happened most
+# runs, and a NEW-device line that is usually the owner's own hardware is one
+# nobody reads by the week a stranger's turns up in it.
+#
+# So each network's baseline also carries a memory: every stable MAC seen there,
+# with when it was first and last seen, kept for DEVICE_MEMORY_DAYS after its
+# last sighting. A device in that memory that turns up again is "back after an
+# absence" — printed, by name, every time, but not a change. One that has never
+# been seen, or not within the window, is NEW exactly as before.
+#
+# What this costs, stated rather than hidden: someone who clones the MAC of a
+# remembered device WHILE IT IS AWAY now arrives as "back" rather than "NEW".
+# Before, that worked only against a device present in the last run, where the
+# clone collides with the real one on the air; the window is wider now. It is
+# the same limit every MAC comparison in this tool has — an address is a claim,
+# not an identity — and it is why a return is always printed, never dropped.
+#
+# Departures are untouched: a device missing from this run is still reported as
+# gone, the run it goes. Rotating private addresses are not remembered at all;
+# they are a population, counted rather than named, as diff_baseline explains.
+
+DEVICE_MEMORY_DAYS = 30
+DEVICE_MEMORY_LIMIT = 1024
+_MAC_SHAPE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def _parse_stamp(value):
+    """A timezone-aware datetime from an ISO string, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def remembered_devices(state):
+    """{mac: {"first_seen", "last_seen"}} for a saved state, read defensively.
+
+    A baseline written before the memory existed still remembers one thing: the
+    devices in it were seen when it was saved. Seeding from that is what makes
+    the first run after the upgrade behave, instead of starting from nothing.
+    """
+    state = state or {}
+    memory = {}
+    saved = state.get("device_memory")
+    if isinstance(saved, dict):
+        for mac, entry in saved.items():
+            if not (isinstance(mac, str) and isinstance(entry, dict)):
+                continue
+            mac = mac.lower()
+            last = entry.get("last_seen")
+            if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac) or _parse_stamp(last) is None:
+                continue
+            first = entry.get("first_seen")
+            memory[mac] = {"first_seen": first if _parse_stamp(first) else last, "last_seen": last}
+    stamp = state.get("timestamp")
+    if _parse_stamp(stamp) is not None:
+        for d in state.get("devices") or []:
+            mac = d.get("mac") if isinstance(d, dict) else None
+            if not isinstance(mac, str):
+                continue
+            mac = mac.lower()
+            if _MAC_SHAPE.match(mac) and not is_randomized_mac(mac) and mac not in memory:
+                memory[mac] = {"first_seen": stamp, "last_seen": stamp}
+    return memory
+
+
+def update_device_memory(previous, state):
+    """The memory to save with `state`: what was remembered, plus what was seen now.
+
+    A run that did not sweep learns nothing about devices and so changes nothing
+    — not even expiry, since "not looked for" is not "not seen".
+    """
+    memory = remembered_devices(previous)
+    if not swept_anywhere(state):
+        return memory
+    stamp = state.get("timestamp")
+    now = _parse_stamp(stamp)
+    if now is None:
+        return memory
+    for d in state.get("devices") or []:
+        mac = d.get("mac") if isinstance(d, dict) else None
+        if not isinstance(mac, str):
+            continue
+        mac = mac.lower()
+        if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac):
+            continue
+        entry = memory.setdefault(mac, {"first_seen": stamp, "last_seen": stamp})
+        entry["last_seen"] = stamp
+    cutoff = now - timedelta(days=DEVICE_MEMORY_DAYS)
+    memory = {m: e for m, e in memory.items() if (_parse_stamp(e["last_seen"]) or now) >= cutoff}
+    if len(memory) > DEVICE_MEMORY_LIMIT:
+        keep = sorted(memory, key=lambda m: memory[m]["last_seen"], reverse=True)[:DEVICE_MEMORY_LIMIT]
+        memory = {m: memory[m] for m in keep}
+    return memory
+
+
+def returning_devices(old, new):
+    """{mac: last_seen} for devices present now, absent from the last run, but
+    seen on this network within the memory window."""
+    if not (swept_anywhere(old) and swept_anywhere(new)):
+        return {}
+    def stable(entry):
+        out = set()
+        for d in entry.get("devices") or []:
+            mac = d.get("mac") if isinstance(d, dict) else None
+            if isinstance(mac, str) and mac != "unknown" and not is_randomized_mac(mac.lower()):
+                out.add(mac.lower())
+        return out
+    arrived = stable(new) - stable(old)
+    if not arrived:
+        return {}
+    memory = remembered_devices(old)
+    now = _parse_stamp(new.get("timestamp"))
+    back = {}
+    for mac in arrived:
+        entry = memory.get(mac)
+        if not entry:
+            continue
+        last = _parse_stamp(entry["last_seen"])
+        # With no usable clock on the new run the window cannot be applied, and
+        # the memory has already been pruned to it at save time.
+        if now is None or last is None or now - last <= timedelta(days=DEVICE_MEMORY_DAYS):
+            back[mac] = entry["last_seen"]
+    return back
+
+
+def describe_returning_devices(old, new, labels=None):
+    """The lines naming devices that came back, or None. Never a change, always said."""
+    back = returning_devices(old, new)
+    if not back:
+        return None
+    labels = labels or {}
+    lines = [f"Known device(s) back after an absence — seen here within the last "
+             f"{DEVICE_MEMORY_DAYS} days, so not counted as new:"]
+    for mac in sorted(back):
+        name = labels.get(mac)
+        when = (back[mac] or "")[:16].replace("T", " ")
+        lines.append(f"  · {mac}" + (f"  {name}" if name else "") + f"  (last seen {when} UTC)")
+    return "\n".join(lines)
+
+
 def diff_baseline(old, new):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
@@ -3281,6 +3445,10 @@ def diff_baseline(old, new):
         # Where it used to answer is unknown, so there is nothing to check it
         # against, and reporting is what the empty set already yields here.
         vanished = {m for m in vanished if old_subnets.get(m, set()) <= new_cov}
+    # A device remembered from an earlier run on this network is back, not new.
+    # It is reported by describe_returning_devices — every time, by name — but
+    # it is not a change. See "Remembering devices for longer than one run".
+    appeared -= set(returning_devices(old, new))
     if appeared:
         notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
     if vanished:
@@ -5857,6 +6025,8 @@ RENDERED_STATE_KEYS = frozenset({
     "ipv6_routers", "interception", "router_tls", "dsl", "upnp_listeners",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
+    # Bookkeeping written by save_baseline: which devices this network has seen.
+    "device_memory",
 })
 
 
@@ -7167,6 +7337,9 @@ def action_compare_baseline(state):
             print("  ! " + c)
     else:
         print("No changes since baseline.")
+    _back = describe_returning_devices(old, state, load_labels())
+    if _back:
+        print(_back)
 
 
 # ---------------------------------------------------------------------------
@@ -7458,6 +7631,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                 print("  ! " + c)
         else:
             print("No changes since baseline.")
+        _back = describe_returning_devices(old, state, load_labels())
+        if _back:
+            print(_back)
     else:
         print("No baseline saved yet. Use option 5 after reviewing results.")
 
