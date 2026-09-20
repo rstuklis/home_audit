@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>com.rstuklis.homeaudit.runner</string>
+  <key>CFBundleName</key><string>Home Audit Runner</string>
+  <key>CFBundleDisplayName</key><string>Home Audit Runner</string>
+  <key>CFBundleExecutable</key><string>HomeAuditRunner</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>The weekly home network audit scans your own router for open ports, asks it for its UPnP port mappings, and checks that only one DHCP server answers. All three need to reach devices on your local network.</string>
+</dict>
+</plist>
