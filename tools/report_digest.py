@@ -39,6 +39,7 @@ import tempfile
 FLAG_RE = re.compile(r"^\s*\[(HIGH|MEDIUM|REVIEW|UNKNOWN)\s*\]\s*(.+?)\s*$")
 RULE_RE = re.compile(r"^={20,}\s*$")
 NETWORK_RE = re.compile(r"^# NETWORK:\s*(.+?)\s+—")
+FROM_RE = re.compile(r"^\s*From (.+):\s*$")
 RISK_ORDER = {"HIGH": 0, "MEDIUM": 1, "REVIEW": 2, "UNKNOWN": 3}
 LINE_LIMIT = 190
 
@@ -59,6 +60,7 @@ def parse_report(text, fallback_name="network"):
     lines = text.splitlines()
     name = fallback_name
     section = ""
+    origin = ""
     flagged, changes = [], []
     verdict = "AUDIT DID NOT COMPLETE"
     devices = unidentified = None
@@ -71,11 +73,21 @@ def parse_report(text, fallback_name="network"):
         # A section title is the line between two rules.
         if RULE_RE.match(line) and i + 2 < len(lines) and RULE_RE.match(lines[i + 2]):
             section = clean(lines[i + 1], 60)
+            origin = ""
             i += 3
+            continue
+        # --host-sections-brief folds this Mac's sections into one block on the
+        # second and later networks, naming where each kept line came from. Read
+        # that back, so the finding is the same finding on every network.
+        m = FROM_RE.match(line)
+        if m and section.startswith("THIS MAC"):
+            origin = clean(m.group(1), 60)
+            i += 1
             continue
         m = FLAG_RE.match(line)
         if m:
-            flagged.append({"risk": m.group(1), "section": section, "text": clean(m.group(2))})
+            where = origin if (origin and section.startswith("THIS MAC")) else section
+            flagged.append({"risk": m.group(1), "section": where, "text": clean(m.group(2))})
         elif section.startswith("CHANGE DETECTION") and line.startswith("  ! "):
             changes.append(clean(line[4:]))
         if line.startswith("CHANGES DETECTED"):

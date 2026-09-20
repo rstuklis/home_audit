@@ -46,6 +46,24 @@ class TestListeners:
         _, out = listeners(BASE[:2] + [{"proto": "TCP", "port": 4444, "pid": "9", "process": "nc"}], BASE)
         assert "4444" in out and "+ not in the baseline" in out and "- in the baseline, gone now" in out
 
+    def test_an_unnamed_listener_on_a_dynamic_port_is_counted_not_compared(self, listeners):
+        # No process name, no fixed port: nothing to tell one from the next, and
+        # they come and go by the minute. Measured: this reopened the table on
+        # consecutive runs of an unchanged Mac.
+        anon = {"proto": "UDP", "port": 64506, "pid": "?", "process": "?"}
+        _, out = listeners(BASE + [anon], BASE)
+        assert "none of them new" in out and "64506" not in out
+        assert "1 unnamed listener(s) on dynamic ports (baseline: 0)" in out
+
+    def test_an_unnamed_listener_on_a_fixed_port_is_still_new(self, listeners):
+        # A fixed port is a choice somebody made, named process or not.
+        _, out = listeners(BASE + [{"proto": "TCP", "port": 8021, "pid": "?", "process": "?"}], BASE)
+        assert "+ not in the baseline: unattributed on TCP port 8021" in out
+
+    def test_a_named_listener_on_a_dynamic_port_is_still_new(self, listeners):
+        _, out = listeners(BASE + [{"proto": "TCP", "port": 50000, "pid": "7", "process": "nc"}], BASE)
+        assert "+ not in the baseline: nc on TCP a dynamic port" in out
+
     def test_with_no_baseline_the_table_is_always_printed(self, listeners):
         _, out = listeners(BASE, None)
         assert "19292" in out

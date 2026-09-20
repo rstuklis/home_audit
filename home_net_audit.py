@@ -36,11 +36,13 @@ Acronyms used below:
 
 import argparse
 import concurrent.futures as futures
+import contextlib
 import errno
 import hashlib
 import hmac
 import html
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -5481,6 +5483,13 @@ def listener_fingerprint(services):
     compared by protocol and process alone. Everything below is compared by
     number as well — a fixed port is a choice somebody made, and a new one is
     exactly what this section is looking for.
+
+    A listener with no process name AND a dynamic port has nothing left to be
+    compared by: one such socket is indistinguishable from the next, they come
+    and go by the minute, and a set that already holds one cannot notice a
+    second. Comparing them buys no detection and reopens the table on most runs,
+    so — like rotating private MAC addresses — they are counted, not compared
+    (see anonymous_dynamic_listeners).
     """
     prints = set()
     for s in services or []:
@@ -5491,9 +5500,26 @@ def listener_fingerprint(services):
         except (TypeError, ValueError):
             continue
         proto, proc = str(s.get("proto", "")), str(s.get("process", ""))
-        prints.add((proto, proc, "dynamic") if port >= EPHEMERAL_PORT_FLOOR
-                   else (proto, proc, port))
+        if port >= EPHEMERAL_PORT_FLOOR:
+            if proc in ("", "?"):
+                continue
+            prints.add((proto, proc, "dynamic"))
+        else:
+            prints.add((proto, proc, port))
     return prints
+
+
+def anonymous_dynamic_listeners(services):
+    """How many listeners have neither a process name nor a fixed port."""
+    count = 0
+    for s in services or []:
+        try:
+            if (isinstance(s, dict) and int(s.get("port")) >= EPHEMERAL_PORT_FLOOR
+                    and str(s.get("process", "")) in ("", "?")):
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    return count
 
 
 def _describe_fingerprint(fp):
@@ -5540,6 +5566,13 @@ def action_listening_services(compact=False, known=None):
               + f", {len(unattributed)} unattributed,")
         print(f"  {len(services) - len(named) - len(unattributed)} system. Dynamic port "
               "numbers are not compared. Table omitted (--compact).")
+        anon_now, anon_before = (anonymous_dynamic_listeners(services),
+                                 anonymous_dynamic_listeners(known))
+        if anon_now or anon_before:
+            print(f"  {anon_now} unnamed listener(s) on dynamic ports (baseline: {anon_before}) "
+                  "are counted, not compared: with no")
+            print("  process name and no fixed port there is nothing to tell one from "
+                  "another. sudo names them.")
         for fp in sorted(before - now, key=str):
             print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
         return services
@@ -7087,10 +7120,82 @@ def action_compare_baseline(state):
 # Full audit
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Sections about this machine, in a report that covers several networks
+# ---------------------------------------------------------------------------
+#
+# The firewall, the sharing services and the listeners belong to this Mac, not
+# to the network it happens to be joined to. A run that audits three networks
+# prints them three times, identically. They still have to be CHECKED on every
+# network — each network keeps its own baseline, and a baseline with no
+# firewall entry would make the next comparison against it blind — so the fix is
+# in the printing only: check, record, and say in a few lines what was found.
+
+_BRIEF_KEEP = re.compile(r"^\s*\[(REVIEW|UNKNOWN)\s*\]")
+_BRIEF_FORCES_FULL = re.compile(r"^\s*\[(HIGH|MEDIUM)\s*\]|^\s*\+ not in the baseline", re.M)
+
+
+def capture_section(fn, *args, **kwargs):
+    """Run a printing section with its output captured. Returns (result, text)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = fn(*args, **kwargs)
+    return result, buf.getvalue()
+
+
+def _captured_section_title(text):
+    """The title hr() printed at the top of a captured section, or a placeholder."""
+    lines = text.splitlines()
+    for i in range(1, len(lines) - 1):
+        if lines[i - 1].startswith("=" * 20) and lines[i + 1].startswith("=" * 20):
+            return lines[i].strip()
+    return "this machine"
+
+
+def render_host_sections_brief(sections):
+    """What to print for host sections that an earlier network already showed.
+
+    `sections` is [(title, captured_text)]. A section is folded into the summary
+    only when it is quiet. Anything rated HIGH or MEDIUM, or a listener that was
+    not in the baseline, puts that whole section back exactly as it would have
+    printed — the state of this Mac can change between two audits minutes apart,
+    and a brief report must never be the reason that went unseen. REVIEW and
+    UNKNOWN lines are standing notes; they are kept, one line each.
+    """
+    quiet, loud = [], []
+    for title, text in sections:
+        (loud if _BRIEF_FORCES_FULL.search(text) else quiet).append((title, text))
+
+    out = []
+    if quiet:
+        names = ", ".join(t for t, _ in quiet)
+        out.append("")
+        out.append("=" * 64)
+        out.append("THIS MAC (re-checked on this network)")
+        out.append("=" * 64)
+        out.append(f"  Re-checked here and recorded in this network's baseline: {names}.")
+        out.append("  Nothing rated HIGH or MEDIUM, and no listener that was not in the "
+                   "baseline. The full")
+        out.append("  sections are printed once, under the first network in this report.")
+        for _title, text in quiet:
+            kept = [ln.rstrip() for ln in text.splitlines() if _BRIEF_KEEP.match(ln)]
+            if kept:
+                # Named by the section it came from, in a form the email digest
+                # reads back: a kept line must be recognisably the SAME finding
+                # as the one printed in full under the first network, or it
+                # would be counted as new there and listed twice.
+                out.append(f"  From {_captured_section_title(text)}:")
+                out.extend(kept)
+    rendered = "\n".join(out)
+    for _title, text in loud:
+        rendered += ("\n" if rendered else "") + text.rstrip("\n")
+    return rendered
+
+
 def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
                       extra_subnets=None, probe_creds=False, no_discovery=False,
-                      no_names=False, compact=False):
+                      no_names=False, compact=False, host_sections_brief=False):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -7224,15 +7329,25 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     state["ipv6"] = ra
     state["ipv6_routers"] = ra["routers"]
 
-    fw = action_firewall_check()
+    # The three sections about this machine rather than the network. Always
+    # checked and always recorded; printed in brief when an earlier network in
+    # the same report has already shown them (see render_host_sections_brief).
+    known_listeners = (load_baseline() or {}).get("listening")
+    if host_sections_brief:
+        fw, fw_text = capture_section(action_firewall_check)
+        sharing, sharing_text = capture_section(action_sharing_services)
+        listening, listening_text = capture_section(
+            action_listening_services, compact=compact, known=known_listeners)
+        print(render_host_sections_brief([("firewall", fw_text),
+                                          ("sharing services", sharing_text),
+                                          ("listening services", listening_text)]))
+    else:
+        fw = action_firewall_check()
+        sharing = action_sharing_services()
+        listening = action_listening_services(compact=compact, known=known_listeners)
     state["firewall"] = fw
-
-    sharing = action_sharing_services()
     state["sharing"] = [{"name": s["name"], "enabled": s["enabled"],
                           "risk": s["risk"], "note": s["note"]} for s in sharing]
-
-    listening = action_listening_services(
-        compact=compact, known=(load_baseline() or {}).get("listening"))
     state["listening"] = listening
 
     rh = action_router_hostname()
@@ -7519,6 +7634,12 @@ def main():
                          "matches the baseline, list only the IPv6 neighbours that "
                          "advertise as routers, and fold the provenance explanation. "
                          "Anything that changed is always printed in full.")
+    ap.add_argument("--host-sections-brief", action="store_true",
+                    help="For the second and later networks of a multi-network "
+                         "report: still check and record this machine's firewall, "
+                         "sharing services and listeners, but print them in a few "
+                         "lines. Anything HIGH, MEDIUM or newly listening is still "
+                         "printed in full.")
     ap.add_argument("--no-save-baseline", action="store_true",
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
@@ -7562,6 +7683,7 @@ def main():
     cli_args_given = any([
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
         args.full, args.no_vendors, args.no_names, args.compact,
+        args.host_sections_brief,
         args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
@@ -7613,6 +7735,7 @@ def main():
         no_discovery=args.no_discovery,
         no_names=args.no_names,
         compact=args.compact,
+        host_sections_brief=args.host_sections_brief,
     )
 
     if args.no_save_baseline:
