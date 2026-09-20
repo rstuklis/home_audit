@@ -2788,6 +2788,9 @@ EVIDENCE = {
     "router_hostname":     (RESOLVER_DEPENDENT, "a reverse DNS answer about the gateway", "Router hostname"),
 
     "device_vendors":      (THIRD_PARTY, "an HTTP lookup to api.macvendors.com, over this network", "Device vendor names"),
+    # What a device calls itself is the purest self-report in the tool: free to
+    # claim, and chosen by the thing being identified.
+    "device_names":        (SELF_REPORTED, "what each device calls itself over mDNS, UPnP or DHCP", "Announced device names"),
 }
 
 _EVIDENCE_TAG = {
@@ -2804,6 +2807,9 @@ _DERIVED_EVIDENCE = {
         for d in (state.get("devices") or ())),
     "dhcp_offer_contents": lambda state: bool(
         isinstance(state.get("dhcp"), dict) and state["dhcp"].get("responders")),
+    "device_names": lambda state: any(
+        isinstance(d, dict) and d.get("names")
+        for d in (state.get("devices") or ())),
 }
 
 
@@ -5872,10 +5878,15 @@ def generate_html_report(state, output_path=None):
 
     # Devices
     if "devices" in state:
-        dev_rows = [[d["ip"], d["mac"], d.get("vendor", ""), d.get("subnet", "")]
-                    for d in state["devices"]]
+        dev_rows = []
+        for d in state["devices"]:
+            said, source = announced_name(d)
+            dev_rows.append([d["ip"], d["mac"], d.get("vendor", ""),
+                             f"{said} [{source}]" if said else "", d.get("subnet", "")])
         sections_html += section("Connected Devices",
-            table(["IP", "MAC", "Vendor", "Subnet"], dev_rows))
+            table(["IP", "MAC", "Vendor", "Announces itself as", "Subnet"], dev_rows)
+            + "<p>An announced name is the device's own claim. It helps you "
+              "recognise a device; it does not prove what the device is.</p>")
 
     # Wi-Fi
     if "wifi" in state:
@@ -6417,7 +6428,13 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             display_name = name or vend
             tag = f"  {display_name}" if display_name else ""
             flag = "" if identified else "  <-- unlabelled"
-            print(f"    {d['ip']:<15} {mac}{tag}{flag}")
+            # What the device calls itself. Shown, quoted and attributed — and
+            # deliberately not part of `identified`: a name is free to claim,
+            # so it can help the owner recognise a device but cannot do the
+            # recognising for them.
+            said, source = announced_name(d)
+            claim = f'  announces "{said}" [{source}]' if said else ""
+            print(f"    {d['ip']:<15} {mac}{tag}{claim}{flag}")
             if not identified:
                 unlabelled.append(mac)
             total += 1
@@ -6524,6 +6541,292 @@ def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
             continue
         kept.append(net)
     return kept
+
+
+# ---------------------------------------------------------------------------
+# What each device calls itself
+# ---------------------------------------------------------------------------
+#
+# A sweep yields an IP, a MAC and — through a third party — a vendor. That is
+# enough to count devices and not enough to recognise them: "Samsung" is a
+# television or a phone, "Tuya" is any of six plugs, and a private MAC is nothing
+# at all. The owner then labels from memory, which is how a smart plug came to
+# be recorded as "Google Nest - Upstairs" for three months.
+#
+# Many devices announce a name. Three places to hear it, all stdlib:
+#
+#   mdns  a reverse lookup of the device's own address, sent to the mDNS group
+#         with the unicast-response bit set, answered by the device itself
+#   upnp  the <friendlyName> in the description a device advertises over SSDP
+#   dns   a reverse lookup asked of the gateway, which on most home routers
+#         answers with the hostname the device gave it over DHCP
+#
+# EVERY ONE OF THESE IS THE DEVICE'S OWN CLAIM. A hostile device calls itself
+# "Google Nest" for free. So a name is shown as something the device announces,
+# never promoted to a label, never counted as identification, and an answer is
+# accepted only from the address it is about (or, for dns, from the gateway that
+# was asked) — nobody gets to name somebody else's device.
+
+DEVICE_NAME_LIMIT = 48
+MDNS_ADDR = "224.0.0.251"
+MDNS_PORT = 5353
+_NAME_SOURCES = ("upnp", "mdns", "dns")          # display preference, best first
+
+
+def _device_name_text(value, limit=DEVICE_NAME_LIMIT):
+    """A name a stranger's device chose, made safe to print, save and email."""
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value or ""))
+    text = " ".join(text.split()).rstrip(".")
+    return text[:limit]
+
+
+def _dns_encode_name(name):
+    out = b""
+    for label in name.strip(".").split("."):
+        raw = label.encode("idna") if label.isascii() else label.encode("utf-8")
+        if not 0 < len(raw) < 64:
+            raise ValueError(f"bad DNS label in {name!r}")
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def _dns_build_ptr_query(name, qid=0, unicast_response=False):
+    """One PTR question. `unicast_response` sets the mDNS QU bit, which asks the
+    responder to answer this socket directly instead of the whole group."""
+    qclass = 0x8001 if unicast_response else 0x0001
+    header = struct.pack(">HHHHHH", qid, 0x0100 if not unicast_response else 0, 1, 0, 0, 0)
+    return header + _dns_encode_name(name) + struct.pack(">HH", 12, qclass)
+
+
+def _dns_read_name(data, offset, _jumps=0):
+    """Decode a possibly-compressed name. Returns (name, offset after it).
+
+    The packet comes from whatever is on the LAN, so every length is checked and
+    compression pointers are counted: a pointer loop is the classic way to hang
+    a DNS parser.
+    """
+    labels = []
+    end = None
+    while True:
+        if offset >= len(data):
+            raise ValueError("name runs past the end of the packet")
+        length = data[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data):
+                raise ValueError("truncated compression pointer")
+            if end is None:
+                end = offset + 2
+            _jumps += 1
+            if _jumps > 16:
+                raise ValueError("compression pointer loop")
+            offset = ((length & 0x3F) << 8) | data[offset + 1]
+            continue
+        if length & 0xC0:
+            raise ValueError("reserved label type")
+        offset += 1
+        if length == 0:
+            break
+        if offset + length > len(data):
+            raise ValueError("label runs past the end of the packet")
+        labels.append(data[offset:offset + length].decode("utf-8", "replace"))
+        offset += length
+        if len(labels) > 64:
+            raise ValueError("too many labels")
+    return ".".join(labels), (end if end is not None else offset)
+
+
+def _dns_ptr_records(data):
+    """[(owner, target)] for every PTR record in a DNS/mDNS reply. [] if unparseable."""
+    try:
+        if len(data) < 12:
+            return []
+        _id, _flags, qd, an, ns, ar = struct.unpack(">HHHHHH", data[:12])
+        offset = 12
+        for _ in range(min(qd, 16)):
+            _, offset = _dns_read_name(data, offset)
+            offset += 4
+        found = []
+        for _ in range(min(an + ns + ar, 64)):
+            owner, offset = _dns_read_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[offset:offset + 10])
+            offset += 10
+            if offset + rdlen > len(data):
+                break
+            if rtype == 12:
+                target, _ = _dns_read_name(data, offset)
+                found.append((owner.lower(), target))
+            offset += rdlen
+        return found
+    except (ValueError, struct.error):
+        return []
+
+
+def _reverse_name(ip):
+    return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+
+
+def _ptr_exchange(ips, dest, accept, unicast_response, wait):
+    """Send a reverse-PTR question per address to `dest`; gather {ip: name}.
+
+    `accept(sender_ip, about_ip)` decides whose answer counts. Returns
+    ({ip: name}, refused) — refused means the OS never let the questions leave.
+    """
+    names, refused = {}, False
+    wanted = {_reverse_name(ip).lower(): ip for ip in ips}
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return {}, e.errno in UNREACHABLE_ERRNOS
+    try:
+        sock.settimeout(0.3)
+        for i, ip in enumerate(ips):
+            try:
+                sock.sendto(_dns_build_ptr_query(_reverse_name(ip), qid=(i + 1) & 0xFFFF,
+                                                 unicast_response=unicast_response), dest)
+            except OSError as e:
+                if e.errno in UNREACHABLE_ERRNOS:
+                    return {}, True
+        deadline = time.time() + wait
+        while time.time() < deadline and len(names) < len(wanted):
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            for owner, target in _dns_ptr_records(data):
+                about = wanted.get(owner)
+                if about and about not in names and accept(addr[0], about):
+                    text = _device_name_text(target)
+                    if text:
+                        names[about] = text
+    finally:
+        sock.close()
+    return names, refused
+
+
+def mdns_device_names(ips, wait=2.5):
+    """{ip: hostname} from each device's own answer to a reverse mDNS lookup."""
+    return _ptr_exchange(list(ips), (MDNS_ADDR, MDNS_PORT),
+                         accept=lambda sender, about: sender == about,
+                         unicast_response=True, wait=wait)
+
+
+def gateway_device_names(ips, gateway, wait=1.5):
+    """{ip: hostname} from the gateway's DNS — usually the DHCP hostname."""
+    if not gateway:
+        return {}, False
+    return _ptr_exchange(list(ips), (gateway, 53),
+                         accept=lambda sender, about: sender == gateway,
+                         unicast_response=False, wait=wait)
+
+
+def upnp_device_names(ips, wait=3.0, max_fetches=24):
+    """{ip: friendlyName} from the UPnP description each device advertises.
+
+    One multicast search, then one GET per responding device. A LOCATION is
+    followed only back to the device that sent it, over plain http, through
+    _http_get_plain — no redirects, no proxy — so a device cannot aim this at
+    anything but itself.
+    """
+    ips = set(ips)
+    locations, refused = {}, False
+    msearch = ("M-SEARCH * HTTP/1.1\r\n"
+               f"HOST: {SSDP_MULTICAST_ADDR}:1900\r\n"
+               "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n").encode()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return {}, e.errno in UNREACHABLE_ERRNOS
+    try:
+        sock.settimeout(0.3)
+        sock.sendto(msearch, (SSDP_MULTICAST_ADDR, 1900))
+        deadline = time.time() + wait
+        seen = 0
+        while time.time() < deadline and seen < 512:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            seen += 1
+            sender = addr[0]
+            if sender not in ips or sender in locations:
+                continue
+            m = re.search(r"(?im)^LOCATION:\s*(\S+)", data.decode("utf-8", "ignore"))
+            if m and _upnp_url_points_at(m.group(1), sender):
+                parts = urllib.parse.urlsplit(m.group(1))
+                if parts.scheme == "http":
+                    path = parts.path or "/"
+                    if parts.query:
+                        path += "?" + parts.query
+                    locations[sender] = (parts.port or 80, path)
+    except OSError as e:
+        refused = e.errno in UNREACHABLE_ERRNOS
+    finally:
+        sock.close()
+
+    def fetch(item):
+        ip, (port, path) = item
+        got = _http_get_plain(ip, port, path, timeout=3.0)
+        if not got or got[0] != 200:
+            return ip, ""
+        body = got[2]
+        for tag in ("friendlyName", "modelName"):
+            m = re.search(fr"<{tag}>\s*([^<]{{1,200}}?)\s*</{tag}>", body)
+            if m:
+                return ip, _device_name_text(html.unescape(m.group(1)))
+        return ip, ""
+
+    names = {}
+    todo = sorted(locations.items())[:max_fetches]
+    if todo:
+        with futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for ip, name in pool.map(fetch, todo):
+                if name:
+                    names[ip] = name
+    return names, refused
+
+
+def collect_device_names(devices, gateway=None):
+    """Attach d["names"] = {source: name} to each device that announced one.
+
+    Returns a one-line note when the OS refused the questions (a background job
+    without Local Network access), else "". Devices that said nothing are left
+    without the key, so "no name" never reads as a name of "".
+    """
+    ips = [d["ip"] for d in devices if d.get("ip")]
+    if not ips:
+        return ""
+    results = {}
+    refused_all = True
+    for source, lookup in (("mdns", lambda: mdns_device_names(ips)),
+                           ("upnp", lambda: upnp_device_names(ips)),
+                           ("dns", lambda: gateway_device_names(ips, gateway))):
+        try:
+            names, refused = lookup()
+        except OSError:
+            names, refused = {}, False
+        refused_all = refused_all and refused
+        results[source] = names
+    for d in devices:
+        found = {src: results[src][d["ip"]] for src in _NAME_SOURCES
+                 if d["ip"] in results.get(src, {})}
+        if found:
+            d["names"] = found
+    return local_network_denied_note("Asking devices for their names") if refused_all else ""
+
+
+def announced_name(device):
+    """(name, source) a device gave for itself, best source first, or ("", "")."""
+    names = device.get("names")
+    if isinstance(names, dict):
+        for source in _NAME_SOURCES:
+            text = _device_name_text(names.get(source))
+            if text:
+                return text, source
+    return "", ""
 
 
 def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_note=""):
@@ -6704,7 +7007,8 @@ def action_compare_baseline(state):
 
 def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
-                      extra_subnets=None, probe_creds=False, no_discovery=False):
+                      extra_subnets=None, probe_creds=False, no_discovery=False,
+                      no_names=False):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -6788,6 +7092,11 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
         if subnets_to_sweep:
             all_devices = collect_devices(subnets_to_sweep, labels, networks, no_vendors=no_vendors)
+            if not no_names:
+                print("  Asking devices what they call themselves (mDNS, UPnP, gateway DNS)...")
+                names_note = collect_device_names(all_devices, gateway)
+                if names_note:
+                    print(f"  [INFO] {names_note}")
             state["devices"] = all_devices
             # Record where we looked AND could have seen something — not merely
             # what was on the sweep list. Without this a later comparison cannot
@@ -7119,6 +7428,9 @@ def main():
                     help="Full router port scan (1-65535, slower)")
     ap.add_argument("--no-vendors", action="store_true",
                     help="Skip online vendor lookups (faster)")
+    ap.add_argument("--no-names", action="store_true",
+                    help="Skip asking devices what they call themselves "
+                         "(mDNS, UPnP and the gateway's DNS)")
     ap.add_argument("--no-save-baseline", action="store_true",
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
@@ -7161,7 +7473,7 @@ def main():
 
     cli_args_given = any([
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
-        args.full, args.no_vendors, args.no_save_baseline, args.label,
+        args.full, args.no_vendors, args.no_names, args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
         args.seal_baseline, args.publish_to, args.monitor,
@@ -7210,6 +7522,7 @@ def main():
         extra_subnets=getattr(args, "extra_subnet", None),
         probe_creds=args.probe_creds,
         no_discovery=args.no_discovery,
+        no_names=args.no_names,
     )
 
     if args.no_save_baseline:

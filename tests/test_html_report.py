@@ -681,7 +681,7 @@ class TestDocumentStructure:
                 cells = re.findall(r"<td[^>]*>", tr.group(1))
                 if cells:
                     assert len(cells) == len(headers)
-        assert ["IP", "MAC", "Vendor", "Subnet"] in seen
+        assert ["IP", "MAC", "Vendor", "Announces itself as", "Subnet"] in seen
 
     def test_the_charset_is_declared_before_any_content(self, mod, tmp_path):
         text = render(mod, tmp_path, dict(RICH_STATE))
