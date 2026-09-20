@@ -82,6 +82,35 @@ class TestParse:
         assert "\x1b" not in r["flagged"][0]["text"] and "\x07" not in r["flagged"][0]["text"]
 
 
+class TestBriefHostSections:
+    """A finding printed in full on one network and in brief on the next is one finding."""
+
+    FULL = report("loveshack", [("SHARING SERVICES CHECK", ["  [UNKNOWN] ?    Remote Apple Events    Unknown — re-run with sudo."])],
+                  ["No changes since baseline."])
+    BRIEF = report("pearl", [("THIS MAC (re-checked on this network)",
+                              ["  Re-checked here and recorded in this network's baseline: firewall, sharing services.",
+                               "  From SHARING SERVICES CHECK:",
+                               "  [UNKNOWN] ?    Remote Apple Events    Unknown — re-run with sudo."])],
+                   ["No changes since baseline."])
+
+    def test_the_brief_line_keeps_its_original_section(self, dg):
+        assert dg.parse_report(self.BRIEF)["flagged"][0]["section"] == "SHARING SERVICES CHECK"
+
+    def test_so_the_two_networks_share_one_line_in_the_block(self, dg):
+        text, _ = dg.build_facts([dg.parse_report(self.FULL), dg.parse_report(self.BRIEF)])
+        assert text.count("Remote Apple Events") == 1 and "(loveshack, pearl)" in text
+
+    def test_and_switching_a_network_to_brief_does_not_make_its_items_new(self, dg):
+        full_pearl = self.FULL.replace("loveshack", "pearl")
+        _, before = dg.build_facts([dg.parse_report(full_pearl)])
+        text, _ = dg.build_facts([dg.parse_report(self.BRIEF)], previous=before)
+        assert "0 new since" in text and "cleared" not in text
+
+    def test_a_from_line_outside_that_block_means_nothing(self, dg):
+        odd = report("x", [("EVIL TWIN CHECK", ["  From SHARING SERVICES CHECK:", "  [REVIEW] something"])], ["No changes since baseline."])
+        assert dg.parse_report(odd)["flagged"][0]["section"] == "EVIL TWIN CHECK"
+
+
 class TestFacts:
     def test_first_digest_calls_nothing_new(self, dg):
         text, _ = dg.build_facts([dg.parse_report(NOISY)], previous=None)
