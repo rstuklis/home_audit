@@ -82,6 +82,41 @@ class TestParse:
         assert "\x1b" not in r["flagged"][0]["text"] and "\x07" not in r["flagged"][0]["text"]
 
 
+class TestOneLineHeaders:
+    """The compact report draws headers in one line; the digest must read both."""
+
+    @staticmethod
+    def line_report(name, sections, verdict_lines):
+        out = ["", "#" * 64, f"# NETWORK: {name} — 09:00:01   ip 10.0.0.2", "#" * 64]
+        for title, lines in sections + [("CHANGE DETECTION (vs saved baseline)", verdict_lines)]:
+            lead = f"── {title} "
+            out += ["", lead + "─" * max(2, 64 - len(lead))] + lines
+        out += ["", "─" * 64, "Full audit complete. This is a snapshot, not a guarantee."]
+        return "\n".join(out)
+
+    def test_sections_changes_and_verdict_are_read_from_one_line_headers(self, dg):
+        text = self.line_report("pearl", [("EVIL TWIN CHECK", ["  [HIGH  ] pearl is being advertised by de:ad:be:ef:00:01."])],
+                                ["CHANGES DETECTED:", "  ! NEW device(s) since baseline: aa:bb:cc:dd:ee:ff"])
+        r = dg.parse_report(text)
+        assert r["flagged"][0]["section"] == "EVIL TWIN CHECK"
+        assert r["changes"] == ["NEW device(s) since baseline: aa:bb:cc:dd:ee:ff"]
+        assert r["verdict"] == "CHANGES DETECTED"
+
+    def test_switching_styles_does_not_make_standing_items_new(self, dg):
+        body = [("ROUTER / GATEWAY PORT SCAN", ["  [MEDIUM]    80  HTTP admin     Unencrypted web admin page."])]
+        boxed = report("pearl", body, ["No changes since baseline."])
+        lined = self.line_report("pearl", body, ["No changes since baseline."])
+        _, before = dg.build_facts([dg.parse_report(boxed)])
+        text, _ = dg.build_facts([dg.parse_report(lined)], previous=before)
+        assert "0 new since" in text and "cleared" not in text
+
+    def test_the_brief_block_is_read_under_a_one_line_header_too(self, dg):
+        text = self.line_report("pearl", [("THIS MAC (re-checked on this network)",
+                                           ["  From SHARING SERVICES CHECK:", "  [UNKNOWN] ?    Remote Apple Events    Unknown."])],
+                                ["No changes since baseline."])
+        assert dg.parse_report(text)["flagged"][0]["section"] == "SHARING SERVICES CHECK"
+
+
 class TestBriefHostSections:
     """A finding printed in full on one network and in brief on the next is one finding."""
 
