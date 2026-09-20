@@ -12,8 +12,8 @@
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSLocationUsageDescription</key>
-  <string>macOS only reveals the name of the Wi-Fi network you are connected to, and its access points, to apps with Location Services access. The home network audit uses them to spot a fake access point copying your network. Your location is never read.</string>
+  <string>macOS only reveals the name of the Wi-Fi network you are connected to, and its access points, to apps with Location Services access. The home network audit uses them to spot a fake access point copying your network, and to move this Mac between your own networks when auditing each one. Your location is never read.</string>
   <key>NSLocationWhenInUseUsageDescription</key>
-  <string>macOS only reveals the name of the Wi-Fi network you are connected to, and its access points, to apps with Location Services access. The home network audit uses them to spot a fake access point copying your network. Your location is never read.</string>
+  <string>macOS only reveals the name of the Wi-Fi network you are connected to, and its access points, to apps with Location Services access. The home network audit uses them to spot a fake access point copying your network, and to move this Mac between your own networks when auditing each one. Your location is never read.</string>
 </dict>
 </plist>
