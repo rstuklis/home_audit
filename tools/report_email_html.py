@@ -58,6 +58,9 @@ RISK_COLOUR = {
 FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
 MONO = "'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
 
+# Printing (Apple Mail's "Export as PDF", say) drops background colours
+# unless asked to keep them; the badges are unreadable without theirs.
+KEEP_COLOUR = "-webkit-print-color-adjust:exact;print-color-adjust:exact;"
 CARD = (f"background:#ffffff;border-radius:12px;padding:20px 24px;"
         f"margin:0 0 20px 0;box-shadow:0 2px 8px rgba(0,0,0,0.08);")
 # The page div sets the font and colour once; cards, headings and bands
@@ -66,7 +69,7 @@ CARD = (f"background:#ffffff;border-radius:12px;padding:20px 24px;"
 H2 = f"color:{BLUE};font-size:20px;font-weight:600;margin:0 0 12px 0;"
 PRE = (f"font-family:{MONO};font-size:12.5px;line-height:1.5;margin:0;"
        f"white-space:pre-wrap;overflow-wrap:break-word;word-wrap:break-word;")
-BAND = (f"background:{BLUE};color:#ffffff;border-radius:12px;"
+BAND = (f"background:{BLUE};color:#ffffff;border-radius:12px;{KEEP_COLOUR}"
         f"padding:14px 24px;margin:28px 0 20px 0;font-size:18px;font-weight:600;")
 BAND_SUB = "font-weight:400;font-size:14px;opacity:0.85;"
 
@@ -122,7 +125,7 @@ def badge(rating):
     colour = RISK_COLOUR.get(rating, RISK_COLOUR["UNKNOWN"])
     return (f'<span style="display:inline-block;min-width:60px;text-align:center;'
             f'background:{colour};color:#fff;padding:0 6px;border-radius:3px;'
-            f'font-size:11px;font-weight:700">{rating}</span>')
+            f'font-size:11px;font-weight:700;{KEEP_COLOUR}">{rating}</span>')
 
 
 def mark_line(line):
@@ -251,8 +254,8 @@ def render(text):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Home Network Audit Report</title>
 </head>
-<body style="margin:0;padding:0;background:{PAGE_BG};">
-<div style="max-width:960px;margin:0 auto;padding:24px 16px;background:{PAGE_BG};font-family:{FONT};color:{TEXT};">
+<body style="margin:0;padding:0;background:{PAGE_BG};{KEEP_COLOUR}">
+<div style="max-width:960px;margin:0 auto;padding:24px 16px;background:{PAGE_BG};font-family:{FONT};color:{TEXT};{KEEP_COLOUR}">
 <h1 style="font-family:{FONT};color:{TEXT};font-size:26px;font-weight:700;border-bottom:3px solid {BLUE};padding-bottom:10px;margin:0 0 10px 0;">&#127968; Home Network Audit Report</h1>
 <p style="font-family:{FONT};color:{TEXT};font-size:14px;margin:0 0 20px 0;">Generated: {head_sub} &nbsp;|&nbsp; Tool: home_net_audit.py</p>
 {body}
