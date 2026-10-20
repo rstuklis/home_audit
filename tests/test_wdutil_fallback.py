@@ -158,9 +158,9 @@ class TestChecksUseTheFallback:
             {"wifi_bssids": []},
             {"wifi_bssids": ["aa:bb:cc:dd:ee:01"],
              "evil_twin": {"source": "association_record"}})
-        joined = " ".join(notes).lower()
-        assert "evil twin" not in joined
-        assert "new visibility" in joined
+        # Upstream's rule since the Wi-Fi helper: an empty old list is never
+        # compared against at all, so the first readable run adds no note.
+        assert notes == []
 
     def test_a_fallback_roam_defers_to_the_evil_twin_section_in_the_diff(self, mod):
         notes = mod.diff_baseline(

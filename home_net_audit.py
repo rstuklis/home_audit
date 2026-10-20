@@ -36,10 +36,13 @@ Acronyms used below:
 
 import argparse
 import concurrent.futures as futures
+import contextlib
 import errno
 import hashlib
 import hmac
 import html
+import http.client
+import io
 import ipaddress
 import json
 import os
@@ -705,14 +708,25 @@ def check_ipv6_routers(known=None):
                     "compare against yet — save one so a second router would show up."}
 
 
-def action_ipv6_routers(known=None):
+def action_ipv6_routers(known=None, compact=False):
     hr("IPv6 ROUTER ADVERTISEMENTS")
     result = check_ipv6_routers(known)
     neighbours = get_ipv6_neighbours()
     print(f"  IPv6 neighbours seen : {len(neighbours)}")
+    # Compact keeps the rows this section exists for — whoever is advertising
+    # as a router — and drops the rest. The others are privacy addresses that
+    # rotate by design, so the list differs on every run and says nothing by
+    # doing so; nothing is compared against it.
+    shown = 0
     for addr, n in sorted(neighbours.items()):
+        if compact and not n.get("router"):
+            continue
         flag = "  <-- advertising as a router" if n.get("router") else ""
         print(f"    {addr:<42} {n['mac']}{flag}")
+        shown += 1
+    if compact and len(neighbours) > shown:
+        print(f"    ({len(neighbours) - shown} ordinary neighbour(s) not listed; "
+              "run without --compact to see them)")
     print(f"  [{result['risk']:6}] {result['note']}")
     return result
 
@@ -740,12 +754,21 @@ def local_network_denied_note(what):
     have UPnP disabled. All three sent the reader somewhere useless, and the
     last two sent them somewhere actively wrong, since no amount of privilege
     or router configuration changes a permission the job cannot be granted.
+
+    "Cannot be granted" turned out to be true only of a bare script. The approval
+    attaches to a signed app, and a LaunchAgent that runs zsh and an unsigned
+    python gives macOS nothing to attach it to — so no prompt is ever shown and
+    nothing appears in System Settings to switch on. Run through an app bundle,
+    the same job is asked once and then works: tools/audit_launcher builds one.
+    Measured on macOS 26.7, which is why the note now names the fix.
     """
     return (f"{what} was refused by the OS, not answered by the network. On macOS "
             "this is Local Network privacy denying a background (launchd/cron) job "
             "access to its own subnet; the same audit run from a terminal works. "
-            "It is not a privilege problem and sudo does not help — run the audit "
-            "interactively for this check.")
+            "It is not a privilege problem and sudo does not help. Either run the "
+            "audit interactively for this check, or have the scheduled job start "
+            "it through the launcher app built by tools/audit_launcher/build.sh, "
+            "which macOS can grant Local Network access to.")
 
 
 def probe_port(host, port, timeout=0.6):
@@ -1340,7 +1363,20 @@ def save_baseline(state, passphrase=None):
     Returns the record that was written. Passing no passphrase still chains and
     seals, but with a bare hash rather than an HMAC — see seal_payload.
     """
+    # Worked out BEFORE carrying forward, from what this run itself saw. After
+    # it, a run that skipped the sweep holds the previous device list as if it
+    # were its own, and every device in it would be stamped "seen just now".
+    # Done here, in the one function every save goes through, so the menu's
+    # save and the CLI's cannot drift apart. Inside the sealed state, so the
+    # memory cannot be padded with a stranger's MAC without breaking the seal.
+    memory = update_device_memory(load_baseline() or {}, state)
     state = carry_forward_unmeasured(state)
+    # Only when there is something to remember: a state that says nothing about
+    # devices gains no key telling the reader that nothing is remembered.
+    if memory:
+        state["device_memory"] = memory
+    else:
+        state.pop("device_memory", None)
     history = read_history()
     prev = history[-1]["seal"] if history else None
     seq = (history[-1]["seq"] + 1) if history else 1
@@ -2759,6 +2795,9 @@ EVIDENCE = {
     "router_open_ports":   (MEASURED, "TCP connections this tool opened to the gateway", "Router port scan"),
     "upstream_open_ports": (MEASURED, "TCP connections this tool opened to the modem", "Upstream port scan"),
     "router_tls":          (MEASURED, "the certificate the gateway presented", "Router TLS"),
+    # Measured, because the tool asked and watched what came back. The DORMANT
+    # verdict in particular is a measurement of silence, and says so itself.
+    "upnp_listeners":      (MEASURED, "how port 1900 answered UPnP discovery and description requests", "UPnP listener probe"),
     "ipv6":                (MEASURED, "Router Advertisements seen on the link", "IPv6 routers"),
     "evil_twin":           (MEASURED, "beacons seen on the air", "Evil twin check"),
     # How many servers answered is a fact about the wire. What they offered is
@@ -2775,6 +2814,9 @@ EVIDENCE = {
     "router_hostname":     (RESOLVER_DEPENDENT, "a reverse DNS answer about the gateway", "Router hostname"),
 
     "device_vendors":      (THIRD_PARTY, "an HTTP lookup to api.macvendors.com, over this network", "Device vendor names"),
+    # What a device calls itself is the purest self-report in the tool: free to
+    # claim, and chosen by the thing being identified.
+    "device_names":        (SELF_REPORTED, "what each device calls itself over mDNS, UPnP or DHCP", "Announced device names"),
 }
 
 _EVIDENCE_TAG = {
@@ -2791,6 +2833,9 @@ _DERIVED_EVIDENCE = {
         for d in (state.get("devices") or ())),
     "dhcp_offer_contents": lambda state: bool(
         isinstance(state.get("dhcp"), dict) and state["dhcp"].get("responders")),
+    "device_names": lambda state: any(
+        isinstance(d, dict) and d.get("names")
+        for d in (state.get("devices") or ())),
 }
 
 
@@ -2819,11 +2864,15 @@ def findings_by_evidence(state):
     return {cls: sorted(keys) for cls, keys in grouped.items()}
 
 
-def describe_evidence_basis(state):
+def describe_evidence_basis(state, compact=False):
     """The report block naming which findings came from the thing they describe.
 
     Silent when this run produced none of them, so a report with nothing to
     qualify gains no paragraph telling the reader that nothing needs qualifying.
+
+    `compact` keeps the list — which findings are second-hand is a fact about
+    this run — and folds the standing explanation of what that means into one
+    line, since a combined report would otherwise carry it once per network.
     """
     grouped = findings_by_evidence(state)
     dependent = [(cls, key)
@@ -2840,6 +2889,13 @@ def describe_evidence_basis(state):
     for cls, key in dependent:
         _cls, basis, label = EVIDENCE[key]
         lines.append(f"    [{_EVIDENCE_TAG[cls]:13}] {label:{width}}  — {basis}")
+    if compact:
+        lines.append("  A clean result from these is weak evidence; anything they admit "
+                     "to is strong.")
+        if independent:
+            lines.append(f"  The other {independent} finding(s) are this machine's own "
+                         "state or measurements.")
+        return "\n".join(lines)
     lines.append("")
     lines.append("  Take seriously anything they admit to: a router listing a port "
                  "mapping has")
@@ -3153,7 +3209,185 @@ def network_name_for_subnet(subnet_str, networks):
     return networks.get(key, networks.get(subnet_str, subnet_str))
 
 
-def diff_baseline(old, new):
+# ---------------------------------------------------------------------------
+# Remembering devices for longer than one run
+# ---------------------------------------------------------------------------
+#
+# The baseline is the last run, so "new" used to mean "not there last time". A
+# camera hub that misses one sweep — asleep, mid-reboot, slow to answer a ping —
+# is dropped from the baseline that run and reads as a NEW device on the next,
+# an hour later. On a house full of battery and Wi-Fi gadgets that happened most
+# runs, and a NEW-device line that is usually the owner's own hardware is one
+# nobody reads by the week a stranger's turns up in it.
+#
+# So each network's baseline also carries a memory: every stable MAC seen there,
+# with when it was first and last seen, kept for DEVICE_MEMORY_DAYS after its
+# last sighting. A device in that memory that turns up again is "back after an
+# absence" — printed, by name, every time, but not a change. One that has never
+# been seen, or not within the window, is NEW exactly as before.
+#
+# What this costs, stated rather than hidden: someone who clones the MAC of a
+# remembered device WHILE IT IS AWAY now arrives as "back" rather than "NEW".
+# Before, that worked only against a device present in the last run, where the
+# clone collides with the real one on the air; the window is wider now. It is
+# the same limit every MAC comparison in this tool has — an address is a claim,
+# not an identity — and it is why a return is always printed, never dropped.
+#
+# Departures are untouched: a device missing from this run is still reported as
+# gone, the run it goes. Rotating private addresses are not remembered at all;
+# they are a population, counted rather than named, as diff_baseline explains.
+
+DEVICE_MEMORY_DAYS = 30
+DEVICE_MEMORY_LIMIT = 1024
+_MAC_SHAPE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def _parse_stamp(value):
+    """A timezone-aware datetime from an ISO string, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def remembered_devices(state):
+    """{mac: {"first_seen", "last_seen"}} for a saved state, read defensively.
+
+    A baseline written before the memory existed still remembers one thing: the
+    devices in it were seen when it was saved. Seeding from that is what makes
+    the first run after the upgrade behave, instead of starting from nothing.
+    """
+    state = state or {}
+    memory = {}
+    saved = state.get("device_memory")
+    if isinstance(saved, dict):
+        for mac, entry in saved.items():
+            if not (isinstance(mac, str) and isinstance(entry, dict)):
+                continue
+            mac = mac.lower()
+            last = entry.get("last_seen")
+            if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac) or _parse_stamp(last) is None:
+                continue
+            first = entry.get("first_seen")
+            memory[mac] = {"first_seen": first if _parse_stamp(first) else last, "last_seen": last}
+    stamp = state.get("timestamp")
+    if _parse_stamp(stamp) is not None:
+        for d in state.get("devices") or []:
+            mac = d.get("mac") if isinstance(d, dict) else None
+            if not isinstance(mac, str):
+                continue
+            mac = mac.lower()
+            if _MAC_SHAPE.match(mac) and not is_randomized_mac(mac) and mac not in memory:
+                memory[mac] = {"first_seen": stamp, "last_seen": stamp}
+    return memory
+
+
+def update_device_memory(previous, state):
+    """The memory to save with `state`: what was remembered, plus what was seen now.
+
+    A run that did not sweep learns nothing about devices and so changes nothing
+    — not even expiry, since "not looked for" is not "not seen".
+    """
+    memory = remembered_devices(previous)
+    if not swept_anywhere(state):
+        return memory
+    stamp = state.get("timestamp")
+    now = _parse_stamp(stamp)
+    if now is None:
+        return memory
+    for d in state.get("devices") or []:
+        mac = d.get("mac") if isinstance(d, dict) else None
+        if not isinstance(mac, str):
+            continue
+        mac = mac.lower()
+        if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac):
+            continue
+        entry = memory.setdefault(mac, {"first_seen": stamp, "last_seen": stamp})
+        entry["last_seen"] = stamp
+    cutoff = now - timedelta(days=DEVICE_MEMORY_DAYS)
+    memory = {m: e for m, e in memory.items() if (_parse_stamp(e["last_seen"]) or now) >= cutoff}
+    if len(memory) > DEVICE_MEMORY_LIMIT:
+        keep = sorted(memory, key=lambda m: memory[m]["last_seen"], reverse=True)[:DEVICE_MEMORY_LIMIT]
+        memory = {m: memory[m] for m in keep}
+    return memory
+
+
+def returning_devices(old, new):
+    """{mac: last_seen} for devices present now, absent from the last run, but
+    seen on this network within the memory window."""
+    if not (swept_anywhere(old) and swept_anywhere(new)):
+        return {}
+    def stable(entry):
+        out = set()
+        for d in entry.get("devices") or []:
+            mac = d.get("mac") if isinstance(d, dict) else None
+            if isinstance(mac, str) and mac != "unknown" and not is_randomized_mac(mac.lower()):
+                out.add(mac.lower())
+        return out
+    arrived = stable(new) - stable(old)
+    if not arrived:
+        return {}
+    memory = remembered_devices(old)
+    now = _parse_stamp(new.get("timestamp"))
+    back = {}
+    for mac in arrived:
+        entry = memory.get(mac)
+        if not entry:
+            continue
+        last = _parse_stamp(entry["last_seen"])
+        # With no usable clock on the new run the window cannot be applied, and
+        # the memory has already been pruned to it at save time.
+        if now is None or last is None or now - last <= timedelta(days=DEVICE_MEMORY_DAYS):
+            back[mac] = entry["last_seen"]
+    return back
+
+
+def describe_returning_devices(old, new, labels=None):
+    """The lines naming devices that came back, or None. Never a change, always said."""
+    back = returning_devices(old, new)
+    if not back:
+        return None
+    labels = labels or {}
+    lines = [f"Known device(s) back after an absence — seen here within the last "
+             f"{DEVICE_MEMORY_DAYS} days, so not counted as new:"]
+    for mac in sorted(back):
+        name = labels.get(mac)
+        when = (back[mac] or "")[:16].replace("T", " ")
+        lines.append(f"  · {mac}" + (f"  {name}" if name else "") + f"  (last seen {when} UTC)")
+    return "\n".join(lines)
+
+
+def describe_mac(mac, labels=None, *states):
+    """`mac` with what is known about it in brackets: the owner's label, or
+    failing that the vendor recorded for it in one of `states`.
+
+    For the change lines. "Device(s) gone: 34:64:a9:cc:57:2e" makes the reader
+    look an address up; "34:64:a9:cc:57:2e [HP Printer]" does not. Only two kinds
+    of text are ever added, and neither is the device's to choose: a label the
+    owner typed, and a vendor name from the OUI registry. What a device ANNOUNCES
+    about itself is deliberately left out — these lines sit at the top of the
+    email and are read first, and a name is free to claim.
+    """
+    # Square brackets, because labels often carry round ones of their own
+    # ("Tuya device A (6d:c6)"). _banner_text rather than _device_name_text: that
+    # one trims a trailing dot, which is right for a DNS name and wrong for
+    # "Apple, Inc."
+    label = (labels or {}).get(mac)
+    if isinstance(label, str) and _banner_text(label, 60):
+        return f"{mac} [{_banner_text(label, 60)}]"
+    for state in states:
+        for d in (state or {}).get("devices") or []:
+            if isinstance(d, dict) and str(d.get("mac", "")).lower() == mac:
+                vendor = _banner_text(d.get("vendor"), 60)
+                if vendor and vendor != PRIVATE_MAC_VENDOR:
+                    return f"{mac} [unlabelled; {vendor}]"
+    return mac
+
+
+def diff_baseline(old, new, labels=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
     #
@@ -3238,10 +3472,18 @@ def diff_baseline(old, new):
         # Where it used to answer is unknown, so there is nothing to check it
         # against, and reporting is what the empty set already yields here.
         vanished = {m for m in vanished if old_subnets.get(m, set()) <= new_cov}
+    # A device remembered from an earlier run on this network is back, not new.
+    # It is reported by describe_returning_devices — every time, by name — but
+    # it is not a change. See "Remembering devices for longer than one run".
+    appeared -= set(returning_devices(old, new))
+    # An arrival is described from this run, where it was seen; a departure from
+    # the baseline, the only place it still exists.
     if appeared:
-        notes.append(f"NEW device(s) since baseline: {', '.join(sorted(appeared))}")
+        notes.append("NEW device(s) since baseline: "
+                     + ", ".join(describe_mac(m, labels, new) for m in sorted(appeared)))
     if vanished:
-        notes.append(f"Device(s) gone since baseline: {', '.join(sorted(vanished))}")
+        notes.append("Device(s) gone since baseline: "
+                     + ", ".join(describe_mac(m, labels, old) for m in sorted(vanished)))
     # A device that changes subnet leaves the MAC set completely unchanged, so
     # the two comparisons above are structurally blind to it — collect_devices
     # records a "subnet" per device precisely so this can be seen. It matters
@@ -3273,7 +3515,8 @@ def diff_baseline(old, new):
                 if devices_measured else []):
         was, now = old_subnets[mac], new_subnets[mac]
         if new_cov and was.isdisjoint(now) and was <= new_cov:
-            entry = f"{mac} ({', '.join(sorted(was))} -> {', '.join(sorted(now))})"
+            entry = (f"{describe_mac(mac, labels, new, old)} "
+                     f"({', '.join(sorted(was))} -> {', '.join(sorted(now))})")
             if old_cov and not now <= old_cov:
                 entry += " [the baseline never covered that destination]"
             moved.append(entry)
@@ -3335,26 +3578,33 @@ def diff_baseline(old, new):
             notes.append(f"Port(s) now closed on {host}: {sorted(old_ports - new_ports)}")
     old_bssids = set(old.get("wifi_bssids", []))
     new_bssids = set(new.get("wifi_bssids", []))
-    added_bssids = new_bssids - old_bssids
-    if added_bssids and not old_bssids:
-        # An empty old list means earlier runs could not see any BSSID —
-        # redaction, not absence — so this is visibility beginning, not a
-        # second access point appearing. Asserting "evil twin" here would
-        # contradict the Evil Twin section's own verdict in the same report.
-        notes.append(
-            f"BSSID(s) recorded for the first time: {sorted(added_bssids)}. "
-            "Earlier runs could not read any, so this is new visibility, "
-            "not a new access point.")
-    elif added_bssids and (new.get("evil_twin") or {}).get("source") == "association_record":
+    # Only against a list that has something in it. An empty one means BSSIDs
+    # had never been readable — the state of every Mac until the Wi-Fi helper or
+    # a fallback can read one — and comparing against it reports the owner's
+    # entire mesh as evil twins on the first run that can finally see it.
+    # check_evil_twin makes the same distinction ("No baseline yet").
+    added_bssids = (new_bssids - old_bssids) if old_bssids else set()
+    if added_bssids and (new.get("evil_twin") or {}).get("source") == "association_record":
+        # The association record sees only the joined access point, so one
+        # never-seen BSSID is what a mesh roam looks like. The Evil Twin section
+        # has already rated it; the diff must not out-rank it.
         notes.append(
             f"Associated with previously unseen BSSID(s): {sorted(added_bssids)}. "
             "Read from the association record, which sees only the joined "
             "access point — a mesh roaming between its own units looks like "
             "this. The Evil Twin section has the verdict.")
     elif added_bssids:
-        notes.append(
-            f"NEW access point advertising your SSID: {sorted(added_bssids)}. "
-            "A second AP broadcasting your network name is an evil twin.")
+        siblings, strangers = split_unexpected_bssids(
+            sorted(added_bssids), sorted(old_bssids))
+        if strangers:
+            notes.append(
+                f"NEW access point advertising your SSID: {strangers}. "
+                "A second AP broadcasting your network name is an evil twin.")
+        if siblings:
+            notes.append(
+                f"Another radio heard on a known access point: {siblings}. One octet "
+                "from a BSSID already in the baseline, so most likely the same unit's "
+                "other band rather than a new device.")
 
     old_offer = (old.get("dhcp") or {}).get("responders") or []
     new_offer = (new.get("dhcp") or {}).get("responders") or []
@@ -3864,6 +4114,123 @@ def _redacted_wifi_fallback():
         return ssid, bssid
     return _wdutil_wifi_fallback()
 
+# ---------------------------------------------------------------------------
+# The Wi-Fi helper: the one way past Location Services for a terminal tool
+# ---------------------------------------------------------------------------
+
+WIFI_HELPER_ENV = "HOME_NET_AUDIT_WIFI_HELPER"
+_WIFI_HELPER_RELPATH = "Applications/HomeAuditWiFi.app/Contents/MacOS/HomeAuditWiFi"
+
+
+def wifi_helper_path():
+    """Where the helper binary is expected. Resolved at call time, not import
+    time, so $HOME and the override are read when they are actually in force."""
+    return (os.environ.get(WIFI_HELPER_ENV)
+            or os.path.join(os.path.expanduser("~"), _WIFI_HELPER_RELPATH))
+
+
+def _normalise_bssid(value):
+    """'3c:28:6d:5e:20:8a' from whatever CoreWLAN printed, or None.
+
+    CoreWLAN drops leading zeros ('0:1a:2b:…'), and a baseline comparison is a
+    string comparison, so the same access point must always spell the same.
+    """
+    raw = str(value or "").strip().split(":")
+    if len(raw) != 6:
+        return None
+    try:
+        return ":".join(f"{int(x, 16):02x}" for x in raw)
+    except ValueError:
+        return None
+
+
+def read_wifi_helper(scan=False):
+    """Ask the HomeAuditWiFi helper app for the SSID and BSSIDs macOS withholds.
+
+    macOS gives the SSID and every BSSID only to a process with Location
+    Services access, and the advice this tool used to print — grant it to your
+    terminal — cannot be followed: Terminal never requests that access, and the
+    Location Services list has no way to add an app that has not asked. An app
+    that asks for itself can be approved, so tools/wifi_helper builds one. It
+    reads the Wi-Fi interface, prints one JSON object and exits.
+
+    Returns {"installed", "authorization", "ssid", "bssid", "bssids", "error"}.
+    Everything in the reply is validated before use: it arrives as text from
+    another program, and it ends up printed, compared and saved.
+
+    What this does to the evidence: the SSID and BSSIDs are still measurements
+    of beacons on the air, but read by a second program on this host rather
+    than by system_profiler. A compromised host could replace either.
+    """
+    path = wifi_helper_path()
+    result = {"installed": False, "authorization": None, "ssid": None,
+              "bssid": None, "bssids": [], "error": None}
+    if sys.platform != "darwin" or not os.path.isfile(path):
+        return result
+    result["installed"] = True
+
+    out = run([path] + (["--scan"] if scan else []), timeout=30)
+    try:
+        reply = json.loads(out) if out and out.strip() else None
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict) or reply.get("helper") != 1:
+        result["error"] = "the helper ran but did not return a reply this tool understands"
+        return result
+
+    auth = reply.get("authorization")
+    if auth in ("authorized", "denied", "restricted", "not_determined"):
+        result["authorization"] = auth
+    if reply.get("location_services_on") is False:
+        result["authorization"] = "location_services_off"
+
+    ssid = reply.get("ssid")
+    # 32 bytes is the 802.11 limit; printable, because it is about to be printed.
+    if (isinstance(ssid, str) and 0 < len(ssid.encode("utf-8")) <= 32
+            and ssid.isprintable()):
+        result["ssid"] = ssid
+    result["bssid"] = _normalise_bssid(reply.get("bssid"))
+
+    seen = reply.get("same_ssid_bssids")
+    found = []
+    for b in (seen if isinstance(seen, list) else [])[:64]:
+        nb = _normalise_bssid(b)
+        if nb and nb not in found:
+            found.append(nb)
+    # The access point this machine is associated with is advertising the SSID
+    # by definition, whether or not this particular scan happened to hear it.
+    if result["ssid"] and result["bssid"] and result["bssid"] not in found:
+        found.append(result["bssid"])
+    result["bssids"] = sorted(found)
+    if isinstance(reply.get("scan_error"), str):
+        result["error"] = _banner_text(reply["scan_error"], 120)
+    return result
+
+
+def wifi_name_withheld_note(helper, what="the connected SSID"):
+    """Why the SSID/BSSIDs could not be read, in words that can be acted on."""
+    app = os.path.dirname(os.path.dirname(os.path.dirname(wifi_helper_path())))
+    if not helper.get("installed"):
+        return (f"Could not read {what}. macOS withholds it from a process without "
+                "Location Services access, and a terminal cannot be given that "
+                "access: it never asks, and the list has no way to add it. Build "
+                "the small helper app that can ask — run tools/wifi_helper/build.sh "
+                "from the audit's folder, then approve its prompt. Running with sudo "
+                "does not help; the gate is the permission, not the user.")
+    auth = helper.get("authorization")
+    if auth == "location_services_off":
+        return (f"Could not read {what}: Location Services is switched off for this "
+                "Mac. Turn it on in System Settings > Privacy & Security > Location "
+                "Services.")
+    if auth in ("denied", "restricted", "not_determined"):
+        return (f"Could not read {what}: the Wi-Fi helper is installed but its "
+                f"Location Services access is '{auth}'. Allow \"Home Audit Wi-Fi\" in "
+                "System Settings > Privacy & Security > Location Services, or run:  "
+                f"open -W \"{app}\" --args --prompt")
+    detail = helper.get("error") or "it reported no network — is this Mac on Wi-Fi?"
+    return (f"Could not read {what}: the Wi-Fi helper has Location Services access "
+            f"but {detail}.")
+
 
 def check_evil_twin(ssid=None, known=None):
     """Flag a BSSID advertising your SSID that was not in the baseline.
@@ -3877,40 +4244,43 @@ def check_evil_twin(ssid=None, known=None):
     if ssid is None:
         ssid, _ = _parse_connected_wifi_block(out)
 
-    # Fallback only on actual redaction. An unassociated Mac, absent Wi-Fi
-    # hardware or a Linux observer returns no SSID at all, and issuing failed
-    # sudo attempts from those hosts would put privilege-escalation noise in
-    # their auth logs for zero possible benefit.
+    # system_profiler first, because it needs nothing installed. When macOS has
+    # redacted its answer, try the helper app, then — for a Mac where the helper
+    # is not installed or not yet approved — the system configuration store's
+    # association record and root wdutil. The fallbacks fire only on actual
+    # redaction: an unassociated Mac, absent Wi-Fi hardware or a Linux observer
+    # returns no SSID at all, and issuing failed sudo attempts from those hosts
+    # would put privilege-escalation noise in their auth logs for zero benefit.
+    helper = None
     via_fallback = False
-    if ssid == "<redacted>":
-        w_ssid, w_bssid = _redacted_wifi_fallback()
-        if w_ssid:
-            ssid = w_ssid
-            via_fallback = True
-            networks.setdefault(ssid, [])
-            if w_bssid and w_bssid not in networks[ssid]:
-                networks[ssid].append(w_bssid)
-
     if not ssid or ssid == "<redacted>":
-        return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                "note": "Could not read the connected SSID. macOS withholds it "
-                        "from a process without Location Services access — grant "
-                        "it to this terminal in System Settings > Privacy & "
-                        "Security > Location Services for interactive runs. "
-                        "The automatic fallbacks — the system configuration "
-                        "store's association record, then root wdutil under a "
-                        "NOPASSWD rule — were also unreadable, so a scheduled "
-                        "job on this system has no path to the SSID."}
+        helper = read_wifi_helper(scan=True)
+        if helper["ssid"]:
+            ssid = helper["ssid"]
+        elif ssid == "<redacted>":
+            w_ssid, w_bssid = _redacted_wifi_fallback()
+            if w_ssid:
+                ssid = w_ssid
+                via_fallback = True
+                networks.setdefault(ssid, [])
+                if w_bssid and w_bssid not in networks[ssid]:
+                    networks[ssid].append(w_bssid)
+        if not ssid or ssid == "<redacted>":
+            return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
+                    "note": wifi_name_withheld_note(helper) + " The automatic "
+                            "fallbacks — the system configuration store's "
+                            "association record, then root wdutil under a NOPASSWD "
+                            "rule — were also unreadable."}
 
     bssids = networks.get(ssid, [])
     if not bssids:
+        if helper is None:
+            helper = read_wifi_helper(scan=True)
+        if helper["ssid"] == ssid:
+            bssids = list(helper["bssids"])
+    if not bssids:
         return {"ssid": ssid, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                "note": f"No BSSID visible for {ssid}. BSSIDs are withheld from a "
-                        "process without Location Services access — grant it in "
-                        "System Settings > Privacy & Security > Location Services. "
-                        "sudo alone does not reveal them; a NOPASSWD rule for "
-                        "`/usr/bin/wdutil info` lets the audit read the "
-                        "associated one."}
+                "note": wifi_name_withheld_note(helper, what=f"any BSSID for {ssid}")}
 
     known = list(known or [])
 
@@ -3949,16 +4319,64 @@ def check_evil_twin(ssid=None, known=None):
                         "network."}
 
     unexpected = [b for b in bssids if b not in known] if known else []
-    if unexpected:
+    siblings, strangers = split_unexpected_bssids(unexpected, known)
+    if strangers:
         return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "HIGH",
-                "note": f"{ssid} is being advertised by {', '.join(unexpected)}, which "
+                "note": f"{ssid} is being advertised by {', '.join(strangers)}, which "
                         "was not in the baseline. A second access point broadcasting "
                         "your network name is an evil twin — clients may associate "
                         "with it instead of yours."}
+    if siblings:
+        return {"ssid": ssid, "bssids": bssids, "unexpected": unexpected, "risk": "REVIEW",
+                "note": f"{ssid} is also advertised by {', '.join(siblings)}, not in the "
+                        "baseline but one octet away from an access point that is — "
+                        "almost certainly another radio on the same unit that earlier "
+                        "scans did not hear. It will be remembered from now on."}
     return {"ssid": ssid, "bssids": bssids, "unexpected": [], "risk": "OK",
             "note": f"{ssid} advertised by {len(bssids)} known BSSID(s)." if known
                     else f"{ssid} advertised by {', '.join(bssids)}. No baseline yet — "
                          "save one so a new access point would stand out."}
+
+
+def split_unexpected_bssids(unexpected, known):
+    """Sort BSSIDs not in the baseline into (siblings, strangers).
+
+    An access point has a radio per band, and their BSSIDs differ only in the
+    last octet: 38:8b:59:e0:f1:72 and :76 are one Google Nest. A scan is a
+    sample, so a known unit's second radio can go unheard for weeks and then
+    turn up — and calling that an evil twin is a HIGH alarm about the owner's
+    own hardware. A sibling shares its first five octets with a known BSSID and
+    is reported for review; anything else is a stranger and keeps the alarm.
+
+    This gives an attacker nothing they did not have. Someone who can choose
+    their BSSID can already clone a known one exactly, which no comparison of
+    addresses can see at all; picking a sibling instead is strictly louder.
+    """
+    prefixes = {b[:14] for b in (known or []) if isinstance(b, str) and len(b) == 17}
+    siblings = [b for b in unexpected if b[:14] in prefixes]
+    strangers = [b for b in unexpected if b[:14] not in prefixes]
+    return siblings, strangers
+
+
+def remembered_bssids(known, seen):
+    """The access points to treat as known next time: everything known, plus
+    everything heard now.
+
+    A Wi-Fi scan is a sample, not a census. A mesh node at the far end of the
+    house is heard by one scan and missed by the next, and saving only what this
+    run heard would forget it — so its return a week later reads as a NEW access
+    point copying the network, a HIGH alarm about the owner's own hardware. A run
+    that could not read BSSIDs at all would forget every one of them.
+
+    The set only grows. That costs nothing a smaller set would have caught: an
+    unknown BSSID is still reported on the run that first hears it, which is the
+    only run either design reports it on.
+    """
+    merged = []
+    for b in list(known or []) + list(seen or []):
+        if isinstance(b, str) and b not in merged:
+            merged.append(b)
+    return sorted(merged)
 
 
 def action_evil_twin(known=None):
@@ -3994,11 +4412,10 @@ def check_wifi_security():
     if ssid_raw and ssid_raw != "<redacted>":
         result["ssid"] = ssid_raw
     elif ssid_raw == "<redacted>":
-        # Redaction specifically — an unassociated or Wi-Fi-less host gets no
-        # block at all, and a failed sudo attempt there is pure auth-log noise.
-        w_ssid, _ = _redacted_wifi_fallback()
-        if w_ssid:
-            result["ssid"] = w_ssid
+        # Redacted means there IS a network and macOS will not name it here.
+        # No scan: this check only wants the name. The helper first; failing
+        # that, the association record, then root wdutil.
+        result["ssid"] = read_wifi_helper()["ssid"] or _redacted_wifi_fallback()[0]
 
     # Security is scoped to the connected block only — never a neighbour's value.
     m = re.search(r"^\s*Security:\s*(.+?)\s*$", block, re.MULTILINE)
@@ -4052,7 +4469,7 @@ def action_wifi_security():
     hr("WI-FI SECURITY MODE")
     r = check_wifi_security()
     print(f"  SSID (network name) : "
-          f"{r['ssid'] or 'unknown (needs Location Services access)'}")
+          f"{r['ssid'] or 'unknown (needs Location Services access — see the evil twin check)'}")
     print(f"  Auth / encryption   : {r['auth'] or 'unknown'}")
     if r["cipher"]:
         print(f"  Cipher              : {r['cipher']}")
@@ -4436,6 +4853,247 @@ def get_upnp_port_mappings(gateway):
         })
 
     return mappings, None
+
+
+# ---------------------------------------------------------------------------
+# What is actually behind an open port 1900
+# ---------------------------------------------------------------------------
+
+# Paths the common UPnP stacks (miniupnpd, libupnp, Broadcom, Realtek) serve a
+# root device description from. A live stack answers at least one of these or
+# names its own in a discovery reply; a web server left running after the
+# feature was switched off answers 404 to all of them.
+UPNP_DESCRIPTION_PATHS = (
+    "/rootDesc.xml", "/igd.xml", "/gatedesc.xml", "/description.xml",
+    "/IGD.xml", "/upnp/IGD.xml", "/DeviceDescription.xml",
+)
+
+# The services that can forward a WAN port on request. Their presence is the
+# whole reason port 1900 is worth a second look; a media server is not.
+_UPNP_GATEWAY_MARKERS = ("internetgatewaydevice", "wanipconnection",
+                         "wanpppconnection")
+
+UPNP_LIVE_GATEWAY = "live-gateway"
+UPNP_LIVE_OTHER = "live-other"
+UPNP_DORMANT = "dormant"
+UPNP_UNKNOWN = "unknown"
+
+
+def _banner_text(value, limit=80):
+    """A header value from a device on the LAN, made safe to print."""
+    text = "".join(ch for ch in str(value or "") if ch.isprintable())
+    return text.strip()[:limit]
+
+
+SSDP_MULTICAST_ADDR = "239.255.255.250"
+
+
+def _ssdp_search(host, port=1900, wait=2.0, multicast=False):
+    """Send one SSDP M-SEARCH and collect the replies that came from `host`.
+
+    Unicast by default, straight at the host: a routed host (a modem upstream
+    of a mesh router) is not reachable by multicast at all. With `multicast`
+    the same question goes to the SSDP group instead, because some stacks —
+    MiniUPnPd on a Google Nest among them, measured — answer the group address
+    and ignore a unicast search entirely. Asking only one way reads a working
+    gateway as silent.
+
+    Returns (replies, refused) where `replies` is the text of every datagram
+    that came back FROM THAT HOST — anyone on the link can answer a discovery,
+    and somebody else's answer says nothing about this listener — and
+    `refused` is True when the OS never let the question leave.
+    """
+    dest = SSDP_MULTICAST_ADDR if multicast else host
+    msearch = ("M-SEARCH * HTTP/1.1\r\n"
+               f"HOST: {dest}:{port}\r\n"
+               "MAN: \"ssdp:discover\"\r\n"
+               "MX: 1\r\n"
+               "ST: ssdp:all\r\n"
+               "\r\n")
+    replies = []
+    refused = False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return [], e.errno in UNREACHABLE_ERRNOS
+    try:
+        sock.settimeout(wait)
+        sock.sendto(msearch.encode(), (dest, port))
+        deadline = time.time() + wait
+        # ssdp:all earns one datagram per device and service, so keep reading
+        # until the window closes. Capped: the count is set by the responder.
+        while time.time() < deadline and len(replies) < 32:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                break
+            if addr[0] == host:
+                replies.append(data.decode("utf-8", "ignore"))
+    except OSError as e:
+        refused = e.errno in UNREACHABLE_ERRNOS
+    finally:
+        sock.close()
+    return replies, refused
+
+
+def _http_get_plain(host, port, path, timeout=3.0, limit=65536):
+    """One plain GET. Returns (status, server_header, body) or None if no HTTP came back.
+
+    http.client rather than urllib on purpose: it follows no redirects and
+    reads no proxy settings, so the request goes to the host being asked about
+    and nowhere a device on the LAN might prefer to send it.
+    """
+    conn = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", path, headers={"User-Agent": "home_net_audit",
+                                           "Connection": "close"})
+        resp = conn.getresponse()
+        body = resp.read(limit).decode("utf-8", "ignore")
+        return resp.status, resp.getheader("Server") or "", body
+    except (OSError, http.client.HTTPException, ValueError):
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def _looks_like_upnp_description(body):
+    return "urn:schemas-upnp-org" in (body or "").lower()
+
+
+def classify_upnp_listener(host, port=1900, onlink=None):
+    """Work out what an open TCP port 1900 is actually doing.
+
+    A port scan can only say the port accepted a connection. That is the same
+    answer for a router that will forward a WAN port to anyone who asks and for
+    one whose UPnP was switched off while the SDK's little web server stayed
+    up — and the second case is common enough (libupnp-based modems do it) that
+    the bare "[REVIEW] 1900" sends people to disable a feature they already
+    disabled. So ask the listener the two things a live UPnP stack answers:
+
+      * an SSDP discovery — unicast to the host itself, and by multicast as
+        well unless the host is known to be off-link, where multicast cannot
+        reach it;
+      * a GET for a device description, at the advertised LOCATION if discovery
+        gave one and at the well-known paths either way.
+
+    Returns {"state", "risk", "server", "summary", "caveat"} where state is one
+    of UPNP_LIVE_GATEWAY / UPNP_LIVE_OTHER / UPNP_DORMANT / UPNP_UNKNOWN.
+
+    The two live verdicts rest on something the device said, which it had no
+    reason to say unless true. DORMANT rests on silence, and silence is weaker:
+    it is reported as what was observed, never as "UPnP is off". `onlink` sharpens
+    that — False means multicast discovery was never possible from here, so a
+    stack that ignores unicast searches cannot be told from a dormant one.
+    """
+    replies, refused = _ssdp_search(host, port)
+    if not replies and onlink is not False:
+        # Default multicast TTL is 1, so this never leaves the local link.
+        replies, mc_refused = _ssdp_search(host, port, multicast=True)
+        refused = refused or mc_refused
+
+    server = ""
+    http_answered = False
+    descriptions = []
+
+    # A LOCATION is only followed back to the host that was asked, over plain
+    # http — the same rule get_upnp_port_mappings applies, for the same reason.
+    targets = []
+    for text in replies:
+        m = re.search(r"(?im)^LOCATION:\s*(\S+)", text)
+        if m and _upnp_url_points_at(m.group(1), host):
+            parts = urllib.parse.urlsplit(m.group(1))
+            if parts.scheme == "http":
+                target = (parts.port or 80, parts.path or "/")
+                if target not in targets:
+                    targets.append(target)
+        if not server:
+            sm = re.search(r"(?im)^SERVER:\s*(.+)$", text)
+            if sm:
+                server = _banner_text(sm.group(1))
+    targets = targets[:4] + [(port, path) for path in ("/",) + UPNP_DESCRIPTION_PATHS]
+
+    for t_port, t_path in targets:
+        got = _http_get_plain(host, t_port, t_path)
+        if got is None:
+            # Nothing on this port speaks HTTP; the remaining well-known paths
+            # on the same port would only repeat the timeout.
+            if t_port == port:
+                break
+            continue
+        status, srv, body = got
+        if t_port == port:
+            http_answered = True
+        if srv and not server:
+            server = _banner_text(srv)
+        if status == 200 and _looks_like_upnp_description(body):
+            descriptions.append(body)
+            break
+
+    said = "\n".join(replies + descriptions).lower()
+    verdict = {"server": server, "caveat": ""}
+
+    if any(marker in said for marker in _UPNP_GATEWAY_MARKERS):
+        verdict.update(
+            state=UPNP_LIVE_GATEWAY, risk="REVIEW",
+            summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
+                     "ports for any device that asks; turn UPnP off on this "
+                     "device unless something needs it."))
+    elif replies or descriptions:
+        verdict.update(
+            state=UPNP_LIVE_OTHER, risk="INFO",
+            summary=("LIVE, but not a gateway service — UPnP answered without "
+                     "offering port forwarding (typically media or USB sharing). "
+                     "It cannot open WAN ports."))
+    elif http_answered:
+        verdict.update(
+            state=UPNP_DORMANT, risk="INFO",
+            summary=("DORMANT — the port is open but nothing behind it answered "
+                     "as UPnP: no reply to discovery, no device description. "
+                     "Typical of a UPnP web server left running after the "
+                     "feature was switched off."))
+        if onlink is False:
+            verdict["caveat"] = (
+                "This host is on another subnet, so only unicast discovery could "
+                "be tried; a stack that answers multicast alone would look the "
+                "same. Confirm against the device's own UPnP setting.")
+        else:
+            verdict["caveat"] = (
+                "Silence is weaker evidence than an answer: this is what was "
+                "observed, not proof the feature is off.")
+    else:
+        verdict.update(
+            state=UPNP_UNKNOWN, risk="REVIEW",
+            summary=(local_network_denied_note("The UPnP probe") if refused else
+                     "UNKNOWN — the port accepted a connection but answered "
+                     "neither discovery nor HTTP, so what is listening could "
+                     "not be determined."))
+    return verdict
+
+
+def describe_upnp_listener(verdict, indent="           "):
+    """The lines audit_host prints under an open port 1900."""
+    width = 78 - len(indent)
+    lines = []
+    for text in (verdict.get("summary"), verdict.get("caveat")):
+        if not text:
+            continue
+        line = ""
+        for word in text.split():
+            if line and len(line) + 1 + len(word) > width:
+                lines.append(indent + line)
+                line = word
+            else:
+                line = f"{line} {word}".strip()
+        if line:
+            lines.append(indent + line)
+    if verdict.get("server"):
+        lines.append(f"{indent}Server banner: {verdict['server']}")
+    return lines
 
 
 def action_upnp_dump():
@@ -5174,7 +5832,73 @@ def classify_listeners(services, system_ports):
     return {"system": system, "named": named, "unattributed": unattributed}
 
 
-def action_listening_services():
+EPHEMERAL_PORT_FLOOR = 49152
+
+
+def listener_fingerprint(services):
+    """The set a list of listeners is compared by.
+
+    Ports from 49152 up are handed out by the OS and move on every boot, so the
+    same daemon on a different dynamic port is the same listener: those are
+    compared by protocol and process alone. Everything below is compared by
+    number as well — a fixed port is a choice somebody made, and a new one is
+    exactly what this section is looking for.
+
+    A listener with no process name AND a dynamic port has nothing left to be
+    compared by: one such socket is indistinguishable from the next, they come
+    and go by the minute, and a set that already holds one cannot notice a
+    second. Comparing them buys no detection and reopens the table on most runs,
+    so — like rotating private MAC addresses — they are counted, not compared
+    (see anonymous_dynamic_listeners).
+    """
+    prints = set()
+    for s in services or []:
+        if not isinstance(s, dict):
+            continue
+        try:
+            port = int(s.get("port"))
+        except (TypeError, ValueError):
+            continue
+        proto, proc = str(s.get("proto", "")), str(s.get("process", ""))
+        if port >= EPHEMERAL_PORT_FLOOR:
+            if proc in ("", "?"):
+                continue
+            prints.add((proto, proc, "dynamic"))
+        else:
+            prints.add((proto, proc, port))
+    return prints
+
+
+def anonymous_dynamic_listeners(services):
+    """How many listeners have neither a process name nor a fixed port."""
+    count = 0
+    for s in services or []:
+        try:
+            if (isinstance(s, dict) and int(s.get("port")) >= EPHEMERAL_PORT_FLOOR
+                    and str(s.get("process", "")) in ("", "?")):
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    return count
+
+
+def _describe_fingerprint(fp):
+    proto, proc, port = fp
+    where = "a dynamic port" if port == "dynamic" else f"port {port}"
+    return f"{proc if proc and proc != '?' else 'unattributed'} on {proto} {where}"
+
+
+def action_listening_services(compact=False, known=None):
+    """List this machine's listeners.
+
+    With `compact`, and only when nothing is listening that was not in `known`
+    (the baseline's list), the table is replaced by a line saying so. Anything
+    NEW always gets the full table, with the newcomer spelled out under it:
+    compact may shorten a report that has nothing new in it and nothing else.
+    A listener that went away does not hold the table open — short-lived system
+    sockets come and go all day, and a closed port is not what this section is
+    watching for — but it is still named.
+    """
     hr("LISTENING SERVICES AUDIT")
     print("  Checking what processes on this Mac accept inbound connections...")
     services = check_listening_services()
@@ -5192,6 +5916,26 @@ def action_listening_services():
     groups = classify_listeners(services, SYSTEM_PORTS)
     unattributed = groups["unattributed"]
     named = groups["named"]
+
+    now, before = listener_fingerprint(services), listener_fingerprint(known)
+    if compact and before and not (now - before):
+        names = sorted({s["process"] for s in named if s.get("process") not in ("", "?")})
+        print(f"\n  {len(services)} listener(s), none of them new since the baseline: "
+              f"{len(named)} named non-system"
+              + (f" ({', '.join(names)})" if names else "")
+              + f", {len(unattributed)} unattributed,")
+        print(f"  {len(services) - len(named) - len(unattributed)} system. Dynamic port "
+              "numbers are not compared. Table omitted (--compact).")
+        anon_now, anon_before = (anonymous_dynamic_listeners(services),
+                                 anonymous_dynamic_listeners(known))
+        if anon_now or anon_before:
+            print(f"  {anon_now} unnamed listener(s) on dynamic ports (baseline: {anon_before}) "
+                  "are counted, not compared: with no")
+            print("  process name and no fixed port there is nothing to tell one from "
+                  "another. sudo names them.")
+        for fp in sorted(before - now, key=str):
+            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
+        return services
 
     print(f"\n  {'Port':<7} {'Proto':<6} {'Process':<22} Note")
     print(f"  {'-'*5:<7} {'-'*5:<6} {'-'*20:<22} {'-'*30}")
@@ -5218,6 +5962,11 @@ def action_listening_services():
         print(f"    Ports: {ports}{more}")
     if not named and not unattributed:
         print("\n  No unexpected listeners found.")
+    if compact and before and now != before:
+        for fp in sorted(now - before, key=str):
+            print(f"  + not in the baseline: {_describe_fingerprint(fp)}")
+        for fp in sorted(before - now, key=str):
+            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
 
     return services
 
@@ -5465,9 +6214,11 @@ RENDERED_STATE_KEYS = frozenset({
     "devices", "scanned_subnets", "wifi", "wifi_bssids", "arp_spoof", "firewall",
     "sharing", "default_creds", "speed_download_mbps", "speed_upload_mbps",
     "upnp", "dhcp", "listening", "router_hostname", "evil_twin", "ipv6",
-    "ipv6_routers", "interception", "router_tls", "dsl",
+    "ipv6_routers", "interception", "router_tls", "dsl", "upnp_listeners",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
+    # Bookkeeping written by save_baseline: which devices this network has seen.
+    "device_memory",
 })
 
 
@@ -5569,8 +6320,16 @@ def generate_html_report(state, output_path=None):
         if ports:
             rows = []
             colours = []
+            listeners = state.get("upnp_listeners")
+            probed = (listeners.get(state.get("gateway"))
+                      if isinstance(listeners, dict) else None)
             for p in ports:
                 svc, risk, note = PORTS_OF_INTEREST.get(p, ("unknown", "REVIEW", "Investigate."))
+                if p == 1900 and isinstance(probed, dict) and probed.get("summary"):
+                    # The probe's verdict, not the generic warning it replaces:
+                    # the table must not contradict the section below it.
+                    risk = probed.get("risk", risk)
+                    note = probed["summary"]
                 rows.append([str(p), svc, risk_badge(risk), note])
                 colours.append(RISK_COLOUR.get(risk, ""))
             body = table(["Port", "Service", "Risk", "Note"], rows, colours)
@@ -5596,10 +6355,15 @@ def generate_html_report(state, output_path=None):
 
     # Devices
     if "devices" in state:
-        dev_rows = [[d["ip"], d["mac"], d.get("vendor", ""), d.get("subnet", "")]
-                    for d in state["devices"]]
+        dev_rows = []
+        for d in state["devices"]:
+            said, source = announced_name(d)
+            dev_rows.append([d["ip"], d["mac"], d.get("vendor", ""),
+                             f"{said} [{source}]" if said else "", d.get("subnet", "")])
         sections_html += section("Connected Devices",
-            table(["IP", "MAC", "Vendor", "Subnet"], dev_rows))
+            table(["IP", "MAC", "Vendor", "Announces itself as", "Subnet"], dev_rows)
+            + "<p>An announced name is the device's own claim. It helps you "
+              "recognise a device; it does not prove what the device is.</p>")
 
     # Wi-Fi
     if "wifi" in state:
@@ -5836,6 +6600,26 @@ def generate_html_report(state, output_path=None):
             body = f"<p>{risk_badge('OK')} No open ports found on the upstream modem.</p>"
         sections_html += section("Upstream Modem Ports", body)
 
+    # What an open port 1900 turned out to be
+    listeners = state.get("upnp_listeners")
+    if isinstance(listeners, dict) and listeners:
+        rows = []
+        colours = []
+        for listener_host, v in sorted(listeners.items()):
+            if not isinstance(v, dict):
+                continue
+            risk = v.get("risk", "REVIEW")
+            finding = " ".join(t for t in (v.get("summary"), v.get("caveat")) if t)
+            rows.append([listener_host, risk_badge(risk), finding,
+                         v.get("server") or "not given"])
+            colours.append(RISK_COLOUR.get(str(risk).upper(), ""))
+        if rows:
+            body = ("<p>Port 1900 was open, which a port scan reports the same way "
+                    "whether UPnP is working or switched off. Each listener was "
+                    "asked directly.</p>"
+                    + table(["Host", "Risk", "Finding", "Server banner"], rows, colours))
+            sections_html += section("UPnP Listener Probe", body)
+
     # DSL line stats
     if "dsl" in state:
         d = state["dsl"]
@@ -5971,11 +6755,64 @@ def action_html_report(state):
 # Shared output helpers
 # ---------------------------------------------------------------------------
 
+HEADER_WIDTH = 64
+HEADER_BOXED = "boxed"
+HEADER_LINE = "line"
+_header_style = HEADER_BOXED
+
+
+@contextlib.contextmanager
+def header_style(style):
+    """Draw section headers in `style` for the duration of the block.
+
+    A full audit prints about twenty sections, and the boxed header costs three
+    lines each plus the blank before it. In a terminal that is what makes the
+    report scannable. In the emailed report — three audits long — it was a
+    third of the entire message: some 200 lines of rules and blanks. The line
+    style says the same thing in one line.
+    """
+    global _header_style
+    previous = _header_style
+    _header_style = style if style in (HEADER_BOXED, HEADER_LINE) else HEADER_BOXED
+    try:
+        yield
+    finally:
+        _header_style = previous
+
+
+def section_header(title=""):
+    """The header text for `title` in the current style, without the blank line
+    that precedes it. Kept separate from hr() so that anything which composes a
+    report as a string (render_host_sections_brief) draws headers identically."""
+    if _header_style == HEADER_LINE:
+        if not title:
+            return "─" * HEADER_WIDTH
+        lead = f"── {title} "
+        return lead + "─" * max(2, HEADER_WIDTH - len(lead))
+    rule = "=" * HEADER_WIDTH
+    return f"{rule}\n{title}\n{rule}" if title else rule
+
+
+_LINE_HEADER_RE = re.compile(r"^── (.+?) ─{2,}\s*$")
+
+
+def parse_section_header(lines, i):
+    """(title, lines consumed) if a section header starts at lines[i], else None.
+
+    Reads both styles, because a report can be produced in one and picked apart
+    in the other's terms — the captured host sections are.
+    """
+    m = _LINE_HEADER_RE.match(lines[i])
+    if m:
+        return m.group(1).strip(), 1
+    if (lines[i].startswith("=" * 20) and i + 2 < len(lines)
+            and lines[i + 2].startswith("=" * 20)):
+        return lines[i + 1].strip(), 3
+    return None
+
+
 def hr(title=""):
-    print("\n" + "=" * 64)
-    if title:
-        print(title)
-        print("=" * 64)
+    print("\n" + section_header(title))
 
 
 def print_network_info():
@@ -5995,10 +6832,78 @@ def print_network_info():
 # Individual audit actions (original)
 # ---------------------------------------------------------------------------
 
-def audit_host(label, host, full_scan=False):
+UPSTREAM_REFERENCE_MAX_AGE_MIN = 60
+
+
+def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
+    """What an earlier network in the same report saw when it scanned the modem.
+
+    A house with several networks behind one modem scans that modem once per
+    network, and from most of them the answer is the same. The wrapper passes
+    the baseline the first network just saved; this reads the two facts from it
+    that the modem section turns on — the open ports, and what an open port 1900
+    was classified as — so that a later network can say "same as from there"
+    instead of repeating the section.
+
+    Returns {"ports", "upnp_state", "network", "age_min"} or None. None whenever
+    the reference cannot honestly be called the same report: unreadable, no
+    modem scan in it, about this very network, or older than an hour.
+
+    The file is NOT trusted for anything the reader will see. The ports printed
+    are always the ones this run measured; the reference can only make the
+    section shorter when the two already agree, and a forged one that happens to
+    agree with reality has changed nothing.
+    """
+    try:
+        with open(path) as f:
+            record = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    state = record.get("state") if isinstance(record, dict) else None
+    if not isinstance(state, dict):
+        return None
+    ports = state.get("upstream_open_ports")
+    if not (isinstance(ports, list) and all(isinstance(p, int) for p in ports)):
+        return None
+    # A value carried forward from an older run was not measured in this report.
+    if "upstream_open_ports" in (state.get("carried_forward") or []):
+        return None
+    stamp = _parse_stamp(state.get("timestamp"))
+    now = now or datetime.now(timezone.utc)
+    if stamp is None or not (timedelta(0) <= now - stamp <= timedelta(minutes=UPSTREAM_REFERENCE_MAX_AGE_MIN)):
+        return None
+    subnets = [x for x in (state.get("scanned_subnets") or []) if isinstance(x, str)]
+    subnet = subnets[0] if subnets else None
+    if subnet and current_subnet and subnet == str(current_subnet):
+        return None
+    listeners = state.get("upnp_listeners")
+    verdict = listeners.get(upstream_ip) if isinstance(listeners, dict) else None
+    upnp_state = verdict.get("state") if isinstance(verdict, dict) else None
+    name = network_name_for_subnet(subnet, load_networks()) if subnet else ""
+    return {"ports": sorted(ports),
+            "upnp_state": upnp_state if isinstance(upnp_state, str) else None,
+            "network": _device_name_text(name or subnet or "an earlier network", 40),
+            "age_min": int((now - stamp).total_seconds() // 60)}
+
+
+def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None):
     """Port-scan one host, print a risk-annotated summary, and return open ports.
 
     Shared by action_port_scan and action_full_audit (previously duplicated).
+
+    An open port 1900 is followed up with classify_upnp_listener, because "open"
+    is the same answer for live UPnP and for a web server left behind when UPnP
+    was switched off. `onlink` says whether the host shares a subnet with this
+    machine (None = not known) and only tempers that verdict's wording. If
+    `verdicts` is a dict, the verdict is stored in it under the host's address
+    so the caller can keep it; the return value stays the list of ports.
+
+    `reference` (see load_upstream_reference) is what an earlier network in the
+    same report found on this host. When this scan agrees with it — the same
+    open ports and the same verdict on port 1900 — the section is printed in
+    brief: the measured ports, every line rated above INFO, the certificate, and
+    a pointer to the full section. Everything is still measured and returned;
+    any disagreement at all prints the section in full, with a note saying so.
     """
     port_set = range(1, 65536) if full_scan else COMMON_PORTS
     n = "all 65535" if full_scan else str(len(COMMON_PORTS))
@@ -6021,12 +6926,57 @@ def audit_host(label, host, full_scan=False):
                   "same audit run from a terminal can. Routed hosts on other subnets\n"
                   "           still answer, which is why an upstream modem can scan "
                   "cleanly in the\n           same run. Run the audit interactively to "
-                  "scan this host.")
+                  "scan this host, or start\n           the scheduled job through the "
+                  "launcher app built by\n           tools/audit_launcher/build.sh, which "
+                  "macOS can grant this access to.")
         return None
     print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
+    # Classified before anything is printed, because whether the section can be
+    # brief depends on the verdict as much as on the port list.
+    verdict = None
+    if 1900 in open_ports:
+        verdict = classify_upnp_listener(host, 1900, onlink=onlink)
+        if verdicts is not None:
+            verdicts[host] = verdict
+
+    brief = False
+    if isinstance(reference, dict):
+        same_ports = sorted(open_ports) == reference.get("ports")
+        same_upnp = (verdict or {}).get("state") == reference.get("upnp_state")
+        brief = same_ports and same_upnp
+        if brief:
+            print(f"  The same open ports"
+                  + (f", and the same verdict on port 1900 ({verdict['state']})," if verdict else "")
+                  + f" as seen from {reference['network']} "
+                  f"{reference['age_min']} min ago. The full section is under that network;")
+            print("  below are only the lines rated above INFO, measured again from here.")
+        else:
+            # A note, deliberately not a rated finding. Networks behind one modem
+            # need not agree — a guest network is cut off from it by design and
+            # sees nothing, every week — so rating the difference would mint a
+            # permanent false flag. What is worth an alarm is this network's view
+            # CHANGING, and its own baseline comparison already watches for that.
+            what = "open ports" if not same_ports else "verdict on port 1900"
+            print(f"  Note: the {what} seen from here differ from what {reference['network']} "
+                  f"saw {reference['age_min']} min ago")
+            print(f"  ({reference['ports']}"
+                  + (f", port 1900 {reference['upnp_state']}" if reference.get("upnp_state") else "")
+                  + "), so this section is printed in full. A guest network that is")
+            print("  isolated from the modem is expected to differ.")
+
     for p in open_ports:
         svc, risk, note = PORTS_OF_INTEREST.get(
             p, ("unknown", "REVIEW", "Unrecognised service; investigate."))
+        if p == 1900:
+            if brief and verdict["risk"] == "INFO":
+                continue
+            print(f"  [{verdict['risk']:6}] {p:>5}  {svc:<14} "
+                  "UPnP port. Probed to see what is behind it:")
+            for line in describe_upnp_listener(verdict):
+                print(line)
+            continue
+        if brief and risk == "INFO":
+            continue
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
     tls = check_tls(host)
     if tls.get("sha256"):
@@ -6041,17 +6991,19 @@ def audit_host(label, host, full_scan=False):
 
 def action_port_scan(full_scan=False, upstream_ip=None):
     hr("PORT SCAN")
-    _, _, gateway = print_network_info()
+    interfaces, _, gateway = print_network_info()
 
     open_ports = []
     if gateway:
-        open_ports = audit_host("default gateway", gateway, full_scan)
+        open_ports = audit_host("default gateway", gateway, full_scan,
+                                onlink=is_onlink(gateway, interfaces))
     else:
         print("Could not determine default gateway.")
 
     if upstream_ip:
         hr("UPSTREAM MODEM")
-        audit_host("upstream modem", upstream_ip, full_scan)
+        audit_host("upstream modem", upstream_ip, full_scan,
+                   onlink=is_onlink(upstream_ip, interfaces))
 
     return gateway, open_ports
 
@@ -6101,7 +7053,13 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             display_name = name or vend
             tag = f"  {display_name}" if display_name else ""
             flag = "" if identified else "  <-- unlabelled"
-            print(f"    {d['ip']:<15} {mac}{tag}{flag}")
+            # What the device calls itself. Shown, quoted and attributed — and
+            # deliberately not part of `identified`: a name is free to claim,
+            # so it can help the owner recognise a device but cannot do the
+            # recognising for them.
+            said, source = announced_name(d)
+            claim = f'  announces "{said}" [{source}]' if said else ""
+            print(f"    {d['ip']:<15} {mac}{tag}{claim}{flag}")
             if not identified:
                 unlabelled.append(mac)
             total += 1
@@ -6208,6 +7166,292 @@ def resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip):
             continue
         kept.append(net)
     return kept
+
+
+# ---------------------------------------------------------------------------
+# What each device calls itself
+# ---------------------------------------------------------------------------
+#
+# A sweep yields an IP, a MAC and — through a third party — a vendor. That is
+# enough to count devices and not enough to recognise them: "Samsung" is a
+# television or a phone, "Tuya" is any of six plugs, and a private MAC is nothing
+# at all. The owner then labels from memory, which is how a smart plug came to
+# be recorded as "Google Nest - Upstairs" for three months.
+#
+# Many devices announce a name. Three places to hear it, all stdlib:
+#
+#   mdns  a reverse lookup of the device's own address, sent to the mDNS group
+#         with the unicast-response bit set, answered by the device itself
+#   upnp  the <friendlyName> in the description a device advertises over SSDP
+#   dns   a reverse lookup asked of the gateway, which on most home routers
+#         answers with the hostname the device gave it over DHCP
+#
+# EVERY ONE OF THESE IS THE DEVICE'S OWN CLAIM. A hostile device calls itself
+# "Google Nest" for free. So a name is shown as something the device announces,
+# never promoted to a label, never counted as identification, and an answer is
+# accepted only from the address it is about (or, for dns, from the gateway that
+# was asked) — nobody gets to name somebody else's device.
+
+DEVICE_NAME_LIMIT = 48
+MDNS_ADDR = "224.0.0.251"
+MDNS_PORT = 5353
+_NAME_SOURCES = ("upnp", "mdns", "dns")          # display preference, best first
+
+
+def _device_name_text(value, limit=DEVICE_NAME_LIMIT):
+    """A name a stranger's device chose, made safe to print, save and email."""
+    text = "".join(ch if ch.isprintable() else " " for ch in str(value or ""))
+    text = " ".join(text.split()).rstrip(".")
+    return text[:limit]
+
+
+def _dns_encode_name(name):
+    out = b""
+    for label in name.strip(".").split("."):
+        raw = label.encode("idna") if label.isascii() else label.encode("utf-8")
+        if not 0 < len(raw) < 64:
+            raise ValueError(f"bad DNS label in {name!r}")
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+def _dns_build_ptr_query(name, qid=0, unicast_response=False):
+    """One PTR question. `unicast_response` sets the mDNS QU bit, which asks the
+    responder to answer this socket directly instead of the whole group."""
+    qclass = 0x8001 if unicast_response else 0x0001
+    header = struct.pack(">HHHHHH", qid, 0x0100 if not unicast_response else 0, 1, 0, 0, 0)
+    return header + _dns_encode_name(name) + struct.pack(">HH", 12, qclass)
+
+
+def _dns_read_name(data, offset, _jumps=0):
+    """Decode a possibly-compressed name. Returns (name, offset after it).
+
+    The packet comes from whatever is on the LAN, so every length is checked and
+    compression pointers are counted: a pointer loop is the classic way to hang
+    a DNS parser.
+    """
+    labels = []
+    end = None
+    while True:
+        if offset >= len(data):
+            raise ValueError("name runs past the end of the packet")
+        length = data[offset]
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data):
+                raise ValueError("truncated compression pointer")
+            if end is None:
+                end = offset + 2
+            _jumps += 1
+            if _jumps > 16:
+                raise ValueError("compression pointer loop")
+            offset = ((length & 0x3F) << 8) | data[offset + 1]
+            continue
+        if length & 0xC0:
+            raise ValueError("reserved label type")
+        offset += 1
+        if length == 0:
+            break
+        if offset + length > len(data):
+            raise ValueError("label runs past the end of the packet")
+        labels.append(data[offset:offset + length].decode("utf-8", "replace"))
+        offset += length
+        if len(labels) > 64:
+            raise ValueError("too many labels")
+    return ".".join(labels), (end if end is not None else offset)
+
+
+def _dns_ptr_records(data):
+    """[(owner, target)] for every PTR record in a DNS/mDNS reply. [] if unparseable."""
+    try:
+        if len(data) < 12:
+            return []
+        _id, _flags, qd, an, ns, ar = struct.unpack(">HHHHHH", data[:12])
+        offset = 12
+        for _ in range(min(qd, 16)):
+            _, offset = _dns_read_name(data, offset)
+            offset += 4
+        found = []
+        for _ in range(min(an + ns + ar, 64)):
+            owner, offset = _dns_read_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[offset:offset + 10])
+            offset += 10
+            if offset + rdlen > len(data):
+                break
+            if rtype == 12:
+                target, _ = _dns_read_name(data, offset)
+                found.append((owner.lower(), target))
+            offset += rdlen
+        return found
+    except (ValueError, struct.error):
+        return []
+
+
+def _reverse_name(ip):
+    return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+
+
+def _ptr_exchange(ips, dest, accept, unicast_response, wait):
+    """Send a reverse-PTR question per address to `dest`; gather {ip: name}.
+
+    `accept(sender_ip, about_ip)` decides whose answer counts. Returns
+    ({ip: name}, refused) — refused means the OS never let the questions leave.
+    """
+    names, refused = {}, False
+    wanted = {_reverse_name(ip).lower(): ip for ip in ips}
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return {}, e.errno in UNREACHABLE_ERRNOS
+    try:
+        sock.settimeout(0.3)
+        for i, ip in enumerate(ips):
+            try:
+                sock.sendto(_dns_build_ptr_query(_reverse_name(ip), qid=(i + 1) & 0xFFFF,
+                                                 unicast_response=unicast_response), dest)
+            except OSError as e:
+                if e.errno in UNREACHABLE_ERRNOS:
+                    return {}, True
+        deadline = time.time() + wait
+        while time.time() < deadline and len(names) < len(wanted):
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            for owner, target in _dns_ptr_records(data):
+                about = wanted.get(owner)
+                if about and about not in names and accept(addr[0], about):
+                    text = _device_name_text(target)
+                    if text:
+                        names[about] = text
+    finally:
+        sock.close()
+    return names, refused
+
+
+def mdns_device_names(ips, wait=2.5):
+    """{ip: hostname} from each device's own answer to a reverse mDNS lookup."""
+    return _ptr_exchange(list(ips), (MDNS_ADDR, MDNS_PORT),
+                         accept=lambda sender, about: sender == about,
+                         unicast_response=True, wait=wait)
+
+
+def gateway_device_names(ips, gateway, wait=1.5):
+    """{ip: hostname} from the gateway's DNS — usually the DHCP hostname."""
+    if not gateway:
+        return {}, False
+    return _ptr_exchange(list(ips), (gateway, 53),
+                         accept=lambda sender, about: sender == gateway,
+                         unicast_response=False, wait=wait)
+
+
+def upnp_device_names(ips, wait=3.0, max_fetches=24):
+    """{ip: friendlyName} from the UPnP description each device advertises.
+
+    One multicast search, then one GET per responding device. A LOCATION is
+    followed only back to the device that sent it, over plain http, through
+    _http_get_plain — no redirects, no proxy — so a device cannot aim this at
+    anything but itself.
+    """
+    ips = set(ips)
+    locations, refused = {}, False
+    msearch = ("M-SEARCH * HTTP/1.1\r\n"
+               f"HOST: {SSDP_MULTICAST_ADDR}:1900\r\n"
+               "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n").encode()
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return {}, e.errno in UNREACHABLE_ERRNOS
+    try:
+        sock.settimeout(0.3)
+        sock.sendto(msearch, (SSDP_MULTICAST_ADDR, 1900))
+        deadline = time.time() + wait
+        seen = 0
+        while time.time() < deadline and seen < 512:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            seen += 1
+            sender = addr[0]
+            if sender not in ips or sender in locations:
+                continue
+            m = re.search(r"(?im)^LOCATION:\s*(\S+)", data.decode("utf-8", "ignore"))
+            if m and _upnp_url_points_at(m.group(1), sender):
+                parts = urllib.parse.urlsplit(m.group(1))
+                if parts.scheme == "http":
+                    path = parts.path or "/"
+                    if parts.query:
+                        path += "?" + parts.query
+                    locations[sender] = (parts.port or 80, path)
+    except OSError as e:
+        refused = e.errno in UNREACHABLE_ERRNOS
+    finally:
+        sock.close()
+
+    def fetch(item):
+        ip, (port, path) = item
+        got = _http_get_plain(ip, port, path, timeout=3.0)
+        if not got or got[0] != 200:
+            return ip, ""
+        body = got[2]
+        for tag in ("friendlyName", "modelName"):
+            m = re.search(fr"<{tag}>\s*([^<]{{1,200}}?)\s*</{tag}>", body)
+            if m:
+                return ip, _device_name_text(html.unescape(m.group(1)))
+        return ip, ""
+
+    names = {}
+    todo = sorted(locations.items())[:max_fetches]
+    if todo:
+        with futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for ip, name in pool.map(fetch, todo):
+                if name:
+                    names[ip] = name
+    return names, refused
+
+
+def collect_device_names(devices, gateway=None):
+    """Attach d["names"] = {source: name} to each device that announced one.
+
+    Returns a one-line note when the OS refused the questions (a background job
+    without Local Network access), else "". Devices that said nothing are left
+    without the key, so "no name" never reads as a name of "".
+    """
+    ips = [d["ip"] for d in devices if d.get("ip")]
+    if not ips:
+        return ""
+    results = {}
+    refused_all = True
+    for source, lookup in (("mdns", lambda: mdns_device_names(ips)),
+                           ("upnp", lambda: upnp_device_names(ips)),
+                           ("dns", lambda: gateway_device_names(ips, gateway))):
+        try:
+            names, refused = lookup()
+        except OSError:
+            names, refused = {}, False
+        refused_all = refused_all and refused
+        results[source] = names
+    for d in devices:
+        found = {src: results[src][d["ip"]] for src in _NAME_SOURCES
+                 if d["ip"] in results.get(src, {})}
+        if found:
+            d["names"] = found
+    return local_network_denied_note("Asking devices for their names") if refused_all else ""
+
+
+def announced_name(device):
+    """(name, source) a device gave for itself, best source first, or ("", "")."""
+    names = device.get("names")
+    if isinstance(names, dict):
+        for source in _NAME_SOURCES:
+            text = _device_name_text(names.get(source))
+            if text:
+                return text, source
+    return "", ""
 
 
 def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_note=""):
@@ -6367,7 +7611,7 @@ def action_compare_baseline(state):
         print("No data collected in this session to compare.")
         print("Run a Full Audit or individual checks first.")
         return
-    changes = diff_baseline(old, state)
+    changes = diff_baseline(old, state, load_labels())
     print(f"Baseline from: {old.get('timestamp', '?')}")
     # Above the verdict, because it qualifies the verdict: it is as true of a
     # short list of changes as it is of "No changes since baseline."
@@ -6380,15 +7624,91 @@ def action_compare_baseline(state):
             print("  ! " + c)
     else:
         print("No changes since baseline.")
+    _back = describe_returning_devices(old, state, load_labels())
+    if _back:
+        print(_back)
 
 
 # ---------------------------------------------------------------------------
 # Full audit
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Sections about this machine, in a report that covers several networks
+# ---------------------------------------------------------------------------
+#
+# The firewall, the sharing services and the listeners belong to this Mac, not
+# to the network it happens to be joined to. A run that audits three networks
+# prints them three times, identically. They still have to be CHECKED on every
+# network — each network keeps its own baseline, and a baseline with no
+# firewall entry would make the next comparison against it blind — so the fix is
+# in the printing only: check, record, and say in a few lines what was found.
+
+_BRIEF_KEEP = re.compile(r"^\s*\[(REVIEW|UNKNOWN)\s*\]")
+_BRIEF_FORCES_FULL = re.compile(r"^\s*\[(HIGH|MEDIUM)\s*\]|^\s*\+ not in the baseline", re.M)
+
+
+def capture_section(fn, *args, **kwargs):
+    """Run a printing section with its output captured. Returns (result, text)."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = fn(*args, **kwargs)
+    return result, buf.getvalue()
+
+
+def _captured_section_title(text):
+    """The title hr() printed at the top of a captured section, or a placeholder."""
+    lines = text.splitlines()
+    for i in range(len(lines)):
+        found = parse_section_header(lines, i)
+        if found:
+            return found[0]
+    return "this machine"
+
+
+def render_host_sections_brief(sections):
+    """What to print for host sections that an earlier network already showed.
+
+    `sections` is [(title, captured_text)]. A section is folded into the summary
+    only when it is quiet. Anything rated HIGH or MEDIUM, or a listener that was
+    not in the baseline, puts that whole section back exactly as it would have
+    printed — the state of this Mac can change between two audits minutes apart,
+    and a brief report must never be the reason that went unseen. REVIEW and
+    UNKNOWN lines are standing notes; they are kept, one line each.
+    """
+    quiet, loud = [], []
+    for title, text in sections:
+        (loud if _BRIEF_FORCES_FULL.search(text) else quiet).append((title, text))
+
+    out = []
+    if quiet:
+        names = ", ".join(t for t, _ in quiet)
+        out.append("")
+        out.extend(section_header("THIS MAC (re-checked on this network)").split("\n"))
+        out.append(f"  Re-checked here and recorded in this network's baseline: {names}.")
+        out.append("  Nothing rated HIGH or MEDIUM, and no listener that was not in the "
+                   "baseline. The full")
+        out.append("  sections are printed once, under the first network in this report.")
+        for _title, text in quiet:
+            kept = [ln.rstrip() for ln in text.splitlines() if _BRIEF_KEEP.match(ln)]
+            if kept:
+                # Named by the section it came from, in a form the email digest
+                # reads back: a kept line must be recognisably the SAME finding
+                # as the one printed in full under the first network, or it
+                # would be counted as new there and listed twice.
+                out.append(f"  From {_captured_section_title(text)}:")
+                out.extend(kept)
+    rendered = "\n".join(out)
+    for _title, text in loud:
+        rendered += ("\n" if rendered else "") + text.rstrip("\n")
+    return rendered
+
+
 def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
-                      extra_subnets=None, probe_creds=False, no_discovery=False):
+                      extra_subnets=None, probe_creds=False, no_discovery=False,
+                      no_names=False, compact=False, host_sections_brief=False,
+                      upstream_reference=None):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -6403,12 +7723,23 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     # Port scan
     hr("ROUTER / GATEWAY PORT SCAN")
+    # What an open port 1900 turned out to be, per scanned host. Only present
+    # when a scan found one, so a run with nothing to classify gains no key.
+    upnp_listeners = {}
     if gateway:
-        state["router_open_ports"] = audit_host("default gateway", gateway, full_scan)
+        state["router_open_ports"] = audit_host(
+            "default gateway", gateway, full_scan,
+            onlink=is_onlink(gateway, interfaces), verdicts=upnp_listeners)
         state["router_tls"] = check_tls(gateway)
     if upstream_ip:
         hr("UPSTREAM MODEM")
-        state["upstream_open_ports"] = audit_host("upstream modem", upstream_ip, full_scan)
+        state["upstream_open_ports"] = audit_host(
+            "upstream modem", upstream_ip, full_scan,
+            onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners,
+            reference=(load_upstream_reference(upstream_reference, upstream_ip, _subnet)
+                       if upstream_reference else None))
+    if upnp_listeners:
+        state["upnp_listeners"] = upnp_listeners
 
     # DSL stats
     if tplink_password:
@@ -6463,6 +7794,11 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         subnets_to_sweep = resolve_subnets(subnet_overrides, extra_subnets, interfaces, local_ip)
         if subnets_to_sweep:
             all_devices = collect_devices(subnets_to_sweep, labels, networks, no_vendors=no_vendors)
+            if not no_names:
+                print("  Asking devices what they call themselves (mDNS, UPnP, gateway DNS)...")
+                names_note = collect_device_names(all_devices, gateway)
+                if names_note:
+                    print(f"  [INFO] {names_note}")
             state["devices"] = all_devices
             # Record where we looked AND could have seen something — not merely
             # what was on the sweep list. Without this a later comparison cannot
@@ -6501,20 +7837,32 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     twin = action_evil_twin((load_baseline() or {}).get("wifi_bssids"))
     state["evil_twin"] = twin
-    state["wifi_bssids"] = twin["bssids"]
+    state["wifi_bssids"] = remembered_bssids(
+        (load_baseline() or {}).get("wifi_bssids"), twin["bssids"])
 
-    ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"))
+    ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"), compact=compact)
     state["ipv6"] = ra
     state["ipv6_routers"] = ra["routers"]
 
-    fw = action_firewall_check()
+    # The three sections about this machine rather than the network. Always
+    # checked and always recorded; printed in brief when an earlier network in
+    # the same report has already shown them (see render_host_sections_brief).
+    known_listeners = (load_baseline() or {}).get("listening")
+    if host_sections_brief:
+        fw, fw_text = capture_section(action_firewall_check)
+        sharing, sharing_text = capture_section(action_sharing_services)
+        listening, listening_text = capture_section(
+            action_listening_services, compact=compact, known=known_listeners)
+        print(render_host_sections_brief([("firewall", fw_text),
+                                          ("sharing services", sharing_text),
+                                          ("listening services", listening_text)]))
+    else:
+        fw = action_firewall_check()
+        sharing = action_sharing_services()
+        listening = action_listening_services(compact=compact, known=known_listeners)
     state["firewall"] = fw
-
-    sharing = action_sharing_services()
     state["sharing"] = [{"name": s["name"], "enabled": s["enabled"],
                           "risk": s["risk"], "note": s["note"]} for s in sharing]
-
-    listening = action_listening_services()
     state["listening"] = listening
 
     rh = action_router_hostname()
@@ -6562,7 +7910,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     if _freshness:
         print(_freshness)
     if old:
-        changes = diff_baseline(old, state)
+        changes = diff_baseline(old, state, load_labels())
         print(f"Baseline from: {old.get('timestamp', '?')}")
         _coverage = describe_comparison_coverage(old, state)
         if _coverage:
@@ -6573,10 +7921,13 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                 print("  ! " + c)
         else:
             print("No changes since baseline.")
+        _back = describe_returning_devices(old, state, load_labels())
+        if _back:
+            print(_back)
     else:
         print("No baseline saved yet. Use option 5 after reviewing results.")
 
-    _basis = describe_evidence_basis(state)
+    _basis = describe_evidence_basis(state, compact=compact)
     if _basis:
         hr("EVIDENCE PROVENANCE")
         print(_basis)
@@ -6793,6 +8144,26 @@ def main():
                     help="Full router port scan (1-65535, slower)")
     ap.add_argument("--no-vendors", action="store_true",
                     help="Skip online vendor lookups (faster)")
+    ap.add_argument("--no-names", action="store_true",
+                    help="Skip asking devices what they call themselves "
+                         "(mDNS, UPnP and the gateway's DNS)")
+    ap.add_argument("--compact", action="store_true",
+                    help="Shorter report for email: omit the listener table when it "
+                         "matches the baseline, list only the IPv6 neighbours that "
+                         "advertise as routers, and fold the provenance explanation. "
+                         "Anything that changed is always printed in full.")
+    ap.add_argument("--host-sections-brief", action="store_true",
+                    help="For the second and later networks of a multi-network "
+                         "report: still check and record this machine's firewall, "
+                         "sharing services and listeners, but print them in a few "
+                         "lines. Anything HIGH, MEDIUM or newly listening is still "
+                         "printed in full.")
+    ap.add_argument("--upstream-reference", metavar="BASELINE_FILE",
+                    help="For the second and later networks of a multi-network "
+                         "report: the baseline an earlier network just saved. If "
+                         "this network's scan of the upstream modem agrees with it, "
+                         "the modem section is printed in brief. The scan still "
+                         "runs, and any disagreement prints the section in full.")
     ap.add_argument("--no-save-baseline", action="store_true",
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
@@ -6835,7 +8206,9 @@ def main():
 
     cli_args_given = any([
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
-        args.full, args.no_vendors, args.no_save_baseline, args.label,
+        args.full, args.no_vendors, args.no_names, args.compact,
+        args.host_sections_brief, args.upstream_reference,
+        args.no_save_baseline, args.label,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
         args.seal_baseline, args.publish_to, args.monitor,
@@ -6874,17 +8247,24 @@ def main():
         save_labels(labels)
         print(f"Labels saved ({len(labels)} total).\n")
 
-    state = action_full_audit(
-        full_scan=args.full,
-        no_vendors=args.no_vendors,
-        no_speedtest=args.no_speedtest,
-        upstream_ip=args.upstream,
-        tplink_password=tplink_password,
-        subnet_overrides=args.subnet,
-        extra_subnets=getattr(args, "extra_subnet", None),
-        probe_creds=args.probe_creds,
-        no_discovery=args.no_discovery,
-    )
+    # One-line section headers whenever the report is compact: the boxed style
+    # was a third of the emailed report. Interactive and plain runs keep the box.
+    with header_style(HEADER_LINE if args.compact else HEADER_BOXED):
+        state = action_full_audit(
+            full_scan=args.full,
+            no_vendors=args.no_vendors,
+            no_speedtest=args.no_speedtest,
+            upstream_ip=args.upstream,
+            tplink_password=tplink_password,
+            subnet_overrides=args.subnet,
+            extra_subnets=getattr(args, "extra_subnet", None),
+            probe_creds=args.probe_creds,
+            no_discovery=args.no_discovery,
+            no_names=args.no_names,
+            compact=args.compact,
+            host_sections_brief=args.host_sections_brief,
+        upstream_reference=args.upstream_reference,
+        )
 
     if args.no_save_baseline:
         pass

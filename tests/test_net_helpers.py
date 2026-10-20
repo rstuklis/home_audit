@@ -977,3 +977,16 @@ class TestIsOnlink:
 
     def test_junk_is_not_onlink(self, mod):
         assert mod.is_onlink("not-an-address", self.IFACES) is False
+
+
+class TestLocalNetworkDeniedNoteNamesTheFix:
+    """The note used to end at "run it interactively", which is no answer for a
+    weekly job. A launcher app that macOS can grant the permission to is — it
+    was measured working — so the note has to say so."""
+
+    def test_it_points_at_the_launcher(self, mod):
+        assert "tools/audit_launcher/build.sh" in mod.local_network_denied_note("The scan")
+
+    def test_it_still_rules_out_sudo_and_offers_the_interactive_run(self, mod):
+        note = mod.local_network_denied_note("The scan")
+        assert "sudo does not help" in note and "interactively" in note
