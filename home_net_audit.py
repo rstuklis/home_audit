@@ -900,6 +900,12 @@ def discover_devices(subnet, workers=50):
             if res:
                 alive.add(res)
     arp = read_arp_table()
+    if alive and not any(ip in arp for ip in alive):
+        # Hosts answered but the table names none of them: the one `arp -an`
+        # failed or timed out, not the network. Ask once more before recording
+        # a sweep of "unknown"s — macs_unreadable says what that costs.
+        time.sleep(1)
+        arp = read_arp_table() or arp
     devices = []
     for ip in sorted(alive | set(arp.keys()), key=ipaddress.ip_address):
         mac = arp.get(ip, "unknown")
@@ -1278,6 +1284,50 @@ def swept_anywhere(state):
     return bool(state.get("scanned_subnets"))
 
 
+def macs_unreadable(state):
+    """Whether a sweep found hosts but could read a hardware address for none.
+
+    discover_devices records a host that answered a ping but has no ARP entry
+    as mac "unknown", so one straggler is ordinary. Every host at once is not:
+    the whole table comes from one `arp -an`, and when that call fails — it
+    timed out on a Mac that had just woken for its scheduled run — the sweep
+    comes back as a list of addresses with no identities. That run reported
+    eleven hosts, all "unknown"; the comparison is by MAC, so every device in
+    the baseline was reported gone, the week after every one came back as NEW,
+    and the device memory would have been emptied in between.
+
+    Such a list is a count, not a measurement of identities, and everywhere
+    identities are compared it is treated like a run that did not sweep: no
+    arrivals, no departures, no memory update, and the previous device list is
+    carried forward. The count is still printed, and the report says why it
+    was not compared.
+
+    Two cases are deliberately NOT this one. An empty list: a sweep that
+    genuinely found nothing is a real and alarming finding, and swept_anywhere
+    owns it. And a single entry without an address: one host with no ARP entry
+    is the ordinary straggler, indistinguishable from a failed read, and the
+    existing rule — it contributes nothing to the comparison — already handles
+    it without silencing the comparison of everything else. The verdict here
+    needs two or more hosts, every one without an address, which no healthy
+    read of the table produces: the gateway alone always has an entry, because
+    this machine has just routed through it.
+    """
+    devices = state.get("devices")
+    if not devices or len(devices) < 2:
+        return False
+    for d in devices:
+        if isinstance(d, dict):
+            mac = d.get("mac")
+            if isinstance(mac, str) and mac and mac != "unknown":
+                return False
+    return True
+
+
+def devices_identified(state):
+    """swept_anywhere, and the sweep could tell the devices apart."""
+    return swept_anywhere(state) and not macs_unreadable(state)
+
+
 def carry_forward_unmeasured(state, previous=None):
     """Return `state` with unmeasured values replaced by the last known-good ones.
 
@@ -1323,7 +1373,7 @@ def carry_forward_unmeasured(state, previous=None):
         # subnet it was not joined to rather than by --no-discovery. Silent, and
         # permanent, because the wiped list becomes the new reference point.
         if key in SWEEP_KEYS:
-            measured = swept_anywhere(state)
+            measured = devices_identified(state)
         elif key == "router_tls":
             measured = tls_measured(state)
         else:
@@ -2698,6 +2748,14 @@ def describe_comparison_coverage(old, new):
     Silent when the comparison was whole, so an ordinary run gains no noise.
     """
     old, new = old or {}, new or {}
+    if macs_unreadable(new) or macs_unreadable(old):
+        side, entry = (("this run", new) if macs_unreadable(new) else ("the baseline", old))
+        return (f"  [REVIEW] Comparison coverage: device list not compared — {side} found "
+                f"{len(entry.get('devices') or [])} host(s) but could read a hardware "
+                "address for none of them. The ARP table read failed, so the list is a "
+                "count, not identities, and arrivals and departures are unknown here, "
+                "not absent. If this repeats, `arp -an` on this Mac is failing or "
+                "timing out.")
     old_swept, new_swept = swept_anywhere(old), swept_anywhere(new)
     if not (old_swept and new_swept):
         if not old_swept and not new_swept:
@@ -3292,7 +3350,7 @@ def update_device_memory(previous, state):
     — not even expiry, since "not looked for" is not "not seen".
     """
     memory = remembered_devices(previous)
-    if not swept_anywhere(state):
+    if not devices_identified(state):
         return memory
     stamp = state.get("timestamp")
     now = _parse_stamp(stamp)
@@ -3318,7 +3376,7 @@ def update_device_memory(previous, state):
 def returning_devices(old, new):
     """{mac: last_seen} for devices present now, absent from the last run, but
     seen on this network within the memory window."""
-    if not (swept_anywhere(old) and swept_anywhere(new)):
+    if not (devices_identified(old) and devices_identified(new)):
         return {}
     def stable(entry):
         out = set()
@@ -3446,7 +3504,7 @@ def diff_baseline(old, new, labels=None):
     # discipline the port lists already follow: an unmeasured side is compared
     # against nothing, in either direction. An empty LIST still diffs, because a
     # sweep that genuinely found nothing is a real and alarming finding.
-    devices_measured = swept_anywhere(old) and swept_anywhere(new)
+    devices_measured = devices_identified(old) and devices_identified(new)
 
     old_macs, old_private, old_subnets = _split(old)
     new_macs, new_private, new_subnets = _split(new)
@@ -7470,6 +7528,12 @@ def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_
             if d["ip"] not in seen_ips:
                 seen_ips.add(d["ip"])
                 all_devices.append({**d, "subnet": str(subnet)})
+
+    if all_devices and macs_unreadable({"devices": all_devices}):
+        print(f"  [REVIEW] {len(all_devices)} host(s) answered but the ARP table named "
+              "none of them, so no device can be identified this run. The list is "
+              "kept as a count and is not compared against the baseline; the "
+              "baseline's device list is carried forward unchanged.")
 
     if not no_vendors and all_devices:
         needs_lookup = [d for d in all_devices
