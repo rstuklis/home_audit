@@ -4771,6 +4771,12 @@ def _upnp_url_points_at(url, gateway):
     """
     try:
         parts = urllib.parse.urlsplit(url)
+        # .port is evaluated lazily and raises ValueError for a port that is not
+        # a number or is above 65535. Every caller that passes this check goes
+        # on to read it, outside any handler, so a device answering one search
+        # with "LOCATION: http://<itself>:99999/" used to end the whole audit
+        # with a traceback — no baseline, no report, no email. Fail the check.
+        parts.port
     except ValueError:
         return False
     return parts.scheme in ("http", "https") and parts.hostname == gateway
@@ -7489,7 +7495,9 @@ def collect_device_names(devices, gateway=None):
                            ("dns", lambda: gateway_device_names(ips, gateway))):
         try:
             names, refused = lookup()
-        except OSError:
+        except Exception:
+            # A name is a courtesy, asked of devices that may answer with
+            # anything. No parsing error in one source may end the audit.
             names, refused = {}, False
         refused_all = refused_all and refused
         results[source] = names
