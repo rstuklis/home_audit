@@ -5214,6 +5214,58 @@ UPNP_DESCRIPTION_PATHS = (
 # whole reason port 1900 is worth a second look; a media server is not.
 _UPNP_GATEWAY_MARKERS = ("internetgatewaydevice", "wanipconnection",
                          "wanpppconnection")
+UPNP_DESCRIBED_OFF = "described-off"
+
+
+def _upnp_control_check(host, port, description):
+    """Ask the gateway service in `description` one read-only question.
+
+    A description naming WANIPConnection is what the live-gateway verdict used
+    to rest on — but a libupnp modem keeps publishing it after UPnP is switched
+    off in its settings, while its control service answers every action with
+    a SOAP fault. Measured on a Telstra Archer VR1600v: toggle off, description
+    served at :1900/gatedesc.xml, GetExternalIPAddress -> "Invalid Action". A
+    description is a claim; the control service answering is the capability.
+
+    GetExternalIPAddress changes nothing and every IGD implements it. Returns
+    "answered" (the service works), "refused" (an HTTP error or SOAP fault: the
+    service is there and declines), or None (no HTTP answer, or no gateway
+    service with a usable control URL in the description).
+    """
+    services = re.findall(r"<service>(.*?)</service>", description or "", re.S | re.I)
+    for block in services:
+        st = re.search(r"<serviceType>\s*([^<]+?)\s*</serviceType>", block, re.I)
+        cu = re.search(r"<controlURL>\s*([^<]+?)\s*</controlURL>", block, re.I)
+        if not st or not cu:
+            continue
+        stype = st.group(1)
+        if "WANIPConnection" not in stype and "WANPPPConnection" not in stype:
+            continue
+        ctrl = html.unescape(cu.group(1))
+        if ctrl.startswith(("http://", "https://")):
+            # Only back to the host being asked about, over plain http — the
+            # same rule every other URL a device hands this tool is held to.
+            if not _upnp_url_points_at(ctrl, host):
+                return None
+            parts = urllib.parse.urlsplit(ctrl)
+            if parts.scheme != "http":
+                return None
+            c_port, c_path = parts.port or 80, parts.path or "/"
+        else:
+            c_port, c_path = port, ("/" + ctrl.lstrip("/"))
+        soap = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+                f'<u:GetExternalIPAddress xmlns:u="{stype}"/></s:Body></s:Envelope>')
+        got = _http_post_plain(host, c_port, c_path, soap, {
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{stype}#GetExternalIPAddress"'})
+        if got is None:
+            return None
+        status, _srv, reply = got
+        if status == 200 and "upnperror" not in reply.lower():
+            return "answered"
+        return "refused"
+    return None
 
 UPNP_LIVE_GATEWAY = "live-gateway"
 UPNP_LIVE_OTHER = "live-other"
@@ -5302,8 +5354,19 @@ HTTP_GET_TOTAL_SECONDS = 8.0
 
 
 def _http_get_plain(host, port, path, timeout=3.0, limit=65536, total=HTTP_GET_TOTAL_SECONDS):
-    """One plain GET, bounded in wall-clock time. Returns (status, server_header,
-    body) or None if no HTTP came back.
+    """One plain GET, bounded in wall-clock time. See _http_plain."""
+    return _http_plain("GET", host, port, path, None, None, timeout, limit, total)
+
+
+def _http_post_plain(host, port, path, body, headers, timeout=3.0, limit=65536,
+                     total=HTTP_GET_TOTAL_SECONDS):
+    """One plain POST, bounded in wall-clock time. See _http_plain."""
+    return _http_plain("POST", host, port, path, body, headers, timeout, limit, total)
+
+
+def _http_plain(method, host, port, path, body, headers, timeout, limit, total):
+    """One plain HTTP exchange, bounded in wall-clock time. Returns (status,
+    server_header, body) or None if no HTTP came back.
 
     A raw socket rather than http.client or urllib, on purpose. Neither follows
     redirects here nor reads proxy settings, so the request goes to the host
@@ -5326,9 +5389,15 @@ def _http_get_plain(host, port, path, timeout=3.0, limit=65536, total=HTTP_GET_T
     sock = None
     try:
         sock = socket.create_connection((host, port), timeout=min(timeout, total))
-        request = (f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
-                   "User-Agent: home_net_audit\r\nConnection: close\r\n\r\n")
-        sock.sendall(request.encode("ascii", "replace"))
+        payload = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        lines = [f"{method} {path} HTTP/1.0", f"Host: {host}", "User-Agent: home_net_audit",
+                 "Connection: close"]
+        for name, value in (headers or {}).items():
+            lines.append(f"{name}: {value}")
+        if payload:
+            lines.append(f"Content-Length: {len(payload)}")
+        request = "\r\n".join(lines) + "\r\n\r\n"
+        sock.sendall(request.encode("ascii", "replace") + payload)
         buf = bytearray()
         # Headers precede the body and are bounded separately below; the read
         # itself stops at the budget, at EOF, or at roughly limit + 64 KB.
@@ -5425,6 +5494,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
                 server = _banner_text(sm.group(1))
     targets = targets[:4] + [(port, path) for path in ("/",) + UPNP_DESCRIPTION_PATHS]
 
+    description_port = None
     for t_port, t_path in targets:
         got = _http_get_plain(host, t_port, t_path)
         if got is None:
@@ -5440,17 +5510,38 @@ def classify_upnp_listener(host, port=1900, onlink=None):
             server = _banner_text(srv)
         if status == 200 and _looks_like_upnp_description(body):
             descriptions.append(body)
+            description_port = t_port
             break
 
     said = "\n".join(replies + descriptions).lower()
     verdict = {"server": server, "caveat": ""}
 
     if any(marker in said for marker in _UPNP_GATEWAY_MARKERS):
-        verdict.update(
-            state=UPNP_LIVE_GATEWAY, risk="REVIEW",
-            summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
-                     "ports for any device that asks; turn UPnP off on this "
-                     "device unless something needs it."))
+        # The description is a claim; whether the control service answers is
+        # the capability. One read-only question settles which this is.
+        control = (_upnp_control_check(host, description_port, descriptions[0])
+                   if descriptions else None)
+        if control == "refused":
+            verdict.update(
+                state=UPNP_DESCRIBED_OFF, risk="INFO",
+                summary=("SWITCHED OFF, description still published — the device "
+                         "advertises a UPnP gateway service, but its control service "
+                         "refuses every request. That is what a libupnp modem looks "
+                         "like with UPnP disabled in its settings: nothing can forward "
+                         "ports through it while it stays so."),
+                caveat=("Rests on the device refusing a read-only request, which it did; "
+                        "asked again every run, so a switch back on would show here."))
+        else:
+            verdict.update(
+                state=UPNP_LIVE_GATEWAY, risk="REVIEW",
+                summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
+                         "ports for any device that asks; turn UPnP off on this "
+                         "device unless something needs it."))
+            if control == "answered":
+                verdict["caveat"] = "Confirmed: its control service answered a read-only request."
+            elif descriptions:
+                verdict["caveat"] = ("Not confirmed: the control service gave no HTTP answer "
+                                     "to a read-only request. Treated as live.")
     elif descriptions or any("urn:schemas-upnp-org:" in r.lower() for r in replies):
         verdict.update(
             state=UPNP_LIVE_OTHER, risk="INFO",

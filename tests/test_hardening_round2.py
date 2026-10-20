@@ -429,3 +429,76 @@ class TestAbortIsLoud:
         assert exc.value.code == 2
         out = capsys.readouterr()
         assert "[HIGH  ] AUDIT ABORTED" in out.out and "ValueError" in out.err + out.out
+
+
+# ---------------------------------------------------------------------------
+# A published gateway description is a claim; the control service answering is
+# the capability (measured on the beach-house Telstra Archer VR1600v, 2026-10-20)
+# ---------------------------------------------------------------------------
+
+IGD_DESC = """<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+<deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+<serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+<serviceId>urn:upnp-org:serviceId:WANIPConn1</serviceId><controlURL>{ctrl}</controlURL>
+</service></serviceList></device></root>"""
+FAULT = ('<s:Envelope><s:Body><s:Fault><faultstring>UPnPError</faultstring><detail>'
+         '<UPnPError><errorCode>-1</errorCode><errorDescription>Invalid Action</errorDescription>'
+         '</UPnPError></detail></s:Fault></s:Body></s:Envelope>')
+ANSWER = ('<s:Envelope><s:Body><u:GetExternalIPAddressResponse>'
+          '<NewExternalIPAddress>203.0.113.9</NewExternalIPAddress>'
+          '</u:GetExternalIPAddressResponse></s:Body></s:Envelope>')
+MODEM = "192.168.1.1"
+
+
+class TestUpnpControlCheck:
+    def _probe(self, mod, monkeypatch, ctrl, post):
+        posts = []
+        monkeypatch.setattr(mod, "_ssdp_search", lambda *a, **k: ([], False))
+        monkeypatch.setattr(mod, "_http_get_plain", lambda h, port, path, **k: (
+            (200, "libupnp", IGD_DESC.format(ctrl=ctrl)) if path == "/gatedesc.xml"
+            else (404, "libupnp", "nope")))
+
+        def fake_post(h, port, path, body, headers, **k):
+            posts.append((h, port, path))
+            return post
+        monkeypatch.setattr(mod, "_http_post_plain", fake_post)
+        v = mod.classify_upnp_listener(MODEM, 1900, onlink=False)
+        return v, posts
+
+    def test_a_service_that_refuses_is_switched_off_not_live(self, mod, monkeypatch):
+        v, posts = self._probe(mod, monkeypatch, "/upnp/control/WANIPConn1", (500, "libupnp", FAULT))
+        assert v["state"] == mod.UPNP_DESCRIBED_OFF and v["risk"] == "INFO"
+        assert "SWITCHED OFF" in v["summary"]
+        assert posts == [(MODEM, 1900, "/upnp/control/WANIPConn1")]
+
+    def test_a_service_that_answers_is_live_and_says_confirmed(self, mod, monkeypatch):
+        v, _ = self._probe(mod, monkeypatch, "/upnp/control/WANIPConn1", (200, "libupnp", ANSWER))
+        assert v["state"] == mod.UPNP_LIVE_GATEWAY and v["risk"] == "REVIEW"
+        assert "Confirmed" in v["caveat"]
+
+    def test_no_answer_stays_live_but_says_unconfirmed(self, mod, monkeypatch):
+        v, _ = self._probe(mod, monkeypatch, "/upnp/control/WANIPConn1", None)
+        assert v["state"] == mod.UPNP_LIVE_GATEWAY and "Not confirmed" in v["caveat"]
+
+    def test_a_control_url_on_another_host_is_never_followed(self, mod, monkeypatch):
+        v, posts = self._probe(mod, monkeypatch, "http://203.0.113.9/control", (200, "x", ANSWER))
+        assert posts == [] and v["state"] == mod.UPNP_LIVE_GATEWAY
+
+    def test_an_absolute_url_back_to_the_host_is_used_as_given(self, mod, monkeypatch):
+        v, posts = self._probe(mod, monkeypatch, f"http://{MODEM}:5000/ctl/IPConn", (500, "x", FAULT))
+        assert posts == [(MODEM, 5000, "/ctl/IPConn")] and v["state"] == mod.UPNP_DESCRIBED_OFF
+
+    def test_a_switch_back_on_is_a_change(self, mod):
+        old = {"upnp_listeners": {MODEM: {"state": mod.UPNP_DESCRIBED_OFF}}}
+        new = {"upnp_listeners": {MODEM: {"state": mod.UPNP_LIVE_GATEWAY}}}
+        assert any("now live-gateway" in n for n in mod.diff_baseline(old, new))
+
+    def test_the_post_helper_sends_the_body_and_headers(self, mod, monkeypatch):
+        sock = FakeSock([b"HTTP/1.0 500 Internal Server Error\r\nServer: libupnp\r\n\r\n" + FAULT.encode(), b""])
+        monkeypatch.setattr(mod.socket, "create_connection", lambda *a, **k: sock)
+        got = mod._http_post_plain(MODEM, 1900, "/upnp/control/WANIPConn1", "<soap/>",
+                                   {"SOAPAction": '"x#GetExternalIPAddress"'})
+        assert got[0] == 500 and "Invalid Action" in got[2]
+        assert b"POST /upnp/control/WANIPConn1 HTTP/1.0\r\n" in sock.sent
+        assert b"SOAPAction: \"x#GetExternalIPAddress\"\r\n" in sock.sent
+        assert b"Content-Length: 7\r\n\r\n<soap/>" in sock.sent

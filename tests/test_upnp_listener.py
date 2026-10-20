@@ -68,6 +68,9 @@ def probe(mod, monkeypatch):
             return (404, server, "<h1>404 Not Found</h1>") if speaks_http else None
 
         monkeypatch.setattr(mod, "_http_get_plain", fake_get)
+        # The read-only control request a gateway description now earns: no
+        # HTTP answer by default, which leaves the verdict LIVE (unconfirmed).
+        monkeypatch.setattr(mod, "_http_post_plain", lambda *a, **k: None)
         verdict = mod.classify_upnp_listener(HOST, 1900, onlink=onlink)
         verdict["_calls"] = calls
         verdict["_searches"] = searches
