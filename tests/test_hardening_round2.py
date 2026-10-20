@@ -502,3 +502,187 @@ class TestUpnpControlCheck:
         assert b"POST /upnp/control/WANIPConn1 HTTP/1.0\r\n" in sock.sent
         assert b"SOAPAction: \"x#GetExternalIPAddress\"\r\n" in sock.sent
         assert b"Content-Length: 7\r\n\r\n<soap/>" in sock.sent
+
+
+# ---------------------------------------------------------------------------
+# Verification pass over the round-2 fixes (16 skeptics): what they found
+# ---------------------------------------------------------------------------
+
+class TestHeartbeatCadenceEdges:
+    def test_a_nan_interval_cannot_hide_the_open_gap(self, mod, tmp_path):
+        sink = tmp_path / "r.jsonl"
+        sink.write_text('{"kind":"heartbeat","chain":"x","interval":NaN,"at":"%s"}\n' % T0.isoformat())
+        beats = mod.read_heartbeats(str(sink)) or [json.loads(sink.read_text(), parse_constant=lambda c: None)]
+        # read through the normaliser: NaN is dropped, so the default cadence applies
+        normalised = mod._normalise_receipt(json.loads(sink.read_text()))
+        assert "interval" not in normalised
+        gaps = mod.observation_gaps([normalised], now=T0 + timedelta(hours=3))
+        assert gaps and gaps[-1]["end"] is None
+        # and even if one reached cadence() unnormalised, it is treated as absent and named
+        raw = {"kind": "heartbeat", "interval": float("nan"), "at": T0.isoformat()}
+        assert mod.observation_gaps([raw], now=T0 + timedelta(hours=3))[-1]["end"] is None
+        assert "Heartbeat cadence" in mod.describe_clock_anomalies([raw], now=T0)
+
+    def test_legacy_poll_interval_beats_are_not_gaps(self, mod):
+        # The pre-fix monitor recorded 60 for beats 900 s apart; read literally
+        # that was ten windows with no monitoring, every week, for ever.
+        beats = [beat(T0 + timedelta(seconds=903 * i), interval=60) for i in range(10)]
+        assert mod.observation_gaps(beats, now=T0 + timedelta(seconds=903 * 9 + 100)) == []
+
+    def test_a_restart_beat_two_minutes_later_is_not_a_gap_either(self, mod):
+        beats = [beat(T0, 60), beat(T0 + timedelta(seconds=121), 60), beat(T0 + timedelta(seconds=1021), 900)]
+        assert mod.observation_gaps(beats, now=T0 + timedelta(seconds=1100)) == []
+
+
+class TestMonitorEdges:
+    def test_ipv6_routers_are_carried_over_a_blank_poll(self, mod):
+        previous = {"gateway": GW, "dns": [GW], "neighbours": [GW], "ipv6_routers": ["fe80::1%en0"]}
+        blank = {"gateway": None, "dns": [], "neighbours": [], "ipv6_routers": []}
+        carried, _ = mod.carry_forward_blank_fields(blank, previous)
+        healthy = dict(previous)
+        assert carried["ipv6_routers"] == ["fe80::1%en0"]
+        assert mod.diff_snapshots(carried, healthy) == []
+
+    def test_a_stop_during_the_first_poll_keeps_the_old_stamp(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (None, None))
+        old = T0 - timedelta(days=3)
+        mod.save_monitor_state({"gateway": GW, "gateway_mac": "aa", "dns": [GW], "neighbours": [GW],
+                                "ipv6_routers": []}, at=old, undelivered=[{"kind": "x"}])
+
+        def interrupt():
+            raise KeyboardInterrupt
+        monkeypatch.setattr(mod, "monitor_snapshot", interrupt)
+        monkeypatch.setattr(mod, "send_alert", lambda *a, **k: {"published": False, "detail": "down"})
+        mod.run_monitor(interval=0, iterations=1, sleeper=lambda s: None, printer=lambda *a: None,
+                        clock=lambda: T0)
+        assert mod.load_monitor_state()[1] == old
+
+
+class TestSaveOutcomesReachTheReport:
+    def _files(self, mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(mod, "BASELINE_FILE", str(tmp_path / "baseline.json"))
+        monkeypatch.setattr(mod, "HISTORY_FILE", str(tmp_path / "history.jsonl"))
+
+    def _run_main(self, mod, monkeypatch, state):
+        monkeypatch.setattr(mod, "action_full_audit", lambda **k: state)
+        monkeypatch.setattr(sys, "argv", ["home_net_audit.py", "--no-speedtest", "--no-names"])
+        mod._main()
+        return state
+
+    def test_a_wrong_passphrase_refuses_the_save_and_says_so_in_the_report(self, mod, tmp_path, monkeypatch):
+        self._files(mod, tmp_path, monkeypatch)
+        mod.save_baseline({"gateway": GW, "router_open_ports": [80]}, passphrase="right")
+        before = Path(mod.BASELINE_FILE).read_text()
+        monkeypatch.setenv(mod.PASSPHRASE_ENV, "wrong")
+        state = self._run_main(mod, monkeypatch, {"gateway": GW, "router_open_ports": [80, 23]})
+        assert Path(mod.BASELINE_FILE).read_text() == before
+        assert any("[HIGH  ] Baseline NOT saved" in l and "does not verify" in l for l in state["_comparison"])
+
+    def test_a_missing_passphrase_refusal_is_in_the_report(self, mod, tmp_path, monkeypatch):
+        self._files(mod, tmp_path, monkeypatch)
+        mod.save_baseline({"gateway": GW}, passphrase="right")
+        monkeypatch.delenv(mod.PASSPHRASE_ENV, raising=False)
+        state = self._run_main(mod, monkeypatch, {"gateway": GW})
+        assert any("[HIGH  ] Baseline NOT saved" in l for l in state["_comparison"])
+
+    def test_a_saved_run_records_its_save_in_the_report(self, mod, tmp_path, monkeypatch):
+        self._files(mod, tmp_path, monkeypatch)
+        monkeypatch.delenv(mod.PASSPHRASE_ENV, raising=False)
+        state = self._run_main(mod, monkeypatch, {"gateway": GW})
+        assert any(l.startswith("Baseline saved to") for l in state["_comparison"])
+        assert any("Receipt not published" in l for l in state["_comparison"])
+
+    def test_keyedness_survives_a_flipped_history_line(self, mod, tmp_path, monkeypatch):
+        self._files(mod, tmp_path, monkeypatch)
+        mod.save_baseline({"gateway": GW}, passphrase="pw")
+        lines = Path(mod.HISTORY_FILE).read_text().splitlines()
+        last = json.loads(lines[-1]); last["keyed"] = False
+        Path(mod.HISTORY_FILE).write_text("\n".join(lines[:-1] + [json.dumps(last)]) + "\n")
+        assert mod.chain_is_keyed() is True
+
+
+class TestControlCheckEdges:
+    def _probe(self, mod, monkeypatch, desc, posts_answer, desc_path="/gatedesc.xml"):
+        posts = []
+        monkeypatch.setattr(mod, "_ssdp_search", lambda *a, **k: ([], False))
+        monkeypatch.setattr(mod, "_http_get_plain", lambda h, port, path, **k: (
+            (200, "libupnp", desc) if path == desc_path else (404, "libupnp", "nope")))
+
+        def fake_post(h, port, path, body, headers, **k):
+            posts.append((port, path))
+            return posts_answer(port, path)
+        monkeypatch.setattr(mod, "_http_post_plain", fake_post)
+        return mod.classify_upnp_listener(MODEM, 1900, onlink=False), posts
+
+    def test_a_404_from_the_web_server_is_not_a_refusal(self, mod, monkeypatch):
+        v, _ = self._probe(mod, monkeypatch, IGD_DESC.format(ctrl="/upnp/control/WANIPConn1"),
+                           lambda port, path: (404, "x", "<h1>404</h1>"))
+        assert v["state"] == mod.UPNP_LIVE_GATEWAY and "Not confirmed" in v["caveat"]
+
+    def test_urlbase_is_honoured(self, mod, monkeypatch):
+        desc = IGD_DESC.format(ctrl="ctl/IPConn").replace("<device>", f"<URLBase>http://{MODEM}:49152/</URLBase><device>")
+        v, posts = self._probe(mod, monkeypatch, desc, lambda port, path: (500, "x", FAULT))
+        assert posts == [(49152, "/ctl/IPConn")] and v["state"] == mod.UPNP_DESCRIBED_OFF
+
+    def test_a_second_gateway_service_that_answers_wins(self, mod, monkeypatch):
+        desc = IGD_DESC.format(ctrl="/ctl/PPP").replace("WANIPConnection", "WANPPPConnection").replace(
+            "</serviceList>", "<service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>"
+                              "<serviceId>x</serviceId><controlURL>/ctl/IP</controlURL></service></serviceList>")
+        v, posts = self._probe(mod, monkeypatch, desc,
+                               lambda port, path: (500, "x", FAULT) if path == "/ctl/PPP" else (200, "x", ANSWER))
+        assert v["state"] == mod.UPNP_LIVE_GATEWAY and "Confirmed" in v["caveat"]
+
+
+class TestHttpEdges:
+    def _fetch(self, mod, monkeypatch, chunks):
+        sock = FakeSock(chunks + [b""])
+        monkeypatch.setattr(mod.socket, "create_connection", lambda *a, **k: sock)
+        return mod._http_get_plain(MODEM, 1900, "/d.xml")
+
+    def test_bare_lf_headers_still_yield_the_body(self, mod, monkeypatch):
+        got = self._fetch(mod, monkeypatch, [b"HTTP/1.0 200 OK\nServer: lf/1\n\n<root>x</root>"])
+        assert got == (200, "lf/1", "<root>x</root>")
+
+    def test_a_chunked_body_is_joined(self, mod, monkeypatch):
+        got = self._fetch(mod, monkeypatch, [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                              b"6\r\n<root>\r\n8\r\nx</root>\r\n0\r\n\r\n"])
+        assert got[2] == "<root>x</root>"
+
+    def test_a_reset_after_the_data_keeps_the_data(self, mod, monkeypatch):
+        class Resetting(FakeSock):
+            def recv(self, n):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise ConnectionResetError()
+        sock = Resetting([b"HTTP/1.0 200 OK\r\n\r\n<root>x</root>"])
+        monkeypatch.setattr(mod.socket, "create_connection", lambda *a, **k: sock)
+        assert mod._http_get_plain(MODEM, 1900, "/")[2] == "<root>x</root>"
+
+
+class TestReceiptsWithoutRunNumbers:
+    def test_seqless_receipts_are_not_agreement(self, mod, tmp_path, monkeypatch):
+        monkeypatch.setattr(mod, "BASELINE_FILE", str(tmp_path / "baseline-x.json"))
+        monkeypatch.setattr(mod, "HISTORY_FILE", str(tmp_path / "history-x.jsonl"))
+        mine = mod.chain_id()
+        receipts = [mod._normalise_receipt({"seq": "4", "chain": mine, "seal": "s"})]
+        assert mod.compare_with_receipts(None, receipts, sink="/x")["status"] == "no_receipts"
+        assert mod.compare_with_receipts({"seq": 3}, receipts, sink="/x")["status"] == "no_receipts"
+
+
+class TestMoreDeviceTextSinks:
+    def test_the_gateway_hostname_is_cleaned(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.socket, "gethostbyaddr", lambda ip: ("[HIGH] evil \"x\".lan", [], []))
+        monkeypatch.setattr(mod, "get_dns_servers", lambda: ["9.9.9.9"])
+        assert mod.check_router_hostname(GW)["hostname"] == "(HIGH) evil 'x'.lan"
+
+    def test_banner_hostname_and_mapping_rows_are_held_out_by_the_renderer(self):
+        eh = load_tool("report_email_html")
+        for line in ("           Server banner: CHANGES DETECTED no changes [HIGH]",
+                     "  Hostname   : [OK    ] no changes",
+                     "  8080       TCP    192.168.86.5:80        [HIGH] CHANGES DETECTED <-- unlabelled"):
+            assert "<span" not in eh.mark_line(line), line
+
+    def test_the_digest_withholds_the_hostname_and_allows_local_names(self):
+        dg = load_tool("report_digest")
+        assert "evil" not in dg.redact_for_model("  Hostname   : evil.example")
+        assert dg.accept_paragraph("All twelve devices answered as before, including kitchen.lan and the printer at hp.local; vendor names came from api.macvendors.com.")

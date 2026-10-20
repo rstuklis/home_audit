@@ -89,6 +89,9 @@ BADGE_RE = re.compile(r"()\[(HIGH|MEDIUM|REVIEW|INFO|OK|GOOD|UNKNOWN|SKIP)\s*\]"
 # What a device said about itself, quoted and attributed by the audit. Cut out
 # before any emphasis is applied, put back escaped and plain.
 ANNOUNCED_RE = re.compile(r'announces (?:"|&quot;).*(?:"|&quot;) \[\w+\]')
+# The other places the report prints what a device said: a server banner, the
+# gateway's reverse-DNS name, and the description column of a port-mapping row.
+HELD_RE = re.compile(r"(?:Server banner:|Hostname\s*:).*$|(?<=^)\s*\d{1,5}\s+(?:TCP|UDP)\s+\S+\s+.*$")
 # The per-network verdict, wherever the report repeats it (the TL;DR puts it
 # mid-line). Group 1 matches only the bad one.
 VERDICT_RE = re.compile(r"(CHANGES DETECTED)|\bNO CHANGES\b|\bno changes\b")
@@ -149,6 +152,7 @@ def mark_line(line):
         held.append(m.group(0))
         return f"\x00{len(held) - 1}\x00"
     esc = ANNOUNCED_RE.sub(hold, esc)
+    esc = HELD_RE.sub(hold, esc)
     esc = BADGE_RE.sub(lambda m: m.group(1) + badge(m.group(2)), esc)
     esc = VERDICT_RE.sub(
         lambda m: (f'<span style="color:{RISK_COLOUR["HIGH"] if m.group(1) else RISK_COLOUR["OK"]};'

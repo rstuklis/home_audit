@@ -45,6 +45,7 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -1474,11 +1475,12 @@ def save_baseline(state, passphrase=None):
 
 def chain_is_keyed():
     """Whether the most recent sealed run on this network used a passphrase."""
+    # Either source says keyed, it is keyed: the history line is unsealed and
+    # one flipped boolean there must not re-open the unsealed save.
     history = read_history()
-    if history and isinstance(history[-1], dict):
-        return bool(history[-1].get("keyed"))
+    history_keyed = bool(history and isinstance(history[-1], dict) and history[-1].get("keyed"))
     record = load_baseline_record()
-    return bool(isinstance(record, dict) and record.get("keyed"))
+    return history_keyed or bool(isinstance(record, dict) and record.get("keyed"))
 
 
 def describe_unkeyed_save_refusal():
@@ -1497,6 +1499,24 @@ def describe_unkeyed_save_refusal():
             f"passphrase that this run was not given ({PASSPHRASE_ENV} unset or "
             "unreadable). Saving unsealed would downgrade the chain. The previous "
             "sealed baseline stays the reference; supply the passphrase to save.")
+
+
+def describe_modified_save_refusal():
+    """Why a seal that does not verify is not quietly re-sealed.
+
+    With the right passphrase a tampered baseline reads "modified"; with the
+    wrong passphrase an honest one reads the same, since an HMAC cannot tell
+    the two apart. Either way, saving went on to write a fresh seal under the
+    passphrase that arrived — so one week of HIGH, then "ok" for ever, over
+    either a tampered record or a chain quietly re-keyed to a typo. The record
+    stays as it is, and the line repeats every run until a person re-seals
+    from a state they trust (seal_baseline.py) or fixes the passphrase.
+    """
+    return ("\n  [HIGH  ] Baseline NOT saved: the sealed baseline does not verify with "
+            "the passphrase given. Either the passphrase is wrong, or the baseline was "
+            "altered since it was sealed. Re-seal from a state you trust with "
+            "seal_baseline.py, or fix the passphrase; until then the record is left as "
+            "it is and this line repeats.")
 
 
 def load_baseline_record():
@@ -1954,7 +1974,10 @@ def _normalise_receipt(entry):
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 clean[key] = value
         elif key == "interval":
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
+            # json.loads accepts NaN and Infinity. NaN compares false with
+            # everything, so a NaN cadence made every window "not a gap".
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value)):
                 clean[key] = value
         elif key == "keyed":
             clean[key] = bool(value)
@@ -2059,7 +2082,15 @@ def compare_with_receipts(record, receipts, sink=None):
                           "the current baseline as attacker-controlled and re-seal "
                           "from a trusted state."}
 
-    highest = max((r.get("seq") or 0) for r in receipts)
+    # Only receipts that carry a run number can agree or disagree with one; a
+    # line whose seq was dropped as malformed used to count as "agrees" at 0.
+    numbered = [r for r in receipts if isinstance(r.get("seq"), int) and not isinstance(r.get("seq"), bool)]
+    if not numbered:
+        return {"status": "no_receipts",
+                "detail": "The off-host receipts for this chain carry no run number, "
+                          "so there is nothing to compare the local baseline against."}
+    receipts = numbered
+    highest = max(r["seq"] for r in receipts)
     local_seq = (record or {}).get("seq") or 0
 
     if local_seq < highest:
@@ -2195,6 +2226,11 @@ def carry_forward_blank_fields(snapshot, previous):
         # gateway MAC, and carry_forward_gateway_mac already says so. Storing
         # the blank is what re-reported every neighbour as new a poll later.
         out["neighbours"] = list(previous["neighbours"])
+    if not out.get("ipv6_routers") and previous.get("ipv6_routers"):
+        # A router that stops advertising is not an event, so carrying costs
+        # nothing; storing the blank made the same router a HIGH "new IPv6
+        # router" on the poll after an `ndp` timeout.
+        out["ipv6_routers"] = list(previous["ipv6_routers"])
     if not carried:
         return (out if out != snapshot else snapshot), None
     return out, {
@@ -2336,20 +2372,6 @@ HEARTBEAT_SKEW = 300
 
 def _utcnow():
     return datetime.now(timezone.utc)
-
-
-def _parse_stamp(value):
-    """Parse an ISO timestamp to an aware datetime, or None if unusable.
-
-    Anything unreadable is None rather than an exception: these stamps come from
-    a log an attacker may have appended to, and a crash on a malformed line
-    would turn the evidence trail into a denial of service.
-    """
-    try:
-        stamp = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
 
 
 def _format_duration(seconds):
@@ -2519,9 +2541,15 @@ def observation_gaps(heartbeats, interval=None, now=None):
 
     def cadence(h):
         value = h.get("interval")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
             return None
-        return min(value, HEARTBEAT_INTERVAL_MAX)
+        # Floored at HEARTBEAT_INTERVAL: run_monitor never publishes faster than
+        # that, so a smaller recorded value describes the poll, not the beats —
+        # the pre-fix monitor wrote 60 for beats 900 s apart, and read literally
+        # those ten lines were ten "windows with no monitoring" on every audit,
+        # for ever, since nothing leaves an append-only sink. Capped as before.
+        return max(HEARTBEAT_INTERVAL, min(value, HEARTBEAT_INTERVAL_MAX))
 
     beats = sorted(((s, cadence(h)) for s, h in ((_parse_stamp(h.get("at")), h) for h in heartbeats)
                     if s is not None and s <= now + timedelta(seconds=HEARTBEAT_SKEW)),
@@ -2567,7 +2595,7 @@ def describe_clock_anomalies(heartbeats, now=None):
              if s is not None and s > now + timedelta(seconds=HEARTBEAT_SKEW)]
     absurd = [h for h in (heartbeats or []) if isinstance(h, dict)
               and isinstance(h.get("interval"), (int, float)) and not isinstance(h.get("interval"), bool)
-              and h.get("interval") > HEARTBEAT_INTERVAL_MAX]
+              and (not math.isfinite(h.get("interval")) or h.get("interval") > HEARTBEAT_INTERVAL_MAX)]
     lines = []
     if ahead:
         lines.append(
@@ -2724,6 +2752,7 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
         undelivered[:] = still
 
     previous, observed_at = load_monitor_state()
+    last_polled_at = observed_at
     started = clock()
     # A gap is measured against the promise the monitor makes: it said it would
     # look every `interval` seconds. One missed poll is a slow machine; beyond
@@ -2772,6 +2801,7 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 _deliver(event)
 
             previous = snapshot
+            last_polled_at = polled_at
             resumed_gap = None          # only the first comparison spans the gap
             _retry_undelivered()
             if (not save_monitor_state(snapshot, polled_at, undelivered=undelivered)
@@ -2810,8 +2840,10 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     finally:
         if previous is not None and undelivered:
             # The queue outlives the process; the reference it belongs to is
-            # rewritten with it so the next start retries what this one could not.
-            save_monitor_state(previous, None, undelivered)
+            # rewritten with it so the next start retries what this one could
+            # not — stamped with the last poll that actually completed, never
+            # with now, or a stop during the first poll would erase the gap.
+            save_monitor_state(previous, last_polled_at, undelivered)
     if undelivered:
         printer(f"  [HIGH  ] {len(undelivered)} alert(s) never left this machine. "
                 "They are queued for the next start and listed above — if this "
@@ -5114,7 +5146,7 @@ def get_upnp_port_mappings(gateway):
         return [], "No UPnP device found via SSDP (router may have UPnP disabled)"
 
     if not _upnp_url_points_at(location, gateway):
-        return [], (f"The UPnP reply from {gateway} pointed at {location}, which is "
+        return [], (f"The UPnP reply from {gateway} pointed at {_banner_text(location, 120)}, which is "
                     "not an http(s) address on the gateway itself. Not followed, so "
                     "port mappings were not read.")
 
@@ -5124,7 +5156,7 @@ def get_upnp_port_mappings(gateway):
         with urllib.request.urlopen(req, timeout=5) as r:
             xml = r.read().decode("utf-8", "ignore")
     except Exception as e:
-        return [], f"Could not fetch UPnP device description: {e}"
+        return [], f"Could not fetch UPnP device description: {_banner_text(str(e), 160)}"
 
     # Extract base URL and control URL
     base_url_m = re.match(r"(https?://[^/]+)", location)
@@ -5139,7 +5171,7 @@ def get_upnp_port_mappings(gateway):
     ctrl_path = ctrl_m.group(1).strip()
     ctrl_url = ctrl_path if ctrl_path.startswith("http") else base_url + ctrl_path
     if not _upnp_url_points_at(ctrl_url, gateway):
-        return [], (f"The UPnP description named a control URL at {ctrl_url}, which is "
+        return [], (f"The UPnP description named a control URL at {_banner_text(ctrl_url, 120)}, which is "
                     "not on the gateway. Not followed, so port mappings were not read.")
 
     # Step 3: GetGenericPortMappingEntry in a loop
@@ -5217,7 +5249,7 @@ _UPNP_GATEWAY_MARKERS = ("internetgatewaydevice", "wanipconnection",
 UPNP_DESCRIBED_OFF = "described-off"
 
 
-def _upnp_control_check(host, port, description):
+def _upnp_control_check(host, port, path, description):
     """Ask the gateway service in `description` one read-only question.
 
     A description naming WANIPConnection is what the live-gateway verdict used
@@ -5232,6 +5264,11 @@ def _upnp_control_check(host, port, description):
     service is there and declines), or None (no HTTP answer, or no gateway
     service with a usable control URL in the description).
     """
+    base = f"http://{host}:{port}{path if str(path).startswith('/') else '/' + str(path)}"
+    urlbase = re.search(r"<URLBase>\s*([^<]+?)\s*</URLBase>", description or "", re.I)
+    if urlbase and _upnp_url_points_at(urlbase.group(1), host):
+        base = urlbase.group(1)
+    outcomes = []
     services = re.findall(r"<service>(.*?)</service>", description or "", re.S | re.I)
     for block in services:
         st = re.search(r"<serviceType>\s*([^<]+?)\s*</serviceType>", block, re.I)
@@ -5241,18 +5278,17 @@ def _upnp_control_check(host, port, description):
         stype = st.group(1)
         if "WANIPConnection" not in stype and "WANPPPConnection" not in stype:
             continue
-        ctrl = html.unescape(cu.group(1))
-        if ctrl.startswith(("http://", "https://")):
-            # Only back to the host being asked about, over plain http — the
-            # same rule every other URL a device hands this tool is held to.
-            if not _upnp_url_points_at(ctrl, host):
-                return None
-            parts = urllib.parse.urlsplit(ctrl)
-            if parts.scheme != "http":
-                return None
-            c_port, c_path = parts.port or 80, parts.path or "/"
-        else:
-            c_port, c_path = port, ("/" + ctrl.lstrip("/"))
+        # Resolved the way the spec says — against URLBase, else the
+        # description's own URL — and only back to the host being asked about,
+        # over plain http: the same rule every other URL a device hands this
+        # tool is held to.
+        ctrl = urllib.parse.urljoin(base, html.unescape(cu.group(1)))
+        if not _upnp_url_points_at(ctrl, host):
+            continue
+        parts = urllib.parse.urlsplit(ctrl)
+        if parts.scheme != "http":
+            continue
+        c_port, c_path = parts.port or 80, parts.path or "/"
         soap = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
                 's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
                 f'<u:GetExternalIPAddress xmlns:u="{stype}"/></s:Body></s:Envelope>')
@@ -5260,12 +5296,17 @@ def _upnp_control_check(host, port, description):
             "Content-Type": 'text/xml; charset="utf-8"',
             "SOAPAction": f'"{stype}#GetExternalIPAddress"'})
         if got is None:
-            return None
+            continue
         status, _srv, reply = got
-        if status == 200 and "upnperror" not in reply.lower():
+        lowered = reply.lower()
+        if status == 200 and "upnperror" not in lowered and "<s:fault" not in lowered:
             return "answered"
-        return "refused"
-    return None
+        # Only a SOAP fault is the service declining. A bare 404 or 405 is a
+        # web server that never heard of the path — a wrong URL, not a
+        # switched-off service — and must not read as "off".
+        if "upnperror" in lowered or "<s:fault" in lowered:
+            outcomes.append("refused")
+    return "refused" if outcomes else None
 
 UPNP_LIVE_GATEWAY = "live-gateway"
 UPNP_LIVE_OTHER = "live-other"
@@ -5364,6 +5405,26 @@ def _http_post_plain(host, port, path, body, headers, timeout=3.0, limit=65536,
     return _http_plain("POST", host, port, path, body, headers, timeout, limit, total)
 
 
+def _dechunk(body):
+    """Join the chunks of a chunked body; on any framing surprise, the raw bytes.
+
+    An HTTP/1.0 request asks for no chunking, but an embedded server that
+    always chunks is not going to read the request version.
+    """
+    out, pos = bytearray(), 0
+    try:
+        while True:
+            end = body.index(b"\r\n", pos)
+            size = int(body[pos:end].split(b";")[0].strip(), 16)
+            if size == 0:
+                break
+            out += body[end + 2:end + 2 + size]
+            pos = end + 2 + size + 2
+    except (ValueError, IndexError):
+        return body if not out else bytes(out)
+    return bytes(out)
+
+
 def _http_plain(method, host, port, path, body, headers, timeout, limit, total):
     """One plain HTTP exchange, bounded in wall-clock time. Returns (status,
     server_header, body) or None if no HTTP came back.
@@ -5410,15 +5471,26 @@ def _http_plain(method, host, port, path, body, headers, timeout, limit, total):
                 chunk = sock.recv(16384)
             except socket.timeout:
                 break
+            except OSError:
+                # A reset after the data (SO_LINGER 0, an abrupt exit) is not
+                # the loss of what already arrived.
+                break
             if not chunk:
                 break
             buf += chunk
         if not buf:
             return None
-        head, sep, body = bytes(buf).partition(b"\r\n\r\n")
-        if not sep:
-            head, body = bytes(buf), b""
-        lines = head.decode("iso-8859-1", "replace").split("\r\n")
+        raw = bytes(buf)
+        crlf, lf = raw.find(b"\r\n\r\n"), raw.find(b"\n\n")
+        if crlf >= 0 and (lf < 0 or crlf <= lf):
+            head, body = raw[:crlf], raw[crlf + 4:]
+        elif lf >= 0:
+            head, body = raw[:lf], raw[lf + 2:]      # a bare-LF embedded server
+        else:
+            head, body = raw, b""
+        lines = head.decode("iso-8859-1", "replace").splitlines()
+        if any(l.lower().replace(" ", "").startswith("transfer-encoding:chunked") for l in lines[1:101]):
+            body = _dechunk(body)
         m = re.match(r"HTTP/\d\.\d\s+(\d{3})", lines[0])
         if not m:
             return None
@@ -5494,7 +5566,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
                 server = _banner_text(sm.group(1))
     targets = targets[:4] + [(port, path) for path in ("/",) + UPNP_DESCRIPTION_PATHS]
 
-    description_port = None
+    description_port, description_path = None, "/"
     for t_port, t_path in targets:
         got = _http_get_plain(host, t_port, t_path)
         if got is None:
@@ -5510,7 +5582,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
             server = _banner_text(srv)
         if status == 200 and _looks_like_upnp_description(body):
             descriptions.append(body)
-            description_port = t_port
+            description_port, description_path = t_port, t_path
             break
 
     said = "\n".join(replies + descriptions).lower()
@@ -5519,7 +5591,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
     if any(marker in said for marker in _UPNP_GATEWAY_MARKERS):
         # The description is a claim; whether the control service answers is
         # the capability. One read-only question settles which this is.
-        control = (_upnp_control_check(host, description_port, descriptions[0])
+        control = (_upnp_control_check(host, description_port, description_path, descriptions[0])
                    if descriptions else None)
         if control == "refused":
             verdict.update(
@@ -6176,7 +6248,9 @@ def check_router_hostname(gateway, resolvers=None):
     self_attested None, meaning "not established" rather than "no".
     """
     try:
-        hostname = socket.gethostbyaddr(gateway)[0]
+        # A PTR answer is the resolver's to choose — on a home network, the
+        # gateway's — so it is cleaned like any other device-chosen text.
+        hostname = _banner_text(socket.gethostbyaddr(gateway)[0], 120) or None
     except socket.herror:
         hostname = None
     except Exception:
@@ -8865,28 +8939,40 @@ def _main():
         upstream_reference=args.upstream_reference,
         )
 
+    # Everything said about the save is kept for the HTML report as well: the
+    # comparison block above was frozen before this point, and a refused save
+    # or a receipt that never left the machine is exactly what the emailed
+    # report must not omit.
+    def tell(line):
+        print(line)
+        if isinstance(state, dict):
+            state.setdefault("_comparison", []).append(str(line).strip("\n"))
+
     if args.no_save_baseline:
-        pass
+        tell("Baseline not saved (--no-save-baseline): the previous one stays the reference.")
     elif state.get("gateway") is None:
         # Saving a gateway-less run would drop router_open_ports from the
         # baseline and trigger false "NEW open port" alarms on the next run.
-        print("\nSkipping baseline save: gateway could not be determined, so this "
-              "scan is incomplete and would corrupt change detection.")
+        tell("\n  [REVIEW] Skipping baseline save: gateway could not be determined, so this "
+             "scan is incomplete and would corrupt change detection.")
     else:
         if args.publish_to:
             os.environ[SINK_ENV] = args.publish_to
         passphrase = resolve_passphrase(prompt=args.seal_baseline)
         if passphrase is None and chain_is_keyed():
-            print(describe_unkeyed_save_refusal())
+            tell(describe_unkeyed_save_refusal())
+        elif passphrase is not None and chain_is_keyed() \
+                and verify_baseline(passphrase).get("status") == "modified":
+            tell(describe_modified_save_refusal())
         else:
             _record = save_baseline(state, passphrase=passphrase)
-            print(f"\nBaseline saved to {BASELINE_FILE}")
+            tell(f"\nBaseline saved to {BASELINE_FILE}")
             _pub = describe_publish_result(_record.get("_receipt"))
             if _pub:
-                print(_pub)
+                tell(_pub)
             if passphrase is None:
-                print(f"Note: saved unsealed. Use --seal-baseline or set "
-                      f"{PASSPHRASE_ENV} to make it tamper-evident.")
+                tell(f"Note: saved unsealed. Use --seal-baseline or set "
+                     f"{PASSPHRASE_ENV} to make it tamper-evident.")
 
     if args.html_report:
         path = generate_html_report(state)
