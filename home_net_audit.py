@@ -2036,8 +2036,33 @@ def monitor_snapshot():
         "gateway_mac": arp.get(gateway) if gateway else None,
         "ipv6_routers": get_ipv6_routers(),
         "dns": get_dns_servers(),
-        "neighbours": sorted(arp),
+        "neighbours": sorted(ip for ip, mac in arp.items() if is_neighbour_entry(ip, mac)),
     }
+
+
+def is_neighbour_entry(ip, mac):
+    """Whether an ARP row describes a device, as opposed to a group or broadcast.
+
+    The ARP cache also holds the addresses this machine has SENT to that are
+    not hosts: 224.0.0.251 (mDNS) with its 01:00:5e multicast MAC, and
+    255.255.255.255 with ff:ff:ff:ff:ff:ff after any DHCP broadcast — which the
+    weekly audit's rogue-DHCP check sends. The device sweep has always dropped
+    these through is_real_host; the monitor compared the raw key set, so the
+    first poll after an audit raised "New device(s) on the LAN: 255.255.255.255"
+    and sent it off-host as an alert. A monitor that cries wolf on its owner's
+    own audit is one nobody reads. Same rule as is_real_host, minus the subnet
+    test the monitor has no subnet for.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_multicast or addr.is_unspecified or str(addr) == "255.255.255.255":
+        return False
+    mac = str(mac or "").lower()
+    if mac == "ff:ff:ff:ff:ff:ff" or mac.startswith(("01:00:5e", "33:33")):
+        return False
+    return True
 
 
 def carry_forward_gateway_mac(snapshot, previous):

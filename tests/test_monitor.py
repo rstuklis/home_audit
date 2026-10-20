@@ -750,3 +750,39 @@ class TestAnUnwritableReferenceIsNotSilent:
         warnings = [l for l in lines if "re-baseline" in l]
         assert len(warnings) == 1, "say it once, not once per poll"
         assert "HIGH" in warnings[0]
+
+
+class TestNeighboursAreDevicesNotGroups:
+    """The ARP cache also holds what this machine SENT to: 224.0.0.251 with its
+    multicast MAC, and 255.255.255.255 with ff:ff:ff:ff:ff:ff after the weekly
+    audit's DHCP broadcast. The first beach-house monitor poll after an audit
+    raised "New device(s) on the LAN: 255.255.255.255" and shipped it off-host
+    as an alert. The sweep has always dropped these rows (is_real_host); the
+    monitor must too."""
+
+    def test_broadcast_and_multicast_rows_are_not_neighbours(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "get_default_gateway", lambda: GW)
+        monkeypatch.setattr(mod, "get_ipv6_routers", lambda: [])
+        monkeypatch.setattr(mod, "get_dns_servers", lambda: [GW])
+        monkeypatch.setattr(mod, "read_arp_table", lambda: {
+            GW: ROUTER_MAC,
+            "192.168.1.42": "3c:22:fb:44:55:66",
+            "255.255.255.255": "ff:ff:ff:ff:ff:ff",
+            "224.0.0.251": "01:00:5e:00:00:fb",
+            "239.255.255.250": "01:00:5e:7f:ff:fa",
+        })
+        assert mod.monitor_snapshot()["neighbours"] == [GW, "192.168.1.42"]
+
+    def test_the_rule_matches_the_sweep(self, mod):
+        assert mod.is_neighbour_entry("192.168.1.42", "3c:22:fb:44:55:66") is True
+        assert mod.is_neighbour_entry("255.255.255.255", "ff:ff:ff:ff:ff:ff") is False
+        assert mod.is_neighbour_entry("224.0.0.251", "01:00:5e:00:00:fb") is False
+        # A broadcast MAC on an ordinary-looking address is still not a device.
+        assert mod.is_neighbour_entry("192.168.1.255", "ff:ff:ff:ff:ff:ff") is False
+        assert mod.is_neighbour_entry("not-an-ip", "3c:22:fb:44:55:66") is False
+
+    def test_an_old_reference_holding_broadcast_raises_nothing_on_the_next_poll(self, mod):
+        # A monitor_state saved before this fix lists 255.255.255.255; a
+        # departure is a non-event, so the transition is silent.
+        old = snap(neighbours=[GW, "192.168.1.42", "255.255.255.255"])
+        assert mod.diff_snapshots(old, snap()) == []
