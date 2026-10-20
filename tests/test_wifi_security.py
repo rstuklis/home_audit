@@ -419,17 +419,20 @@ class TestRedactedSsid:
         assert "Location Services" in printed
         assert "sudo" not in printed.lower()
 
-    def test_the_evil_twin_note_names_the_permission_and_rules_out_sudo(
+    def test_the_evil_twin_note_names_the_permission_and_the_fallbacks(
             self, mod, monkeypatch, fixture):
         """The terse SSID field states the requirement; this is where someone
-        goes for detail, so it is where the misconception is worth correcting
-        rather than left to be rediscovered."""
+        goes for detail. Reaching this note now means the automatic fallbacks
+        (association record, root wdutil) were tried and failed too, so the
+        note must say that rather than repeat the old 'sudo never helps'
+        claim the module itself no longer honours."""
         monkeypatch.setattr(mod, "run", make_run({
             "system_profiler SPAirPortDataType":
                 fixture("wifi_sp_airport_redacted.out")}))
         note = mod.check_evil_twin()["note"]
         assert "Location Services" in note
-        assert "sudo does not help" in note.lower()
+        assert "fallback" in note.lower()
+        assert "wdutil" in note
 
     def test_redaction_does_not_stop_the_security_classification(
             self, mod, monkeypatch, fixture):

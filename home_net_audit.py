@@ -45,8 +45,10 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import os
 import re
+import signal
 import socket
 import ssl
 import struct
@@ -900,6 +902,12 @@ def discover_devices(subnet, workers=50):
             if res:
                 alive.add(res)
     arp = read_arp_table()
+    if alive and not any(ip in arp for ip in alive):
+        # Hosts answered but the table names none of them: the one `arp -an`
+        # failed or timed out, not the network. Ask once more before recording
+        # a sweep of "unknown"s — macs_unreadable says what that costs.
+        time.sleep(1)
+        arp = read_arp_table() or arp
     devices = []
     for ip in sorted(alive | set(arp.keys()), key=ipaddress.ip_address):
         mac = arp.get(ip, "unknown")
@@ -1278,6 +1286,50 @@ def swept_anywhere(state):
     return bool(state.get("scanned_subnets"))
 
 
+def macs_unreadable(state):
+    """Whether a sweep found hosts but could read a hardware address for none.
+
+    discover_devices records a host that answered a ping but has no ARP entry
+    as mac "unknown", so one straggler is ordinary. Every host at once is not:
+    the whole table comes from one `arp -an`, and when that call fails — it
+    timed out on a Mac that had just woken for its scheduled run — the sweep
+    comes back as a list of addresses with no identities. That run reported
+    eleven hosts, all "unknown"; the comparison is by MAC, so every device in
+    the baseline was reported gone, the week after every one came back as NEW,
+    and the device memory would have been emptied in between.
+
+    Such a list is a count, not a measurement of identities, and everywhere
+    identities are compared it is treated like a run that did not sweep: no
+    arrivals, no departures, no memory update, and the previous device list is
+    carried forward. The count is still printed, and the report says why it
+    was not compared.
+
+    Two cases are deliberately NOT this one. An empty list: a sweep that
+    genuinely found nothing is a real and alarming finding, and swept_anywhere
+    owns it. And a single entry without an address: one host with no ARP entry
+    is the ordinary straggler, indistinguishable from a failed read, and the
+    existing rule — it contributes nothing to the comparison — already handles
+    it without silencing the comparison of everything else. The verdict here
+    needs two or more hosts, every one without an address, which no healthy
+    read of the table produces: the gateway alone always has an entry, because
+    this machine has just routed through it.
+    """
+    devices = state.get("devices")
+    if not devices or len(devices) < 2:
+        return False
+    for d in devices:
+        if isinstance(d, dict):
+            mac = d.get("mac")
+            if isinstance(mac, str) and mac and mac != "unknown":
+                return False
+    return True
+
+
+def devices_identified(state):
+    """swept_anywhere, and the sweep could tell the devices apart."""
+    return swept_anywhere(state) and not macs_unreadable(state)
+
+
 def carry_forward_unmeasured(state, previous=None):
     """Return `state` with unmeasured values replaced by the last known-good ones.
 
@@ -1323,7 +1375,7 @@ def carry_forward_unmeasured(state, previous=None):
         # subnet it was not joined to rather than by --no-discovery. Silent, and
         # permanent, because the wiped list becomes the new reference point.
         if key in SWEEP_KEYS:
-            measured = swept_anywhere(state)
+            measured = devices_identified(state)
         elif key == "router_tls":
             measured = tls_measured(state)
         else:
@@ -1369,14 +1421,21 @@ def save_baseline(state, passphrase=None):
     # Done here, in the one function every save goes through, so the menu's
     # save and the CLI's cannot drift apart. Inside the sealed state, so the
     # memory cannot be padded with a stranger's MAC without breaking the seal.
+    # Keys beginning with "_" are this run's commentary about the comparison it
+    # made (see action_full_audit), kept on the state so the HTML report can
+    # render them and stripped here so the baseline holds only measurements.
+    given = state
+    state = {k: v for k, v in state.items() if not str(k).startswith("_")}
     memory = update_device_memory(load_baseline() or {}, state)
     state = carry_forward_unmeasured(state)
     # Only when there is something to remember: a state that says nothing about
     # devices gains no key telling the reader that nothing is remembered.
     if memory:
         state["device_memory"] = memory
+        given["device_memory"] = memory
     else:
         state.pop("device_memory", None)
+        given.pop("device_memory", None)
     history = read_history()
     prev = history[-1]["seal"] if history else None
     seq = (history[-1]["seq"] + 1) if history else 1
@@ -1412,6 +1471,52 @@ def save_baseline(state, passphrase=None):
         "ts": state.get("timestamp") or datetime.now(timezone.utc).isoformat(),
     })
     return record
+
+
+def chain_is_keyed():
+    """Whether the most recent sealed run on this network used a passphrase."""
+    # Either source says keyed, it is keyed: the history line is unsealed and
+    # one flipped boolean there must not re-open the unsealed save.
+    history = read_history()
+    history_keyed = bool(history and isinstance(history[-1], dict) and history[-1].get("keyed"))
+    record = load_baseline_record()
+    return history_keyed or bool(isinstance(record, dict) and record.get("keyed"))
+
+
+def describe_unkeyed_save_refusal():
+    """Why a run without the passphrase leaves a sealed baseline as it is.
+
+    save_baseline writes keyed=False whenever no passphrase arrives, and one
+    failed lookup — a locked Keychain, a typo in the job's environment — used to
+    chain an unsealed record onto a sealed chain with only a "saved unsealed"
+    note. For the following week the live baseline was one any local process
+    could rewrite and re-seal, and the week after that reported the tool's own
+    keyed_downgrade HIGH about what the operator's job had done. Keeping the
+    previous sealed record as the reference costs one week of baseline freshness
+    and nothing else: the comparison already ran.
+    """
+    return ("\n  [HIGH  ] Baseline NOT saved: this network's chain is sealed with a "
+            f"passphrase that this run was not given ({PASSPHRASE_ENV} unset or "
+            "unreadable). Saving unsealed would downgrade the chain. The previous "
+            "sealed baseline stays the reference; supply the passphrase to save.")
+
+
+def describe_modified_save_refusal():
+    """Why a seal that does not verify is not quietly re-sealed.
+
+    With the right passphrase a tampered baseline reads "modified"; with the
+    wrong passphrase an honest one reads the same, since an HMAC cannot tell
+    the two apart. Either way, saving went on to write a fresh seal under the
+    passphrase that arrived — so one week of HIGH, then "ok" for ever, over
+    either a tampered record or a chain quietly re-keyed to a typo. The record
+    stays as it is, and the line repeats every run until a person re-seals
+    from a state they trust (seal_baseline.py) or fixes the passphrase.
+    """
+    return ("\n  [HIGH  ] Baseline NOT saved: the sealed baseline does not verify with "
+            "the passphrase given. Either the passphrase is wrong, or the baseline was "
+            "altered since it was sealed. Re-seal from a state you trust with "
+            "seal_baseline.py, or fix the passphrase; until then the record is left as "
+            "it is and this line repeats.")
 
 
 def load_baseline_record():
@@ -1502,6 +1607,13 @@ def verify_baseline(passphrase=None):
 
     keyed = bool(record.get("keyed"))
     if keyed and passphrase is None:
+        # The seal cannot be checked without the key, but the record's place in
+        # the chain can: an older sealed baseline put back, or a history file
+        # removed, shows in seq and seal alone. Returning "unverifiable" first
+        # made a rollback a REVIEW on any run that lacked the passphrase.
+        misplaced = _chain_position_problem(record, keyed=True)
+        if misplaced:
+            return misplaced
         return {"status": "unverifiable", "keyed": True,
                 "detail": "Baseline is sealed with a passphrase; supply it to verify."}
 
@@ -1539,19 +1651,9 @@ def verify_baseline(passphrase=None):
                 "detail": "The baseline's contents do not match its seal. It has been "
                           "altered since it was written."}
 
-    history = read_history()
-    if not history:
-        if record.get("seq", 1) > 1:
-            return {"status": "chain_missing", "keyed": keyed,
-                    "detail": "The baseline references earlier runs but the history "
-                              "file is gone. It may have been removed to hide a change."}
-    else:
-        last = history[-1]
-        if record.get("seq") != last.get("seq") or record.get("seal") != last.get("seal"):
-            return {"status": "rolled_back", "keyed": keyed,
-                    "detail": f"The baseline is at run {record.get('seq')} but the chain "
-                              f"has reached run {last.get('seq')}. An older baseline may "
-                              "have been put back in place."}
+    misplaced = _chain_position_problem(record, keyed)
+    if misplaced:
+        return misplaced
 
     detail = ("Seal verified with your passphrase." if keyed else
               "Hash chain intact. Note this is unkeyed: it catches corruption and "
@@ -1574,6 +1676,26 @@ def verify_baseline(passphrase=None):
 # scheme rests on. If the host holds credentials that can also delete or
 # overwrite remote history, an attacker on that host holds them too.
 # ---------------------------------------------------------------------------
+
+def _chain_position_problem(record, keyed):
+    """rolled_back or chain_missing for a record that does not sit at the chain's
+    head, else None. Needs no key: seq and seal are compared, not recomputed."""
+    history = read_history()
+    if not history:
+        seq = record.get("seq", 1)
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 1:
+            return {"status": "chain_missing", "keyed": keyed,
+                    "detail": "The baseline references earlier runs but the history "
+                              "file is gone. It may have been removed to hide a change."}
+        return None
+    last = history[-1]
+    if record.get("seq") != last.get("seq") or record.get("seal") != last.get("seal"):
+        return {"status": "rolled_back", "keyed": keyed,
+                "detail": f"The baseline is at run {record.get('seq')} but the chain "
+                          f"has reached run {last.get('seq')}. An older baseline may "
+                          "have been put back in place."}
+    return None
+
 
 def chain_id(baseline_path=None):
     """An opaque, stable identifier for the chain a baseline belongs to.
@@ -1700,6 +1822,11 @@ def _publish_path(payload, destination, mode):
     """
     if os.path.isdir(destination):
         destination = os.path.join(destination, "receipts.jsonl")
+    if _icloud_placeholder(destination):
+        # Appending here would create a second file beside the evicted one and
+        # fork the record; the publish fails loudly instead.
+        raise OSError(f"{destination} is evicted from iCloud Drive (only its "
+                      ".icloud placeholder is present); not appending beside it")
     parent = os.path.dirname(destination)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -1778,7 +1905,22 @@ def receipt_sink_is_readable(source):
     never be reported as the first, because the whole point of the sink is to
     contradict a local baseline that claims to be a first run.
     """
-    return not str(source).startswith(("http://", "https://"))
+    source = str(source)
+    if source.startswith(("http://", "https://")):
+        return False
+    path = os.path.join(source, "receipts.jsonl") if os.path.isdir(source) else source
+    if _icloud_placeholder(path):
+        # iCloud Drive has evicted the file: only ".<name>.icloud" is present.
+        # Reading it as "no receipts" is the difference between "nothing was
+        # published" and "I cannot see what was published".
+        return False
+    return not (os.path.exists(path) and not os.access(path, os.R_OK))
+
+
+def _icloud_placeholder(path):
+    parent, name = os.path.split(path)
+    return (not os.path.exists(path)
+            and os.path.exists(os.path.join(parent, f".{name}.icloud")))
 
 
 def read_receipts(source):
@@ -1807,10 +1949,44 @@ def read_receipts(source):
                 except json.JSONDecodeError:
                     continue
                 if isinstance(entry, dict):
-                    entries.append(entry)
+                    entries.append(_normalise_receipt(entry))
     except OSError:
         return []
     return entries
+
+
+def _normalise_receipt(entry):
+    """A receipt line with every field of the type its readers assume.
+
+    Non-dict lines were already dropped here. A dict whose "seq" is "4", whose
+    "code" is 12345 or whose "published_at" is a number got as far as
+    compare_with_receipts' max() and code_attestations' sort and raised
+    TypeError there — out of the change-detection section, before the save,
+    the report and the email. The sink is append-only and shared; one such line
+    is all it takes. Fields of the wrong type are dropped, not coerced: a seq
+    of "4" is not evidence of run 4.
+    """
+    clean = {}
+    for key, value in entry.items():
+        if not isinstance(key, str):
+            continue
+        if key == "seq":
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                clean[key] = value
+        elif key == "interval":
+            # json.loads accepts NaN and Infinity. NaN compares false with
+            # everything, so a NaN cadence made every window "not a gap".
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value)):
+                clean[key] = value
+        elif key == "keyed":
+            clean[key] = bool(value)
+        elif key in ("seal", "prev", "chain", "code", "kind", "at", "published_at"):
+            if isinstance(value, str) or value is None:
+                clean[key] = value
+        else:
+            clean[key] = value
+    return clean
 
 
 def compare_with_receipts(record, receipts, sink=None):
@@ -1906,7 +2082,15 @@ def compare_with_receipts(record, receipts, sink=None):
                           "the current baseline as attacker-controlled and re-seal "
                           "from a trusted state."}
 
-    highest = max((r.get("seq") or 0) for r in receipts)
+    # Only receipts that carry a run number can agree or disagree with one; a
+    # line whose seq was dropped as malformed used to count as "agrees" at 0.
+    numbered = [r for r in receipts if isinstance(r.get("seq"), int) and not isinstance(r.get("seq"), bool)]
+    if not numbered:
+        return {"status": "no_receipts",
+                "detail": "The off-host receipts for this chain carry no run number, "
+                          "so there is nothing to compare the local baseline against."}
+    receipts = numbered
+    highest = max(r["seq"] for r in receipts)
     local_seq = (record or {}).get("seq") or 0
 
     if local_seq < highest:
@@ -1986,8 +2170,74 @@ def monitor_snapshot():
         "gateway_mac": arp.get(gateway) if gateway else None,
         "ipv6_routers": get_ipv6_routers(),
         "dns": get_dns_servers(),
-        "neighbours": sorted(arp),
+        "neighbours": sorted(ip for ip, mac in arp.items() if is_neighbour_entry(ip, mac)),
     }
+
+
+def is_neighbour_entry(ip, mac):
+    """Whether an ARP row describes a device, as opposed to a group or broadcast.
+
+    The ARP cache also holds the addresses this machine has SENT to that are
+    not hosts: 224.0.0.251 (mDNS) with its 01:00:5e multicast MAC, and
+    255.255.255.255 with ff:ff:ff:ff:ff:ff after any DHCP broadcast — which the
+    weekly audit's rogue-DHCP check sends. The device sweep has always dropped
+    these through is_real_host; the monitor compared the raw key set, so the
+    first poll after an audit raised "New device(s) on the LAN: 255.255.255.255"
+    and sent it off-host as an alert. A monitor that cries wolf on its owner's
+    own audit is one nobody reads. Same rule as is_real_host, minus the subnet
+    test the monitor has no subnet for.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_multicast or addr.is_unspecified or str(addr) == "255.255.255.255":
+        return False
+    mac = str(mac or "").lower()
+    if mac == "ff:ff:ff:ff:ff:ff" or mac.startswith(("01:00:5e", "33:33")):
+        return False
+    return True
+
+
+def carry_forward_blank_fields(snapshot, previous):
+    """Keep the last observed gateway, resolvers and neighbours over a poll that
+    read none, rather than storing the blank and alarming twice.
+
+    One poll in which `route`, `scutil --dns` or `arp -an` times out yields
+    gateway None, dns [] and neighbours []. Compared with plain != that raised
+    HIGH gateway_changed ("to None") and HIGH dns_changed, then — the blank
+    having become the reference — the same two HIGHs back again on the next
+    poll plus every neighbour as new, all sent off-host. The same rule as
+    carry_forward_gateway_mac and as diff_baseline: an unmeasured side is
+    compared against nothing. Returns (snapshot, note or None).
+    """
+    if not previous:
+        return snapshot, None
+    carried = []
+    out = dict(snapshot)
+    if out.get("gateway") is None and previous.get("gateway"):
+        out["gateway"] = previous["gateway"]
+        carried.append("default gateway")
+    if not out.get("dns") and previous.get("dns"):
+        out["dns"] = list(previous["dns"])
+        carried.append("DNS resolvers")
+    if not out.get("neighbours") and previous.get("neighbours"):
+        # Carried without its own note: an empty ARP table also blanks the
+        # gateway MAC, and carry_forward_gateway_mac already says so. Storing
+        # the blank is what re-reported every neighbour as new a poll later.
+        out["neighbours"] = list(previous["neighbours"])
+    if not out.get("ipv6_routers") and previous.get("ipv6_routers"):
+        # A router that stops advertising is not an event, so carrying costs
+        # nothing; storing the blank made the same router a HIGH "new IPv6
+        # router" on the poll after an `ndp` timeout.
+        out["ipv6_routers"] = list(previous["ipv6_routers"])
+    if not carried:
+        return (out if out != snapshot else snapshot), None
+    return out, {
+        "severity": "REVIEW", "kind": "poll_unreadable",
+        "detail": f"Could not read the {', '.join(carried)} this poll; keeping the last "
+                  "observed values as the reference. A blank reading is not evidence "
+                  "that nothing changed."}
 
 
 def carry_forward_gateway_mac(snapshot, previous):
@@ -2104,6 +2354,12 @@ MONITOR_STATE_FILE = os.path.join(BASELINE_DIR, "monitor_state.json")
 # within one heartbeat interval, which observation_gaps reports rather than
 # rounds away.
 HEARTBEAT_INTERVAL = 900
+# The largest cadence a heartbeat is believed to claim. The sink is append-only
+# by design and the threat model assumes the host can append: one line with
+# "interval": 10**12 raised observation_gaps' threshold for every pair of beats
+# and silenced the coverage check for ever, returning the same None as
+# "observation was continuous". A day is already far beyond any sane --interval.
+HEARTBEAT_INTERVAL_MAX = 86400
 
 # How far ahead of now a heartbeat may be stamped before it is discarded as
 # unusable. The sink is append-only by design, so an entry dated 2099 can never
@@ -2116,20 +2372,6 @@ HEARTBEAT_SKEW = 300
 
 def _utcnow():
     return datetime.now(timezone.utc)
-
-
-def _parse_stamp(value):
-    """Parse an ISO timestamp to an aware datetime, or None if unusable.
-
-    Anything unreadable is None rather than an exception: these stamps come from
-    a log an attacker may have appended to, and a crash on a malformed line
-    would turn the evidence trail into a denial of service.
-    """
-    try:
-        stamp = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
 
 
 def _format_duration(seconds):
@@ -2192,7 +2434,21 @@ def load_monitor_state():
     return saved.get("snapshot"), _parse_stamp(saved.get("observed_at"))
 
 
-def save_monitor_state(snapshot, at=None):
+MONITOR_QUEUE_LIMIT = 200
+
+
+def load_monitor_queue():
+    """Alerts an earlier monitor process could not deliver, read defensively."""
+    try:
+        with open(monitor_state_file()) as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    queue = saved.get("undelivered") if isinstance(saved, dict) else None
+    return [e for e in (queue or []) if isinstance(e, dict)][:MONITOR_QUEUE_LIMIT]
+
+
+def save_monitor_state(snapshot, at=None, undelivered=None):
     """Persist the reference snapshot so the next start has something to diff.
 
     Returns True on success. A monitor that cannot persist its reference still
@@ -2202,10 +2458,18 @@ def save_monitor_state(snapshot, at=None):
     reports rather than either raising or swallowing.
     """
     try:
-        _write_json_atomic(monitor_state_file(), {
+        payload = {
             "snapshot": snapshot,
             "observed_at": (at or _utcnow()).isoformat(),
-        })
+        }
+        if undelivered:
+            # The queue used to live only in memory. SIGTERM from launchd, a
+            # reboot or an exception ended the process without the final "N
+            # alert(s) never left this machine" line, and the next start had
+            # nothing to retry: the HIGH that an in-path attacker dropped was
+            # simply gone.
+            payload["undelivered"] = list(undelivered)[-MONITOR_QUEUE_LIMIT:]
+        _write_json_atomic(monitor_state_file(), payload)
         return True
     except OSError:
         return False
@@ -2274,27 +2538,42 @@ def observation_gaps(heartbeats, interval=None, now=None):
     """
     heartbeats = [h for h in (heartbeats or []) if isinstance(h, dict)]
     now = now or _utcnow()
-    stamps = sorted(s for s in (_parse_stamp(h.get("at")) for h in heartbeats)
-                    if s is not None and s <= now + timedelta(seconds=HEARTBEAT_SKEW))
-    if not stamps:
+
+    def cadence(h):
+        value = h.get("interval")
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            return None
+        # Floored at HEARTBEAT_INTERVAL: run_monitor never publishes faster than
+        # that, so a smaller recorded value describes the poll, not the beats —
+        # the pre-fix monitor wrote 60 for beats 900 s apart, and read literally
+        # those ten lines were ten "windows with no monitoring" on every audit,
+        # for ever, since nothing leaves an append-only sink. Capped as before.
+        return max(HEARTBEAT_INTERVAL, min(value, HEARTBEAT_INTERVAL_MAX))
+
+    beats = sorted(((s, cadence(h)) for s, h in ((_parse_stamp(h.get("at")), h) for h in heartbeats)
+                    if s is not None and s <= now + timedelta(seconds=HEARTBEAT_SKEW)),
+                   key=lambda pair: pair[0])
+    if not beats:
         return []
-    if interval is None:
-        recorded = [h.get("interval") for h in heartbeats
-                    if isinstance(h.get("interval"), (int, float))
-                    and not isinstance(h.get("interval"), bool)
-                    and h.get("interval") > 0]
-        # The largest recorded cadence, so a monitor that was restarted with a
-        # longer interval is not judged against its old one.
-        interval = max(recorded) if recorded else HEARTBEAT_INTERVAL
-    # One missed heartbeat is a slow disk or a busy Pi; the allowance is what
-    # keeps this from crying wolf on every hiccup.
-    threshold = max(interval * 2, interval + 60)
+    stamps = [s for s, _ in beats]
+    # Each window is judged by the cadence the beat that OPENS it recorded, so a
+    # monitor restarted with a longer interval is not judged against its old
+    # one — and a single appended line claiming an enormous interval widens its
+    # own window and no other. Sealed against that line is the cap above. An
+    # explicit `interval` overrides all of it.
+    def threshold_after(i):
+        cad = interval if interval is not None else (beats[i][1] or HEARTBEAT_INTERVAL)
+        # One missed heartbeat is a slow disk or a busy Pi; the allowance is
+        # what keeps this from crying wolf on every hiccup.
+        return max(cad * 2, cad + 60)
     gaps = []
-    for earlier, later in zip(stamps, stamps[1:]):
+    for i, (earlier, later) in enumerate(zip(stamps, stamps[1:])):
         elapsed = (later - earlier).total_seconds()
-        if elapsed > threshold:
+        if elapsed > threshold_after(i):
             gaps.append({"start": earlier.isoformat(), "end": later.isoformat(),
                          "seconds": elapsed})
+    threshold = threshold_after(len(beats) - 1)
     trailing = (now - stamps[-1]).total_seconds()
     if trailing > threshold:
         gaps.append({"start": stamps[-1].isoformat(), "end": None,
@@ -2314,12 +2593,26 @@ def describe_clock_anomalies(heartbeats, now=None):
     ahead = [s for s in (_parse_stamp(h.get("at")) for h in (heartbeats or [])
                          if isinstance(h, dict))
              if s is not None and s > now + timedelta(seconds=HEARTBEAT_SKEW)]
-    if not ahead:
-        return None
-    return (f"  [REVIEW] Heartbeat clock: {len(ahead)} heartbeat(s) are stamped in the "
+    absurd = [h for h in (heartbeats or []) if isinstance(h, dict)
+              and isinstance(h.get("interval"), (int, float)) and not isinstance(h.get("interval"), bool)
+              and (not math.isfinite(h.get("interval")) or h.get("interval") > HEARTBEAT_INTERVAL_MAX)]
+    lines = []
+    if ahead:
+        lines.append(
+            f"  [REVIEW] Heartbeat clock: {len(ahead)} heartbeat(s) are stamped in the "
             f"future, the furthest at {max(ahead).isoformat()}. They are excluded from "
             "the coverage check. Either this host's clock is wrong, or entries were "
             "added to a log that cannot have entries removed.")
+    if absurd:
+        # No --interval produces this; only a wrong configuration or an appended
+        # line can. It would have widened the coverage check's window, so it is
+        # capped above and named here.
+        lines.append(
+            f"  [REVIEW] Heartbeat cadence: {len(absurd)} heartbeat(s) claim an interval "
+            f"above {HEARTBEAT_INTERVAL_MAX} s, which no monitor is run at. Treated as "
+            f"{HEARTBEAT_INTERVAL_MAX} s for the coverage check. Either the monitor was "
+            "misconfigured, or an entry was added to a log that cannot have entries removed.")
+    return "\n".join(lines) if lines else None
 
 
 def describe_observation_gaps(gaps):
@@ -2423,9 +2716,21 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     # then adopt the change as the new normal anyway. The adversary an alert
     # describes is in-path by definition and can drop the alert POST while
     # letting heartbeats through, so nothing else reported the loss either.
-    undelivered = []
+    undelivered = load_monitor_queue()
+    if undelivered:
+        printer(f"  [REVIEW] {len(undelivered)} alert(s) queued by an earlier run were "
+                "never delivered; retrying them.")
     state_warned = False
     heartbeat_warned = False
+
+    # launchd stops a job with SIGTERM. Turned into KeyboardInterrupt so the
+    # loop ends through the same path as Ctrl-C: queue saved, summary printed.
+    def _terminate(signum, frame):
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _terminate)
+    except (ValueError, OSError):
+        pass                      # not the main thread: nothing to install
 
     def _deliver(event):
         result = send_alert(event, alert_to)
@@ -2447,6 +2752,7 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
         undelivered[:] = still
 
     previous, observed_at = load_monitor_state()
+    last_polled_at = observed_at
     started = clock()
     # A gap is measured against the promise the monitor makes: it said it would
     # look every `interval` seconds. One missed poll is a slow machine; beyond
@@ -2472,6 +2778,11 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
         while iterations is None or count < iterations:
             polled_at = clock()
             snapshot = monitor_snapshot()
+            snapshot, blank = carry_forward_blank_fields(snapshot, previous)
+            if blank:
+                raised.append(blank)
+                printer(f"  [{blank['severity']:6}] {blank['detail']}")
+                _deliver(blank)
             snapshot, carried = carry_forward_gateway_mac(snapshot, previous)
             if carried:
                 raised.append(carried)
@@ -2490,9 +2801,11 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 _deliver(event)
 
             previous = snapshot
+            last_polled_at = polled_at
             resumed_gap = None          # only the first comparison spans the gap
             _retry_undelivered()
-            if not save_monitor_state(snapshot, polled_at) and not state_warned:
+            if (not save_monitor_state(snapshot, polled_at, undelivered=undelivered)
+                    and not state_warned):
                 state_warned = True
                 printer("  [HIGH  ] The reference snapshot could not be written to "
                         f"{monitor_state_file()}. This process still compares poll to "
@@ -2505,7 +2818,14 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 # no retry until the next interval, so the coverage record —
                 # the thing that says the monitor was running — silently thinned
                 # out while the monitor was in fact running perfectly well.
-                beat = monitor_heartbeat(interval=interval, at=polled_at)
+                # The cadence recorded is the one the beats are actually sent
+                # at. Recording the POLL interval (60 s) while publishing every
+                # heartbeat_interval (900 s) made observation_gaps judge 900 s
+                # spacing against a 120 s threshold: every healthy beat read as a
+                # window with no monitoring, and every weekly audit printed a
+                # HIGH "the monitor is not running now" about a monitor that was.
+                beat = monitor_heartbeat(interval=max(interval, heartbeat_interval),
+                                         at=polled_at)
                 if beat.get("published"):
                     last_heartbeat = polled_at
                 elif not heartbeat_warned:
@@ -2517,10 +2837,17 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 sleeper(interval)
     except KeyboardInterrupt:
         printer("\nStopped.")
+    finally:
+        if previous is not None and undelivered:
+            # The queue outlives the process; the reference it belongs to is
+            # rewritten with it so the next start retries what this one could
+            # not — stamped with the last poll that actually completed, never
+            # with now, or a stop during the first poll would erase the gap.
+            save_monitor_state(previous, last_polled_at, undelivered)
     if undelivered:
         printer(f"  [HIGH  ] {len(undelivered)} alert(s) never left this machine. "
-                "They are listed above and nowhere else — if this host is the one "
-                "under suspicion, treat them as unreported.")
+                "They are queued for the next start and listed above — if this "
+                "host is the one under suspicion, treat them as unreported.")
     return raised
 
 
@@ -2698,6 +3025,14 @@ def describe_comparison_coverage(old, new):
     Silent when the comparison was whole, so an ordinary run gains no noise.
     """
     old, new = old or {}, new or {}
+    if macs_unreadable(new) or macs_unreadable(old):
+        side, entry = (("this run", new) if macs_unreadable(new) else ("the baseline", old))
+        return (f"  [REVIEW] Comparison coverage: device list not compared — {side} found "
+                f"{len(entry.get('devices') or [])} host(s) but could read a hardware "
+                "address for none of them. The ARP table read failed, so the list is a "
+                "count, not identities, and arrivals and departures are unknown here, "
+                "not absent. If this repeats, `arp -an` on this Mac is failing or "
+                "timing out.")
     old_swept, new_swept = swept_anywhere(old), swept_anywhere(new)
     if not (old_swept and new_swept):
         if not old_swept and not new_swept:
@@ -3292,7 +3627,7 @@ def update_device_memory(previous, state):
     — not even expiry, since "not looked for" is not "not seen".
     """
     memory = remembered_devices(previous)
-    if not swept_anywhere(state):
+    if not devices_identified(state):
         return memory
     stamp = state.get("timestamp")
     now = _parse_stamp(stamp)
@@ -3318,7 +3653,7 @@ def update_device_memory(previous, state):
 def returning_devices(old, new):
     """{mac: last_seen} for devices present now, absent from the last run, but
     seen on this network within the memory window."""
-    if not (swept_anywhere(old) and swept_anywhere(new)):
+    if not (devices_identified(old) and devices_identified(new)):
         return {}
     def stable(entry):
         out = set()
@@ -3351,7 +3686,7 @@ def describe_returning_devices(old, new, labels=None):
     if not back:
         return None
     labels = labels or {}
-    lines = [f"Known device(s) back after an absence — seen here within the last "
+    lines = [f"  [INFO  ] Known device(s) back after an absence — seen here within the last "
              f"{DEVICE_MEMORY_DAYS} days, so not counted as new:"]
     for mac in sorted(back):
         name = labels.get(mac)
@@ -3446,7 +3781,7 @@ def diff_baseline(old, new, labels=None):
     # discipline the port lists already follow: an unmeasured side is compared
     # against nothing, in either direction. An empty LIST still diffs, because a
     # sweep that genuinely found nothing is a real and alarming finding.
-    devices_measured = swept_anywhere(old) and swept_anywhere(new)
+    devices_measured = devices_identified(old) and devices_identified(new)
 
     old_macs, old_private, old_subnets = _split(old)
     new_macs, new_private, new_subnets = _split(new)
@@ -3560,6 +3895,22 @@ def diff_baseline(old, new, labels=None):
     # so Telnet appearing on the modem was completely silent — on the one device
     # in the house that faces the internet directly, where an open port is worth
     # more than it is on the LAN side of the router behind it.
+    # Port 1900 open on both sides says nothing about what is behind it: a
+    # router whose UPnP was switched on this week (by anyone with the vendor's
+    # app, or by a compromised router) scans identically to last week's dormant
+    # one. The probe's verdict is what changed, so it is compared too.
+    old_listeners = old.get("upnp_listeners") if isinstance(old.get("upnp_listeners"), dict) else {}
+    new_listeners = new.get("upnp_listeners") if isinstance(new.get("upnp_listeners"), dict) else {}
+    for host in sorted(set(old_listeners) & set(new_listeners)):
+        was = (old_listeners[host] or {}).get("state") if isinstance(old_listeners[host], dict) else None
+        now = (new_listeners[host] or {}).get("state") if isinstance(new_listeners[host], dict) else None
+        if isinstance(was, str) and isinstance(now, str) and was != now:
+            note = f"UPnP on {_banner_text(host, 60)} CHANGED: was {was}, now {now}"
+            if now == UPNP_LIVE_GATEWAY:
+                note += (". A UPnP gateway service will forward WAN ports for any "
+                         "device on the LAN that asks; turn it off unless something needs it.")
+            notes.append(note)
+
     for key, host in (("router_open_ports", "router"),
                       ("upstream_open_ports", "upstream modem")):
         old_ports = old.get(key)
@@ -3579,13 +3930,23 @@ def diff_baseline(old, new, labels=None):
     old_bssids = set(old.get("wifi_bssids", []))
     new_bssids = set(new.get("wifi_bssids", []))
     # Only against a list that has something in it. An empty one means BSSIDs
-    # had never been readable — the state of every Mac until the Wi-Fi helper is
-    # installed — and comparing against it reports the owner's entire mesh as
-    # evil twins on the first run that can finally see it. check_evil_twin makes
-    # the same distinction ("No baseline yet").
-    if old_bssids and new_bssids - old_bssids:
+    # had never been readable — the state of every Mac until the Wi-Fi helper or
+    # a fallback can read one — and comparing against it reports the owner's
+    # entire mesh as evil twins on the first run that can finally see it.
+    # check_evil_twin makes the same distinction ("No baseline yet").
+    added_bssids = (new_bssids - old_bssids) if old_bssids else set()
+    if added_bssids and (new.get("evil_twin") or {}).get("source") == "association_record":
+        # The association record sees only the joined access point, so one
+        # never-seen BSSID is what a mesh roam looks like. The Evil Twin section
+        # has already rated it; the diff must not out-rank it.
+        notes.append(
+            f"Associated with previously unseen BSSID(s): {sorted(added_bssids)}. "
+            "Read from the association record, which sees only the joined "
+            "access point — a mesh roaming between its own units looks like "
+            "this. The Evil Twin section has the verdict.")
+    elif added_bssids:
         siblings, strangers = split_unexpected_bssids(
-            sorted(new_bssids - old_bssids), sorted(old_bssids))
+            sorted(added_bssids), sorted(old_bssids))
         if strangers:
             notes.append(
                 f"NEW access point advertising your SSID: {strangers}. "
@@ -4009,6 +4370,101 @@ def parse_wifi_networks(text):
     return {k: v for k, v in networks.items() if v}
 
 
+def _scutil_wifi_fallback():
+    """Return (ssid, bssid) from the SystemConfiguration dynamic store, or
+    (None, None).
+
+    Sequoia scrubs the store's top-level SSID_STR and BSSID keys for a process
+    without Location Services, but (as of 15.7) the CachedScanRecord left
+    beside them is an NSKeyedArchiver plist still carrying both for the
+    network this machine last associated to. Unprivileged, and refreshed on
+    every association. Two honest limits: it is a cache, so a reading taken
+    mid-roam can be one association behind; and everything in it originated
+    in beacon frames, so a hostile access point chose these bytes — the
+    parser treats the blob as untrusted and returns nothing on any surprise.
+    """
+    out = run(["/bin/sh", "-c",
+               "echo 'show State:/Network/Interface/en0/AirPort' | scutil"],
+              timeout=10) or ""
+    m = re.search(r"CachedScanRecord\s*:\s*<data>\s*0x([0-9a-fA-F]+)", out)
+    if not m:
+        return None, None
+    try:
+        import plistlib
+        arc = plistlib.loads(bytes.fromhex(m.group(1)))
+        objs = arc["$objects"]
+
+        def deref(v):
+            if isinstance(v, plistlib.UID):
+                return objs[v.data] if v.data < len(objs) else None
+            return v
+
+        for o in objs:
+            if not (isinstance(o, dict) and "NS.keys" in o and "NS.objects" in o):
+                continue
+            keys = [deref(k) for k in o["NS.keys"]]
+            vals = [deref(v) for v in o["NS.objects"]]
+            kv = {k: v for k, v in zip(keys, vals) if isinstance(k, str)}
+            ssid = kv.get("SSID_STR")
+            if not (isinstance(ssid, str) and 0 < len(ssid) <= 32):
+                continue
+            bssid = None
+            b = kv.get("BSSID")
+            if isinstance(b, str) and len(b.split(":")) == 6:
+                try:
+                    bssid = ":".join(f"{int(x, 16):02x}" for x in b.split(":"))
+                except ValueError:
+                    bssid = None
+            return ssid, bssid
+    except Exception:
+        pass
+    return None, None
+
+
+def _wdutil_wifi_fallback():
+    """Return (ssid, bssid) via `sudo -n wdutil info`, or (None, None).
+
+    Location Services gates the SSID per-process, and a launchd background job
+    has no way to hold that grant — root is the one path macOS still allows.
+    `sudo -n` never prompts: without a NOPASSWD rule for wdutil it fails
+    instantly and this returns nothing, leaving behaviour exactly as before.
+    Enable it with a drop-in like
+        rstuklis ALL=(root) NOPASSWD: /usr/bin/wdutil info
+    in /etc/sudoers.d/. The BSSID returned is only the one this machine is
+    associated to — wdutil cannot see other access points advertising the same
+    SSID, so a twin is caught at the moment of association, not while merely
+    broadcasting nearby.
+    """
+    out = run(["sudo", "-n", "/usr/bin/wdutil", "info"], timeout=10) or ""
+    ssid = bssid = None
+    m = re.search(r"^\s*SSID\s*:\s*(.+?)\s*$", out, re.MULTILINE)
+    if m and m.group(1).lower() not in ("<redacted>", "redacted", "none"):
+        ssid = m.group(1)
+    m = re.search(r"^\s*BSSID\s*:\s*(\S+)\s*$", out, re.MULTILINE)
+    if m:
+        raw = m.group(1).split(":")
+        if len(raw) == 6:
+            try:
+                bssid = ":".join(f"{int(x, 16):02x}" for x in raw)
+            except ValueError:
+                bssid = None
+    return ssid, bssid
+
+
+def _redacted_wifi_fallback():
+    """SSID/BSSID for a process macOS redacts them from.
+
+    The dynamic store's cached association record first — unprivileged and
+    still populated on current macOS — then root wdutil, which needs the
+    sudoers rule and which 15.7 redacts anyway; older systems still honour
+    it. Both sources describe only the access point this machine associated
+    to, never other advertisers of the SSID, and callers must treat them so.
+    """
+    ssid, bssid = _scutil_wifi_fallback()
+    if ssid:
+        return ssid, bssid
+    return _wdutil_wifi_fallback()
+
 # ---------------------------------------------------------------------------
 # The Wi-Fi helper: the one way past Location Services for a terminal tool
 # ---------------------------------------------------------------------------
@@ -4059,7 +4515,7 @@ def read_wifi_helper(scan=False):
     """
     path = wifi_helper_path()
     result = {"installed": False, "authorization": None, "ssid": None,
-              "bssid": None, "bssids": [], "error": None}
+              "bssid": None, "bssids": [], "error": None, "scanned": False}
     if sys.platform != "darwin" or not os.path.isfile(path):
         return result
     result["installed"] = True
@@ -4087,6 +4543,10 @@ def read_wifi_helper(scan=False):
     result["bssid"] = _normalise_bssid(reply.get("bssid"))
 
     seen = reply.get("same_ssid_bssids")
+    # A scan is what makes the evil-twin check comparative: without the list,
+    # only the joined access point is known, and the verdict must say so rather
+    # than score one BSSID as a full scan that heard nothing else.
+    result["scanned"] = scan and isinstance(seen, list) and not isinstance(reply.get("scan_error"), str)
     found = []
     for b in (seen if isinstance(seen, list) else [])[:64]:
         nb = _normalise_bssid(b)
@@ -4123,6 +4583,8 @@ def wifi_name_withheld_note(helper, what="the connected SSID"):
                 "System Settings > Privacy & Security > Location Services, or run:  "
                 f"open -W \"{app}\" --args --prompt")
     detail = helper.get("error") or "it reported no network — is this Mac on Wi-Fi?"
+    if auth is None:
+        return f"Could not read {what}: {detail}."
     return (f"Could not read {what}: the Wi-Fi helper has Location Services access "
             f"but {detail}.")
 
@@ -4140,14 +4602,32 @@ def check_evil_twin(ssid=None, known=None):
         ssid, _ = _parse_connected_wifi_block(out)
 
     # system_profiler first, because it needs nothing installed. When macOS has
-    # redacted its answer, the helper app is the only reader left.
+    # redacted its answer, try the helper app, then — for a Mac where the helper
+    # is not installed or not yet approved — the system configuration store's
+    # association record and root wdutil. The fallbacks fire only on actual
+    # redaction: an unassociated Mac, absent Wi-Fi hardware or a Linux observer
+    # returns no SSID at all, and issuing failed sudo attempts from those hosts
+    # would put privilege-escalation noise in their auth logs for zero benefit.
     helper = None
+    via_fallback = False
     if not ssid or ssid == "<redacted>":
         helper = read_wifi_helper(scan=True)
-        ssid = helper["ssid"]
-        if not ssid:
+        if helper["ssid"]:
+            ssid = helper["ssid"]
+        elif ssid == "<redacted>":
+            w_ssid, w_bssid = _redacted_wifi_fallback()
+            if w_ssid:
+                ssid = w_ssid
+                via_fallback = True
+                networks.setdefault(ssid, [])
+                if w_bssid and w_bssid not in networks[ssid]:
+                    networks[ssid].append(w_bssid)
+        if not ssid or ssid == "<redacted>":
             return {"ssid": None, "bssids": [], "unexpected": [], "risk": "REVIEW",
-                    "note": wifi_name_withheld_note(helper)}
+                    "note": wifi_name_withheld_note(helper) + " The automatic "
+                            "fallbacks — the system configuration store's "
+                            "association record, then root wdutil under a NOPASSWD "
+                            "rule — were also unreadable."}
 
     bssids = networks.get(ssid, [])
     if not bssids:
@@ -4155,11 +4635,53 @@ def check_evil_twin(ssid=None, known=None):
             helper = read_wifi_helper(scan=True)
         if helper["ssid"] == ssid:
             bssids = list(helper["bssids"])
+            if bssids and not helper.get("scanned"):
+                # CoreWLAN's scan failed or returned nothing (a shared radio is
+                # often busy). What is left is the joined access point alone,
+                # which is exactly what the association-record fallback sees —
+                # so it is judged by that branch below, never as "advertised by
+                # 1 known BSSID" with the scan's authority.
+                via_fallback = True
     if not bssids:
         return {"ssid": ssid, "bssids": [], "unexpected": [], "risk": "REVIEW",
                 "note": wifi_name_withheld_note(helper, what=f"any BSSID for {ssid}")}
 
     known = list(known or [])
+
+    if via_fallback:
+        # The fallback sources see only the access point this machine is
+        # associated to, so the full comparative check cannot run: a sibling
+        # mesh unit and an evil twin that captured the association look
+        # identical — one never-seen BSSID. Alarming at HIGH would page on
+        # every mesh roam forever, so a new association is a REVIEW to verify
+        # once, and the union is kept so it is then remembered.
+        new = [b for b in bssids if b not in known]
+        merged = known + new
+        if new and known:
+            return {"ssid": ssid, "bssids": merged, "unexpected": new, "risk": "REVIEW",
+                    "source": "association_record",
+                    "note": f"Associated with {', '.join(new)} on {ssid}, a BSSID "
+                            "not seen before. Read from this machine's "
+                            "association record, which covers only the access "
+                            "point it joined — a mesh roaming between its own "
+                            "units looks exactly like this, and so would a twin "
+                            "that captured the association. Check the MAC "
+                            "against your own equipment once; it is then "
+                            "remembered."}
+        if known:
+            return {"ssid": ssid, "bssids": merged, "unexpected": [], "risk": "OK",
+                    "source": "association_record",
+                    "note": f"Associated with a known BSSID on {ssid}. Read from "
+                            "the association record — only the joined access "
+                            "point is visible, not other advertisers of this "
+                            "SSID."}
+        return {"ssid": ssid, "bssids": merged, "unexpected": [], "risk": "OK",
+                "source": "association_record",
+                "note": f"{ssid} associated via {', '.join(bssids)}. Read from "
+                        "the association record — only the joined access point "
+                        "is visible. Saved as the first known BSSID for this "
+                        "network."}
+
     unexpected = [b for b in bssids if b not in known] if known else []
     siblings, strangers = split_unexpected_bssids(unexpected, known)
     if strangers:
@@ -4240,7 +4762,8 @@ def check_wifi_security():
 
     Returns a dict: ssid, auth, cipher, risk, note. ssid is None when macOS
     withholds it, which it does from any process without Location Services
-    access — the default for a terminal, and unaffected by sudo. An SSID and a
+    access — the default for a terminal, and unaffected by plain sudo (the
+    wdutil fallback below is the one sanctioned root path). An SSID and a
     BSSID can be looked up in a wardriving database to place a house on a map,
     so those two fields sit behind that permission while everything else in the
     same report — firmware, channel, country code, the security mode this
@@ -4254,8 +4777,9 @@ def check_wifi_security():
         result["ssid"] = ssid_raw
     elif ssid_raw == "<redacted>":
         # Redacted means there IS a network and macOS will not name it here.
-        # No scan: this check only wants the name.
-        result["ssid"] = read_wifi_helper()["ssid"]
+        # No scan: this check only wants the name. The helper first; failing
+        # that, the association record, then root wdutil.
+        result["ssid"] = read_wifi_helper()["ssid"] or _redacted_wifi_fallback()[0]
 
     # Security is scoped to the connected block only — never a neighbour's value.
     m = re.search(r"^\s*Security:\s*(.+?)\s*$", block, re.MULTILINE)
@@ -4553,6 +5077,12 @@ def _upnp_url_points_at(url, gateway):
     """
     try:
         parts = urllib.parse.urlsplit(url)
+        # .port is evaluated lazily and raises ValueError for a port that is not
+        # a number or is above 65535. Every caller that passes this check goes
+        # on to read it, outside any handler, so a device answering one search
+        # with "LOCATION: http://<itself>:99999/" used to end the whole audit
+        # with a traceback — no baseline, no report, no email. Fail the check.
+        parts.port
     except ValueError:
         return False
     return parts.scheme in ("http", "https") and parts.hostname == gateway
@@ -4616,7 +5146,7 @@ def get_upnp_port_mappings(gateway):
         return [], "No UPnP device found via SSDP (router may have UPnP disabled)"
 
     if not _upnp_url_points_at(location, gateway):
-        return [], (f"The UPnP reply from {gateway} pointed at {location}, which is "
+        return [], (f"The UPnP reply from {gateway} pointed at {_banner_text(location, 120)}, which is "
                     "not an http(s) address on the gateway itself. Not followed, so "
                     "port mappings were not read.")
 
@@ -4626,7 +5156,7 @@ def get_upnp_port_mappings(gateway):
         with urllib.request.urlopen(req, timeout=5) as r:
             xml = r.read().decode("utf-8", "ignore")
     except Exception as e:
-        return [], f"Could not fetch UPnP device description: {e}"
+        return [], f"Could not fetch UPnP device description: {_banner_text(str(e), 160)}"
 
     # Extract base URL and control URL
     base_url_m = re.match(r"(https?://[^/]+)", location)
@@ -4641,7 +5171,7 @@ def get_upnp_port_mappings(gateway):
     ctrl_path = ctrl_m.group(1).strip()
     ctrl_url = ctrl_path if ctrl_path.startswith("http") else base_url + ctrl_path
     if not _upnp_url_points_at(ctrl_url, gateway):
-        return [], (f"The UPnP description named a control URL at {ctrl_url}, which is "
+        return [], (f"The UPnP description named a control URL at {_banner_text(ctrl_url, 120)}, which is "
                     "not on the gateway. Not followed, so port mappings were not read.")
 
     # Step 3: GetGenericPortMappingEntry in a loop
@@ -4680,8 +5210,12 @@ def get_upnp_port_mappings(gateway):
             break
 
         def xtag(tag, text):
+            # Any device on the LAN can AddPortMapping with a free-text
+            # description. A newline in it used to start a new report line at
+            # column 0 — a forged section header, a forged rating — so every
+            # field goes through the same cleaner as a device's banner.
             m = re.search(fr"<[^>]*{tag}[^>]*>([^<]*)<", text, re.IGNORECASE)
-            return m.group(1).strip() if m else ""
+            return _banner_text(html.unescape(m.group(1)), 120) if m else ""
 
         mappings.append({
             "ext_port":    xtag("NewExternalPort", resp),
@@ -4712,6 +5246,67 @@ UPNP_DESCRIPTION_PATHS = (
 # whole reason port 1900 is worth a second look; a media server is not.
 _UPNP_GATEWAY_MARKERS = ("internetgatewaydevice", "wanipconnection",
                          "wanpppconnection")
+UPNP_DESCRIBED_OFF = "described-off"
+
+
+def _upnp_control_check(host, port, path, description):
+    """Ask the gateway service in `description` one read-only question.
+
+    A description naming WANIPConnection is what the live-gateway verdict used
+    to rest on — but a libupnp modem keeps publishing it after UPnP is switched
+    off in its settings, while its control service answers every action with
+    a SOAP fault. Measured on a Telstra Archer VR1600v: toggle off, description
+    served at :1900/gatedesc.xml, GetExternalIPAddress -> "Invalid Action". A
+    description is a claim; the control service answering is the capability.
+
+    GetExternalIPAddress changes nothing and every IGD implements it. Returns
+    "answered" (the service works), "refused" (an HTTP error or SOAP fault: the
+    service is there and declines), or None (no HTTP answer, or no gateway
+    service with a usable control URL in the description).
+    """
+    base = f"http://{host}:{port}{path if str(path).startswith('/') else '/' + str(path)}"
+    urlbase = re.search(r"<URLBase>\s*([^<]+?)\s*</URLBase>", description or "", re.I)
+    if urlbase and _upnp_url_points_at(urlbase.group(1), host):
+        base = urlbase.group(1)
+    outcomes = []
+    services = re.findall(r"<service>(.*?)</service>", description or "", re.S | re.I)
+    for block in services:
+        st = re.search(r"<serviceType>\s*([^<]+?)\s*</serviceType>", block, re.I)
+        cu = re.search(r"<controlURL>\s*([^<]+?)\s*</controlURL>", block, re.I)
+        if not st or not cu:
+            continue
+        stype = st.group(1)
+        if "WANIPConnection" not in stype and "WANPPPConnection" not in stype:
+            continue
+        # Resolved the way the spec says — against URLBase, else the
+        # description's own URL — and only back to the host being asked about,
+        # over plain http: the same rule every other URL a device hands this
+        # tool is held to.
+        ctrl = urllib.parse.urljoin(base, html.unescape(cu.group(1)))
+        if not _upnp_url_points_at(ctrl, host):
+            continue
+        parts = urllib.parse.urlsplit(ctrl)
+        if parts.scheme != "http":
+            continue
+        c_port, c_path = parts.port or 80, parts.path or "/"
+        soap = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+                f'<u:GetExternalIPAddress xmlns:u="{stype}"/></s:Body></s:Envelope>')
+        got = _http_post_plain(host, c_port, c_path, soap, {
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{stype}#GetExternalIPAddress"'})
+        if got is None:
+            continue
+        status, _srv, reply = got
+        lowered = reply.lower()
+        if status == 200 and "upnperror" not in lowered and "<s:fault" not in lowered:
+            return "answered"
+        # Only a SOAP fault is the service declining. A bare 404 or 405 is a
+        # web server that never heard of the path — a wrong URL, not a
+        # switched-off service — and must not read as "off".
+        if "upnperror" in lowered or "<s:fault" in lowered:
+            outcomes.append("refused")
+    return "refused" if outcomes else None
 
 UPNP_LIVE_GATEWAY = "live-gateway"
 UPNP_LIVE_OTHER = "live-other"
@@ -4719,10 +5314,24 @@ UPNP_DORMANT = "dormant"
 UPNP_UNKNOWN = "unknown"
 
 
+# The three characters the report's own readers key on. "[HIGH  ]" is how a
+# rating is written, so a device calling itself "[HIGH] rogue DHCP" was badged
+# red by the email renderer and listed as a finding by the digest; a '"' ended
+# the quoted name early and let what followed it pass as the audit's own words.
+# A name is free to claim anything, so these are taken away from it.
+_REPORT_MARKUP = str.maketrans({"[": "(", "]": ")", '"': "'"})
+# For an announced name only the quote goes: the report prints it as
+# announces "<name>" [source], every reader of the report finds that span by
+# its quotes, and a '"' inside the name ended the span early. Brackets stay —
+# "[TV] Lounge" is how some devices are named — because the span itself is now
+# set aside before any reader looks for a rating.
+_NAME_MARKUP = str.maketrans({'"': "'"})
+
+
 def _banner_text(value, limit=80):
     """A header value from a device on the LAN, made safe to print."""
     text = "".join(ch for ch in str(value or "") if ch.isprintable())
-    return text.strip()[:limit]
+    return text.strip().translate(_REPORT_MARKUP)[:limit]
 
 
 SSDP_MULTICAST_ADDR = "239.255.255.250"
@@ -4762,13 +5371,19 @@ def _ssdp_search(host, port=1900, wait=2.0, multicast=False):
         deadline = time.time() + wait
         # ssdp:all earns one datagram per device and service, so keep reading
         # until the window closes. Capped: the count is set by the responder.
-        while time.time() < deadline and len(replies) < 32:
+        # ssdp:all earns one datagram per device and service. Duplicates are
+        # dropped so a flood of identical datagrams cannot fill the cap before
+        # the one that names a WAN service arrives; the cap bounds what the
+        # responder can make this hold.
+        while time.time() < deadline and len(replies) < 64:
             try:
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 break
             if addr[0] == host:
-                replies.append(data.decode("utf-8", "ignore"))
+                text = data.decode("utf-8", "ignore")
+                if text.startswith("HTTP/1.1 200") and text not in replies:
+                    replies.append(text)
     except OSError as e:
         refused = e.errno in UNREACHABLE_ERRNOS
     finally:
@@ -4776,27 +5391,121 @@ def _ssdp_search(host, port=1900, wait=2.0, multicast=False):
     return replies, refused
 
 
-def _http_get_plain(host, port, path, timeout=3.0, limit=65536):
-    """One plain GET. Returns (status, server_header, body) or None if no HTTP came back.
+HTTP_GET_TOTAL_SECONDS = 8.0
 
-    http.client rather than urllib on purpose: it follows no redirects and
-    reads no proxy settings, so the request goes to the host being asked about
-    and nowhere a device on the LAN might prefer to send it.
+
+def _http_get_plain(host, port, path, timeout=3.0, limit=65536, total=HTTP_GET_TOTAL_SECONDS):
+    """One plain GET, bounded in wall-clock time. See _http_plain."""
+    return _http_plain("GET", host, port, path, None, None, timeout, limit, total)
+
+
+def _http_post_plain(host, port, path, body, headers, timeout=3.0, limit=65536,
+                     total=HTTP_GET_TOTAL_SECONDS):
+    """One plain POST, bounded in wall-clock time. See _http_plain."""
+    return _http_plain("POST", host, port, path, body, headers, timeout, limit, total)
+
+
+def _dechunk(body):
+    """Join the chunks of a chunked body; on any framing surprise, the raw bytes.
+
+    An HTTP/1.0 request asks for no chunking, but an embedded server that
+    always chunks is not going to read the request version.
     """
-    conn = None
+    out, pos = bytearray(), 0
     try:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", path, headers={"User-Agent": "home_net_audit",
-                                           "Connection": "close"})
-        resp = conn.getresponse()
-        body = resp.read(limit).decode("utf-8", "ignore")
-        return resp.status, resp.getheader("Server") or "", body
-    except (OSError, http.client.HTTPException, ValueError):
+        while True:
+            end = body.index(b"\r\n", pos)
+            size = int(body[pos:end].split(b";")[0].strip(), 16)
+            if size == 0:
+                break
+            out += body[end + 2:end + 2 + size]
+            pos = end + 2 + size + 2
+    except (ValueError, IndexError):
+        return body if not out else bytes(out)
+    return bytes(out)
+
+
+def _http_plain(method, host, port, path, body, headers, timeout, limit, total):
+    """One plain HTTP exchange, bounded in wall-clock time. Returns (status,
+    server_header, body) or None if no HTTP came back.
+
+    A raw socket rather than http.client or urllib, on purpose. Neither follows
+    redirects here nor reads proxy settings, so the request goes to the host
+    being asked about and nowhere a device on the LAN might prefer to send it.
+    But http.client's `timeout` is per socket operation, not per request: a
+    device that answers the audit's own SSDP search with a LOCATION pointing at
+    itself, then serves its description one byte every 2.9 seconds, kept a
+    3-second timeout from ever firing — for up to 65536 bytes of body and a
+    hundred header lines of 65536 bytes each. The sweep's thread pool joins
+    every fetch, so one such device stalled the whole weekly audit for hours,
+    before the baseline, the report and the email, and launchd would not start
+    the next week's run while this one was still going. `total` is the budget
+    for the entire exchange; whatever has arrived when it runs out is what is
+    parsed, and what has not is treated as not having come.
+
+    HTTP/1.0 with Connection: close, so a conforming server neither chunks nor
+    keeps the connection open; a non-conforming one simply runs into the budget.
+    """
+    deadline = time.monotonic() + total
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=min(timeout, total))
+        payload = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+        lines = [f"{method} {path} HTTP/1.0", f"Host: {host}", "User-Agent: home_net_audit",
+                 "Connection: close"]
+        for name, value in (headers or {}).items():
+            lines.append(f"{name}: {value}")
+        if payload:
+            lines.append(f"Content-Length: {len(payload)}")
+        request = "\r\n".join(lines) + "\r\n\r\n"
+        sock.sendall(request.encode("ascii", "replace") + payload)
+        buf = bytearray()
+        # Headers precede the body and are bounded separately below; the read
+        # itself stops at the budget, at EOF, or at roughly limit + 64 KB.
+        while len(buf) < limit + 65536:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(min(timeout, remaining))
+            try:
+                chunk = sock.recv(16384)
+            except socket.timeout:
+                break
+            except OSError:
+                # A reset after the data (SO_LINGER 0, an abrupt exit) is not
+                # the loss of what already arrived.
+                break
+            if not chunk:
+                break
+            buf += chunk
+        if not buf:
+            return None
+        raw = bytes(buf)
+        crlf, lf = raw.find(b"\r\n\r\n"), raw.find(b"\n\n")
+        if crlf >= 0 and (lf < 0 or crlf <= lf):
+            head, body = raw[:crlf], raw[crlf + 4:]
+        elif lf >= 0:
+            head, body = raw[:lf], raw[lf + 2:]      # a bare-LF embedded server
+        else:
+            head, body = raw, b""
+        lines = head.decode("iso-8859-1", "replace").splitlines()
+        if any(l.lower().replace(" ", "").startswith("transfer-encoding:chunked") for l in lines[1:101]):
+            body = _dechunk(body)
+        m = re.match(r"HTTP/\d\.\d\s+(\d{3})", lines[0])
+        if not m:
+            return None
+        server = ""
+        for line in lines[1:101]:
+            if line.lower().startswith("server:"):
+                server = line.split(":", 1)[1].strip()
+                break
+        return int(m.group(1)), server, body[:limit].decode("utf-8", "ignore")
+    except (OSError, ValueError, UnicodeError):
         return None
     finally:
-        if conn is not None:
+        if sock is not None:
             try:
-                conn.close()
+                sock.close()
             except OSError:
                 pass
 
@@ -4857,6 +5566,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
                 server = _banner_text(sm.group(1))
     targets = targets[:4] + [(port, path) for path in ("/",) + UPNP_DESCRIPTION_PATHS]
 
+    description_port, description_path = None, "/"
     for t_port, t_path in targets:
         got = _http_get_plain(host, t_port, t_path)
         if got is None:
@@ -4872,23 +5582,55 @@ def classify_upnp_listener(host, port=1900, onlink=None):
             server = _banner_text(srv)
         if status == 200 and _looks_like_upnp_description(body):
             descriptions.append(body)
+            description_port, description_path = t_port, t_path
             break
 
     said = "\n".join(replies + descriptions).lower()
     verdict = {"server": server, "caveat": ""}
 
     if any(marker in said for marker in _UPNP_GATEWAY_MARKERS):
-        verdict.update(
-            state=UPNP_LIVE_GATEWAY, risk="REVIEW",
-            summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
-                     "ports for any device that asks; turn UPnP off on this "
-                     "device unless something needs it."))
-    elif replies or descriptions:
+        # The description is a claim; whether the control service answers is
+        # the capability. One read-only question settles which this is.
+        control = (_upnp_control_check(host, description_port, description_path, descriptions[0])
+                   if descriptions else None)
+        if control == "refused":
+            verdict.update(
+                state=UPNP_DESCRIBED_OFF, risk="INFO",
+                summary=("SWITCHED OFF, description still published — the device "
+                         "advertises a UPnP gateway service, but its control service "
+                         "refuses every request. That is what a libupnp modem looks "
+                         "like with UPnP disabled in its settings: nothing can forward "
+                         "ports through it while it stays so."),
+                caveat=("Rests on the device refusing a read-only request, which it did; "
+                        "asked again every run, so a switch back on would show here."))
+        else:
+            verdict.update(
+                state=UPNP_LIVE_GATEWAY, risk="REVIEW",
+                summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
+                         "ports for any device that asks; turn UPnP off on this "
+                         "device unless something needs it."))
+            if control == "answered":
+                verdict["caveat"] = "Confirmed: its control service answered a read-only request."
+            elif descriptions:
+                verdict["caveat"] = ("Not confirmed: the control service gave no HTTP answer "
+                                     "to a read-only request. Treated as live.")
+    elif descriptions or any("urn:schemas-upnp-org:" in r.lower() for r in replies):
         verdict.update(
             state=UPNP_LIVE_OTHER, risk="INFO",
             summary=("LIVE, but not a gateway service — UPnP answered without "
                      "offering port forwarding (typically media or USB sharing). "
                      "It cannot open WAN ports."))
+    elif replies:
+        # Discovery answered but no description could be fetched. MiniUPnPd's
+        # first datagram is the bare root device, naming no service; whether a
+        # WAN service hides behind it is in the description that did not come.
+        # Calling that "cannot open WAN ports" was a verdict on evidence not
+        # seen.
+        verdict.update(
+            state=UPNP_UNKNOWN, risk="REVIEW",
+            summary=("UNKNOWN — UPnP discovery answered, but the device "
+                     "description could not be fetched, so whether a gateway "
+                     "(port-forwarding) service is offered could not be determined."))
     elif http_answered:
         verdict.update(
             state=UPNP_DORMANT, risk="INFO",
@@ -5506,7 +6248,9 @@ def check_router_hostname(gateway, resolvers=None):
     self_attested None, meaning "not established" rather than "no".
     """
     try:
-        hostname = socket.gethostbyaddr(gateway)[0]
+        # A PTR answer is the resolver's to choose — on a home network, the
+        # gateway's — so it is cleaned like any other device-chosen text.
+        hostname = _banner_text(socket.gethostbyaddr(gateway)[0], 120) or None
     except socket.herror:
         hostname = None
     except Exception:
@@ -5802,7 +6546,11 @@ def action_listening_services(compact=False, known=None):
         print(f"    Ports: {ports}{more}")
     if not named and not unattributed:
         print("\n  No unexpected listeners found.")
-    if compact and before and now != before:
+    # Not gated on --compact: this comparison is the reason the listener list
+    # is in the baseline at all, and the default run printed the table with a
+    # generic "verify you recognise them" while a new fixed-port daemon sat in
+    # it unnamed as new.
+    if before and now != before:
         for fp in sorted(now - before, key=str):
             print(f"  + not in the baseline: {_describe_fingerprint(fp)}")
         for fp in sorted(before - now, key=str):
@@ -6059,6 +6807,8 @@ RENDERED_STATE_KEYS = frozenset({
     "carried_forward", "measured_at",
     # Bookkeeping written by save_baseline: which devices this network has seen.
     "device_memory",
+    # This run's change-detection text, rendered first; never saved.
+    "_comparison",
 })
 
 
@@ -6148,6 +6898,29 @@ def generate_html_report(state, output_path=None):
         return f"<table><thead><tr>{th}</tr></thead><tbody>{tbody}</tbody></table>"
 
     sections_html = ""
+
+    comparison = state.get("_comparison")
+    if isinstance(comparison, list) and comparison:
+        rendered = []
+        for raw in comparison:
+            line = str(raw)
+            stripped = line.strip()
+            m = re.match(r"\[(HIGH|MEDIUM|REVIEW|INFO|OK|GOOD|UNKNOWN)\s*\]\s*(.*)$", stripped, re.S)
+            if m:
+                rendered.append(f"<p>{risk_badge(m.group(1))} {_esc(m.group(2))}</p>")
+            elif stripped.startswith("! "):
+                rendered.append(f'<p style="color:{RISK_COLOUR["HIGH"]};font-weight:bold">'
+                                f"{risk_badge('HIGH')} {_esc(stripped[2:])}</p>")
+            elif stripped == "CHANGES DETECTED:":
+                rendered.append(f'<p style="color:{RISK_COLOUR["HIGH"]};font-weight:bold">'
+                                "CHANGES DETECTED:</p>")
+            elif stripped.startswith("No changes since baseline"):
+                rendered.append(f"<p>{risk_badge('OK')} {_esc(stripped)}</p>")
+            elif stripped.startswith("No baseline saved yet"):
+                rendered.append(f"<p>{risk_badge('INFO')} {_esc(stripped)}</p>")
+            else:
+                rendered.append(f'<p style="white-space:pre-wrap">{_esc(line)}</p>')
+        sections_html += section("Change Detection (vs saved baseline)", "".join(rendered))
     ts_str = state.get("timestamp", datetime.now(timezone.utc).isoformat())
 
     # Gateway
@@ -6348,6 +7121,14 @@ def generate_html_report(state, output_path=None):
         if svcs:
             rows = [[str(s["port"]), s["proto"], s["process"]] for s in svcs]
             sections_html += section("Listening Services", table(["Port", "Proto", "Process"], rows))
+        else:
+            # An empty list is what the enumeration returns when lsof and
+            # netstat both came back empty — a failure to look, which the
+            # terminal says and the report must not render as a quiet machine.
+            sections_html += section("Listening Services", (
+                f"<p>{risk_badge('REVIEW')} No listening services could be enumerated "
+                "this run (lsof and netstat returned nothing), so what this Mac "
+                "accepts connections on is <strong>unknown</strong> here — not none.</p>"))
 
     # Router hostname
     if "router_hostname" in state:
@@ -6432,9 +7213,26 @@ def generate_html_report(state, output_path=None):
             body = (f"<p>{risk_badge('REVIEW')} The upstream modem could not be "
                     "scanned, so nothing is known about which ports it exposes.</p>")
         elif ports:
-            body = (f"<p>{risk_badge('HIGH')} Open port(s) on the upstream modem: "
-                    f"{_esc(', '.join(str(p) for p in ports))}</p>"
-                    "<p>This device faces the internet directly, so a port open here "
+            # Per port, rated as the terminal rates it, with the probe's own
+            # verdict for 1900 — a flat HIGH badge over every open port said
+            # the opposite of the UPnP section two cards below about the same
+            # port, every week.
+            listeners = state.get("upnp_listeners")
+            probed = None
+            if isinstance(listeners, dict):
+                for host, verdict in listeners.items():
+                    if host != state.get("gateway") and isinstance(verdict, dict):
+                        probed = verdict
+            rows, colours = [], []
+            for p in ports:
+                svc, risk, note = PORTS_OF_INTEREST.get(p, ("unknown", "REVIEW", "Investigate."))
+                if p == 1900 and isinstance(probed, dict) and probed.get("summary"):
+                    risk = probed.get("risk", risk)
+                    note = probed["summary"]
+                rows.append([str(p), svc, risk_badge(risk), note])
+                colours.append(RISK_COLOUR.get(risk, ""))
+            body = (table(["Port", "Service", "Risk", "Note"], rows, colours)
+                    + "<p>This device faces the internet directly, so a port open here "
                     "is exposed more widely than one on the router behind it.</p>")
         else:
             body = f"<p>{risk_badge('OK')} No open ports found on the upstream modem.</p>"
@@ -7041,7 +7839,7 @@ _NAME_SOURCES = ("upnp", "mdns", "dns")          # display preference, best firs
 def _device_name_text(value, limit=DEVICE_NAME_LIMIT):
     """A name a stranger's device chose, made safe to print, save and email."""
     text = "".join(ch if ch.isprintable() else " " for ch in str(value or ""))
-    text = " ".join(text.split()).rstrip(".")
+    text = " ".join(text.split()).rstrip(".").translate(_NAME_MARKUP)
     return text[:limit]
 
 
@@ -7132,14 +7930,21 @@ def _reverse_name(ip):
     return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
 
 
-def _ptr_exchange(ips, dest, accept, unicast_response, wait):
+def _ptr_exchange(ips, dest, accept, unicast_response, wait, require_id=False):
     """Send a reverse-PTR question per address to `dest`; gather {ip: name}.
 
     `accept(sender_ip, about_ip)` decides whose answer counts. Returns
     ({ip: name}, refused) — refused means the OS never let the questions leave.
+
+    A datagram only counts as an answer if its QR bit says it is one, and with
+    `require_id` only if its id is one this exchange sent — the source address
+    alone is forgeable by anyone on the link with a raw socket. mDNS responders
+    may legitimately answer a legacy unicast query with id 0, so the id is
+    required only where the protocol guarantees it: the gateway's resolver.
     """
     names, refused = {}, False
     wanted = {_reverse_name(ip).lower(): ip for ip in ips}
+    sent_ids = {(i + 1) & 0xFFFF for i in range(len(ips))}
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     except OSError as e:
@@ -7161,6 +7966,11 @@ def _ptr_exchange(ips, dest, accept, unicast_response, wait):
                 continue
             except OSError:
                 break
+            if len(data) < 4:
+                continue
+            qid, flags = struct.unpack(">HH", data[:4])
+            if not flags & 0x8000 or (require_id and qid not in sent_ids):
+                continue
             for owner, target in _dns_ptr_records(data):
                 about = wanted.get(owner)
                 if about and about not in names and accept(addr[0], about):
@@ -7183,7 +7993,7 @@ def gateway_device_names(ips, gateway, wait=1.5):
     """{ip: hostname} from the gateway's DNS — usually the DHCP hostname."""
     if not gateway:
         return {}, False
-    return _ptr_exchange(list(ips), (gateway, 53),
+    return _ptr_exchange(list(ips), (gateway, 53), require_id=True,
                          accept=lambda sender, about: sender == gateway,
                          unicast_response=False, wait=wait)
 
@@ -7271,7 +8081,9 @@ def collect_device_names(devices, gateway=None):
                            ("dns", lambda: gateway_device_names(ips, gateway))):
         try:
             names, refused = lookup()
-        except OSError:
+        except Exception:
+            # A name is a courtesy, asked of devices that may answer with
+            # anything. No parsing error in one source may end the audit.
             names, refused = {}, False
         refused_all = refused_all and refused
         results[source] = names
@@ -7310,6 +8122,12 @@ def collect_devices(subnets_to_sweep, labels, networks, no_vendors=False, sweep_
             if d["ip"] not in seen_ips:
                 seen_ips.add(d["ip"])
                 all_devices.append({**d, "subnet": str(subnet)})
+
+    if all_devices and macs_unreadable({"devices": all_devices}):
+        print(f"  [REVIEW] {len(all_devices)} host(s) answered but the ARP table named "
+              "none of them, so no device can be identified this run. The list is "
+              "kept as a count and is not compared against the baseline; the "
+              "baseline's device list is carried forward unchanged.")
 
     if not no_vendors and all_devices:
         needs_lookup = [d for d in all_devices
@@ -7397,6 +8215,9 @@ def action_save_baseline(state):
     if _net_line:
         print(_net_line)
     passphrase = resolve_passphrase(prompt=True)
+    if passphrase is None and chain_is_keyed():
+        print(describe_unkeyed_save_refusal())
+        return
     _record = save_baseline(state, passphrase=passphrase)
     print(f"Baseline saved to {BASELINE_FILE}")
     _pub = describe_publish_result(_record.get("_receipt"))
@@ -7722,50 +8543,62 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
 
     # Baseline comparison
     hr("CHANGE DETECTION (vs saved baseline)")
-    print(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
+    # Everything this block prints is also kept, under a key save_baseline
+    # strips, so the HTML report — the artefact that is emailed — can show it.
+    # It used to carry the current readings alone: a new MAC, an opened port, a
+    # changed gateway MAC or a broken seal was a HIGH on stdout and nowhere else.
+    said = []
+
+    def tell(line):
+        print(line)
+        said.append(str(line))
+
+    tell(describe_baseline_integrity(verify_baseline(resolve_passphrase())))
     _sink = resolve_sink()
     if _sink:
-        print(describe_receipt_status(compare_with_receipts(
+        tell(describe_receipt_status(compare_with_receipts(
             load_baseline_record(), read_receipts(_sink), sink=_sink)))
         # Silent unless a monitor has actually run, so an audit-only user gains
         # no noise from a feature they are not using.
         _beats = read_heartbeats(_sink)
         _gaps = describe_observation_gaps(observation_gaps(_beats))
         if _gaps:
-            print(_gaps)
+            tell(_gaps)
         # Future-stamped heartbeats are excluded from the coverage check above,
         # and saying so matters: the sink is append-only, so an entry that
         # cannot be removed was either mis-stamped by a wrong clock or added.
         _clock = describe_clock_anomalies(_beats)
         if _clock:
-            print(_clock)
+            tell(_clock)
         # Reads both channels: a monitor-only deployment publishes heartbeats
         # for weeks without a single baseline receipt, and that is exactly where
         # an edited script has the longest to go unnoticed.
         _code = describe_code_attestation(read_receipts(_sink))
         if _code:
-            print(_code)
+            tell(_code)
     old = load_baseline()
     _freshness = describe_baseline_freshness(old)
     if _freshness:
-        print(_freshness)
+        tell(_freshness)
     if old:
         changes = diff_baseline(old, state, load_labels())
-        print(f"Baseline from: {old.get('timestamp', '?')}")
+        tell(f"Baseline from: {old.get('timestamp', '?')}")
         _coverage = describe_comparison_coverage(old, state)
         if _coverage:
-            print(_coverage)
+            tell(_coverage)
         if changes:
-            print("CHANGES DETECTED:")
+            tell("CHANGES DETECTED:")
             for c in changes:
-                print("  ! " + c)
+                tell("  ! " + c)
         else:
-            print("No changes since baseline.")
+            tell("No changes since baseline.")
         _back = describe_returning_devices(old, state, load_labels())
         if _back:
-            print(_back)
+            tell(_back)
     else:
-        print("No baseline saved yet. Use option 5 after reviewing results.")
+        tell("No baseline saved yet. Use option 5 after reviewing results.")
+
+    state["_comparison"] = said
 
     _basis = describe_evidence_basis(state, compact=compact)
     if _basis:
@@ -7959,7 +8792,7 @@ def interactive_menu():
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def _main():
     ap = argparse.ArgumentParser(
         description="Defensive audit of your own home network. "
                     "Run with no arguments for an interactive menu.",
@@ -8106,29 +8939,65 @@ def main():
         upstream_reference=args.upstream_reference,
         )
 
+    # Everything said about the save is kept for the HTML report as well: the
+    # comparison block above was frozen before this point, and a refused save
+    # or a receipt that never left the machine is exactly what the emailed
+    # report must not omit.
+    def tell(line):
+        print(line)
+        if isinstance(state, dict):
+            state.setdefault("_comparison", []).append(str(line).strip("\n"))
+
     if args.no_save_baseline:
-        pass
+        tell("Baseline not saved (--no-save-baseline): the previous one stays the reference.")
     elif state.get("gateway") is None:
         # Saving a gateway-less run would drop router_open_ports from the
         # baseline and trigger false "NEW open port" alarms on the next run.
-        print("\nSkipping baseline save: gateway could not be determined, so this "
-              "scan is incomplete and would corrupt change detection.")
+        tell("\n  [REVIEW] Skipping baseline save: gateway could not be determined, so this "
+             "scan is incomplete and would corrupt change detection.")
     else:
         if args.publish_to:
             os.environ[SINK_ENV] = args.publish_to
         passphrase = resolve_passphrase(prompt=args.seal_baseline)
-        _record = save_baseline(state, passphrase=passphrase)
-        print(f"\nBaseline saved to {BASELINE_FILE}")
-        _pub = describe_publish_result(_record.get("_receipt"))
-        if _pub:
-            print(_pub)
-        if passphrase is None:
-            print(f"Note: saved unsealed. Use --seal-baseline or set "
-                  f"{PASSPHRASE_ENV} to make it tamper-evident.")
+        if passphrase is None and chain_is_keyed():
+            tell(describe_unkeyed_save_refusal())
+        elif passphrase is not None and chain_is_keyed() \
+                and verify_baseline(passphrase).get("status") == "modified":
+            tell(describe_modified_save_refusal())
+        else:
+            _record = save_baseline(state, passphrase=passphrase)
+            tell(f"\nBaseline saved to {BASELINE_FILE}")
+            _pub = describe_publish_result(_record.get("_receipt"))
+            if _pub:
+                tell(_pub)
+            if passphrase is None:
+                tell(f"Note: saved unsealed. Use --seal-baseline or set "
+                     f"{PASSPHRASE_ENV} to make it tamper-evident.")
 
     if args.html_report:
         path = generate_html_report(state)
         print(f"HTML report saved to {path}")
+
+
+def main():
+    """Run the audit; name an unexpected failure the way findings are named.
+
+    Everything the audit does can be made to raise by what a device on the LAN
+    sends, and a bare traceback is a silent week: no baseline, no report, no
+    email, nothing in the log a reader scans for. The failure is printed as a
+    HIGH and the exit code is non-zero, so the scheduled wrapper can send word
+    that the audit did not run to completion.
+    """
+    try:
+        _main()
+    except KeyboardInterrupt:
+        raise
+    except Exception:                                   # noqa: BLE001 - the last line of defence
+        import traceback
+        print("\n  [HIGH  ] AUDIT ABORTED by an unexpected error before it completed. "
+              "No baseline was saved and no report was written for this run.")
+        traceback.print_exc()
+        sys.exit(2)
 
 
 if __name__ == "__main__":

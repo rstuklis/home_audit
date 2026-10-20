@@ -68,6 +68,9 @@ def probe(mod, monkeypatch):
             return (404, server, "<h1>404 Not Found</h1>") if speaks_http else None
 
         monkeypatch.setattr(mod, "_http_get_plain", fake_get)
+        # The read-only control request a gateway description now earns: no
+        # HTTP answer by default, which leaves the verdict LIVE (unconfirmed).
+        monkeypatch.setattr(mod, "_http_post_plain", lambda *a, **k: None)
         verdict = mod.classify_upnp_listener(HOST, 1900, onlink=onlink)
         verdict["_calls"] = calls
         verdict["_searches"] = searches
@@ -248,7 +251,9 @@ class TestSearch:
 
 class TestBanner:
     def test_control_characters_from_the_device_are_not_printed(self, mod):
-        assert mod._banner_text("libupnp\x1b[31m\r\nX-Evil: 1") == "libupnp[31mX-Evil: 1"
+        # Brackets go too: "[HIGH]" is how the report writes a rating, and a
+        # banner is the device's to choose.
+        assert mod._banner_text("libupnp\x1b[31m\r\nX-Evil: 1") == "libupnp(31mX-Evil: 1"
 
     def test_a_long_banner_is_truncated(self, mod):
         assert len(mod._banner_text("a" * 500)) == 80

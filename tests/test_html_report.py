@@ -759,15 +759,13 @@ class TestSectionSelection:
         assert "<h2>Router Open Ports</h2>" in text
         assert "No open ports found." in text
 
-    def test_an_empty_listening_list_renders_no_section_at_all(self, mod, tmp_path):
-        # Asymmetry with router_open_ports above: line 1774 guards the whole
-        # section on `if svcs:` rather than rendering an empty-state message, so
-        # "we looked and found nothing" is indistinguishable from "we never
-        # looked". Documented as actual behaviour, not xfailed — the intent is
-        # ambiguous from the source alone.
+    def test_an_empty_listening_list_is_a_failure_to_look_not_a_quiet_machine(self, mod, tmp_path):
+        # An empty list is what the enumeration returns when lsof and netstat
+        # both came back empty. The section used to be omitted, so "we never
+        # managed to look" read as "nothing listens here" in the emailed report.
         text = render(mod, tmp_path, {"listening": []})
-        assert "<h2>Listening Services</h2>" not in text
-        assert 'class="section"' not in text
+        assert "<h2>Listening Services</h2>" in text
+        assert "could be enumerated" in text and ">REVIEW<" in text
 
     def test_no_dhcp_responders_reports_that_nothing_answered(self, mod, tmp_path):
         text = render(mod, tmp_path, {"dhcp": {"responders": []}})
