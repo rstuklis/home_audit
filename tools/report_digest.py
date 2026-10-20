@@ -215,8 +215,14 @@ def redact_for_model(text):
     Announced names and server banners are the two places the audit prints text
     supplied by whatever is on the network. The owner's own labels stay.
     """
-    text = re.sub(r'announces "[^"\n]*" \[(\w+)\]', r"announces a name [\1]", text)
+    # To the end of the line, not to the closing quote: a quote inside the
+    # name ended the match early and let the rest of the name pass as the
+    # audit's own words.
+    text = re.sub(r"(?m)announces .*$", "announces a name (withheld)", text)
     text = re.sub(r"(?m)^(\s*Server banner:).*$", r"\1 (withheld)", text)
+    # The UPnP mapping table's description column is free text any LAN device
+    # can set with AddPortMapping; the ports and addresses stay.
+    text = re.sub(r"(?m)^(\s*\d{1,5}\s+(?:TCP|UDP)\s+\S+\s+).*$", r"\1(description withheld)", text)
     return text
 
 
@@ -226,7 +232,11 @@ def accept_paragraph(reply):
     if len(text) < 40:
         return None
     # A summary has no reason to contain a link, and an injected one has every reason.
-    if re.search(r"(?i)https?://|www\.|\b[a-z0-9-]+\.(com|net|org|io|ru|cn|xyz|top|info)\b", text):
+    # Any dotted name with a letter suffix, not a list of nine TLDs: .dev, .app,
+    # .au, .co.uk and the rest were walking through. File extensions the
+    # report itself mentions are the only exception.
+    if re.search(r"(?i)https?://|www\.|\b[a-z0-9-]+\.(?!(?:py|sh|md|txt|json|jsonl|html|htm|"
+                 r"pdf|log|js|css|plist|swift)\b)[a-z]{2,24}\b", text):
         return None
     if len(text) > PARAGRAPH_LIMIT:
         cut = text[:PARAGRAPH_LIMIT]

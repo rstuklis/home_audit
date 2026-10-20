@@ -244,3 +244,34 @@ Single path for all networks — `select_network_baseline` repoints only `BASELI
 5. **M12 Scenario B severity depends on H12.** Whether an unwritable `monitor_state.json` is silent depends on whether the off-host heartbeat gap report works — which H12 shows it does not, in per-network deployments. Fix H12 first, then re-rate.
 6. **Not audited:** the speed-test path (`:2877-2904`), `check_trust_store`'s `security dump-trust-settings` parsing, `lookup_vendor`'s network OUI fetch (`:860`), `tools/capture_fixtures.py` redaction correctness, and the `seal_baseline.py` helper.
 7. **Not attempted:** any dynamic testing against real network hardware. All reproductions were against the module with stubbed `run`/sockets, or pure-function calls with hand-built inputs.
+
+# Adversarial audit — round 2 (2026-10-20)
+`home_net_audit.py` @ `7dbf92c` · nine finders over the ~2800 lines added since round 1 · 174 agents · 20 confirmed by three skeptics each, 21 contested (one refuter), 14 refuted · **all 20 confirmed and 8 of the contested fixed in the following commit, 1911 tests passing.**
+
+Threat model as before: (a) a false all-clear, (b) LAN-attacker-controlled input, plus (c) false alarms, (d) secrets, (e) a crash before baseline/report/email.
+
+| # | Where | Defect | Fix |
+|---|---|---|---|
+| HIGH | `_http_get_plain` (via `upnp_device_names`, `classify_upnp_listener`) | http.client's timeout is per recv; a device serving its UPnP description one byte per 2.9 s stalled the whole weekly audit for hours, before the baseline, report and email | Raw-socket GET with a wall-clock budget (`HTTP_GET_TOTAL_SECONDS`); whatever arrived is parsed |
+| HIGH | `generate_html_report` | The emailed HTML/PDF carried no change detection, integrity or receipt verdict — a broken seal or a changed gateway MAC was a HIGH on stdout only | `action_full_audit` keeps the block under `state["_comparison"]` (stripped by `save_baseline`); rendered first, with badges |
+| HIGH | `observation_gaps` | One appended heartbeat with a huge `interval` silenced the coverage check for ever | Per-beat cadence, capped at `HEARTBEAT_INTERVAL_MAX`; absurd intervals named by `describe_clock_anomalies` |
+| HIGH | `compare_with_receipts`, `code_attestations` | A receipt line with a string `seq` or numeric `code` raised TypeError out of change detection | `_normalise_receipt` drops wrong-typed fields at the producer |
+| MEDIUM | `run_monitor` | Heartbeats recorded the 60 s poll interval while being sent every 900 s, so every weekly audit would report a healthy monitor as "not running now" at HIGH | Records `max(interval, heartbeat_interval)` |
+| MEDIUM | `diff_baseline` | A dormant→live UPnP gateway flip printed "No changes" (port 1900 open both weeks) | `upnp_listeners` state compared |
+| MEDIUM | `check_evil_twin` | Helper scan failed → the one joined BSSID scored as a full scan, `[OK]` | `read_wifi_helper` records `scanned`; unscanned results take the association-record branch |
+| MEDIUM | `generate_html_report` | Every open modem port badged HIGH, contradicting the probe's DORMANT verdict two cards down | Per-port table with the probe's verdict for 1900 |
+| MEDIUM | `run_monitor` | Undelivered alerts lived in memory; SIGTERM/reboot lost them silently | Queue persisted in the monitor state file, reloaded and retried; SIGTERM → clean stop |
+| MEDIUM | UPnP `xtag`, `redact_for_model`, `mark_line` | Device-chosen text (mapping description with newlines, names with `"`, mid-line `[OK]`) forged report lines, badges and reached the digest's model | `_banner_text` for every mapping field; `"` never survives in a name; renderer sets announced spans aside; digest withholds the whole announced remainder and mapping descriptions; link filter covers any TLD |
+| LOW | `save_baseline` / `main` | One failed Keychain lookup extended a sealed chain unsealed and raised the tool's own keyed_downgrade HIGH a week later | `chain_is_keyed()` refuses the unsealed save, at HIGH, in the CLI and the menu |
+| LOW | `diff_snapshots` / `run_monitor` | One blank poll (route/scutil/arp timed out) raised two HIGHs, then two more and every neighbour as new | `carry_forward_blank_fields` |
+| LOW | `action_listening_services` | The listener comparison the baseline exists for only ran under `--compact` | Runs whenever a baseline is given |
+| contested, fixed | `verify_baseline` | A rolled-back keyed baseline was REVIEW "unverifiable" whenever the passphrase was missing | Chain position checked before the key is needed |
+| contested, fixed | `_ptr_exchange` | Any datagram from the gateway's address counted; QR bit and id ignored | QR required; id required on the gateway path |
+| contested, fixed | `_ssdp_search`, `classify_upnp_listener` | 32 identical datagrams filled the cap; a root-device reply with no description read "live but cannot open WAN ports" | Duplicates dropped, cap 64; undescribed reply is UNKNOWN/REVIEW |
+| contested, fixed | `generate_html_report` | An empty listener list rendered no section at all | REVIEW "could not be enumerated" |
+| contested, fixed | `main` | No top-level guard: any uncaught exception was a silent week | `main()` wraps `_main()`: `[HIGH] AUDIT ABORTED`, exit 2; the beach wrapper emails a failure notice |
+| contested, fixed | `seal_baseline.py`, `wifi_name_withheld_note`, iCloud sink | Seal published no receipt silently; note claimed Location Services access on an unparsed reply; an evicted iCloud file read as "no receipts" and was forked | Each said or refused |
+
+Deployment findings from the same review (not code): the launcher app was installed but never approved for Local Network on macOS 15, which posts no prompt for a background job; Mail's Automation grant moved to the launcher and resets on rebuild. Both are documented in the beach-house wrapper.
+
+Declined or deferred: the evil-twin BSSID auto-remembered into the baseline (accepted design, round 1); the iCloud path sink being user-writable (documented limit of a path sink); heartbeat forgery of the open gap by a line stamped `now` with an interval at the cap (bounded to a day, and named).

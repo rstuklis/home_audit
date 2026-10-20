@@ -57,7 +57,13 @@ if not pw:
 if pw != getpass.getpass("Re-enter passphrase to confirm : "):
     sys.exit("Passphrases did not match — nothing changed.")
 
-h.save_baseline(state, passphrase=pw)
+record = h.save_baseline(state, passphrase=pw)
+published = h.describe_publish_result(record.get("_receipt"))
+if published:
+    print(published)
+if not (record.get("_receipt") or {}).get("published"):
+    print(f"  Note: no off-host receipt for this seal. Run with {h.SINK_ENV} set, as the\n"
+          "  scheduled job does, or the next audit will say this run was never published.")
 
 result = h.verify_baseline(passphrase=pw)
 print()

@@ -81,7 +81,14 @@ RULE_RE = re.compile(r"^─{20,}\s*$")
 BOX_RE = re.compile(r"^={20,}\s*$")
 # The report writes "[OK    ]" and "[MEDIUM]" alike: a rating padded to the
 # widest one so its columns line up. The badge takes the same width back.
-BADGE_RE = re.compile(r"\[(HIGH|MEDIUM|REVIEW|INFO|OK|GOOD|UNKNOWN|SKIP)\s*\]")
+# Not anchored: the report also writes a rating mid-line ("Risk : [OK]"). What
+# keeps a device's own text from earning a badge is that its span is set aside
+# before this runs (ANNOUNCED_RE below), and that banners and UPnP descriptions
+# have their brackets replaced by the audit itself.
+BADGE_RE = re.compile(r"()\[(HIGH|MEDIUM|REVIEW|INFO|OK|GOOD|UNKNOWN|SKIP)\s*\]")
+# What a device said about itself, quoted and attributed by the audit. Cut out
+# before any emphasis is applied, put back escaped and plain.
+ANNOUNCED_RE = re.compile(r'announces (?:"|&quot;).*(?:"|&quot;) \[\w+\]')
 # The per-network verdict, wherever the report repeats it (the TL;DR puts it
 # mid-line). Group 1 matches only the bad one.
 VERDICT_RE = re.compile(r"(CHANGES DETECTED)|\bNO CHANGES\b|\bno changes\b")
@@ -133,15 +140,32 @@ def mark_line(line):
     the report's own emphasis kept: change lines red, unlabelled devices amber,
     file paths and closing remarks muted."""
     esc = html.escape(line)
-    esc = BADGE_RE.sub(lambda m: badge(m.group(1)), esc)
+    # The device-chosen span is removed before any pattern looks at the line
+    # and restored, escaped only, afterwards: nothing a device says can be
+    # read as a rating, a verdict or the audit's own emphasis.
+    held = []
+
+    def hold(m):
+        held.append(m.group(0))
+        return f"\x00{len(held) - 1}\x00"
+    esc = ANNOUNCED_RE.sub(hold, esc)
+    esc = BADGE_RE.sub(lambda m: m.group(1) + badge(m.group(2)), esc)
     esc = VERDICT_RE.sub(
         lambda m: (f'<span style="color:{RISK_COLOUR["HIGH"] if m.group(1) else RISK_COLOUR["OK"]};'
                    f'font-weight:700">{m.group(0)}</span>'), esc)
     stripped = line.strip()
+    plain = esc
     if stripped.startswith("! "):
-        return f'<span style="color:{RISK_COLOUR["HIGH"]};font-weight:700">{esc}</span>'
-    if "&lt;-- unlabelled" in esc or "not in the baseline" in esc:
-        return f'<span style="color:{RISK_COLOUR["MEDIUM"]};font-weight:700">{esc}</span>'
+        plain = f'<span style="color:{RISK_COLOUR["HIGH"]};font-weight:700">{esc}</span>'
+    elif "&lt;-- unlabelled" in esc or "not in the baseline" in esc:
+        plain = f'<span style="color:{RISK_COLOUR["MEDIUM"]};font-weight:700">{esc}</span>'
+    if held:
+        for i, span in enumerate(held):
+            plain = plain.replace(f"\x00{i}\x00", span)
+        return plain
+    esc = plain
+    if stripped.startswith("! ") or "&lt;-- unlabelled" in esc or "not in the baseline" in esc:
+        return esc
     if (stripped.startswith("Baseline saved to") or stripped.startswith("Baseline from:")
             or stripped.startswith("Full audit complete")):
         return f'<span style="color:{MUTED}">{esc}</span>'

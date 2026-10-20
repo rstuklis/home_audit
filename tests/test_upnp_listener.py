@@ -248,7 +248,9 @@ class TestSearch:
 
 class TestBanner:
     def test_control_characters_from_the_device_are_not_printed(self, mod):
-        assert mod._banner_text("libupnp\x1b[31m\r\nX-Evil: 1") == "libupnp[31mX-Evil: 1"
+        # Brackets go too: "[HIGH]" is how the report writes a rating, and a
+        # banner is the device's to choose.
+        assert mod._banner_text("libupnp\x1b[31m\r\nX-Evil: 1") == "libupnp(31mX-Evil: 1"
 
     def test_a_long_banner_is_truncated(self, mod):
         assert len(mod._banner_text("a" * 500)) == 80
