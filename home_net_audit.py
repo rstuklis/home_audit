@@ -2908,12 +2908,19 @@ def describe_code_attestation(receipts, current=None, chain=None):
 
     `current` is the digest of the script running now and `chain` the network
     this run is for. With them the question asked is the one worth asking
-    every run — has the program changed since the last run that recorded one,
-    on this chain — and the answer is REVIEW on the first run after a change
-    and INFO after that, naming when the last change was. Without them the
-    record alone is read, and any change ever on it is REVIEW: since the record
-    is append-only that was for ever, one update made the line a permanent
-    fixture, and the TL;DR could not tell the next edit from the one before.
+    every run — has the program changed since the last AUDIT that recorded
+    one, on this chain — and the answer is REVIEW on the first audit after a
+    change and INFO after that, naming when the last change was. The last
+    audit is the chain's last baseline receipt: a monitor's heartbeats attest
+    the script every quarter hour, and an edit they recorded between two
+    audits must still reach the audit's report, so any digest they recorded
+    after that receipt that differs from it is REVIEW too — even one the
+    script has since come back from. An audit run by hand that saves a
+    baseline is a recorded audit: it printed this REVIEW itself, and the next
+    scheduled run says INFO. Without `current` the record alone is read, and
+    any change ever on it is REVIEW: since the record is append-only that was
+    for ever, one update made the line a permanent fixture, and the TL;DR
+    could not tell the next edit from the one before.
     """
     seen = code_attestations(receipts)
     if not seen:
@@ -2922,16 +2929,24 @@ def describe_code_attestation(receipts, current=None, chain=None):
     caveat = ("Self-reported: the script hashes itself, so this catches an edit "
               "that did not expect to be watched, not one that did.")
     if current:
-        own = seen
-        if chain:
-            own = code_attestations([r for r in receipts or ()
-                                     if isinstance(r, dict) and r.get("chain") == chain]) or seen
-        last_digest, last_when = own[-1]
+        pool = [r for r in receipts or () if isinstance(r, dict)]
+        mine = [r for r in pool if r.get("chain") == chain] if chain else []
+        mine = mine or pool
+        audits = (code_attestations([r for r in mine if r.get("kind") != "heartbeat"])
+                  or code_attestations(mine))
+        last_digest, last_when = audits[-1]
+        since = [d for d, when in code_attestations(mine)
+                 if when > (last_when or "") and d != last_digest]
         if current != last_digest:
             return (f"  [REVIEW] Audit code: the script has changed since the last recorded "
-                    f"run ({_stamp_text(last_when)}): {last_digest[:12]}… → {current[:12]}…. "
+                    f"audit ({_stamp_text(last_when)}): {last_digest[:12]}… → {current[:12]}…. "
                     f"If you did not update the tool since then, something edited it. "
                     f"{len(changes)} earlier change(s) on record. {caveat}")
+        if since:
+            return (f"  [REVIEW] Audit code: since the last recorded audit ({_stamp_text(last_when)}) "
+                    f"the monitor attested a different script ({since[-1][:12]}…); it is "
+                    f"{current[:12]}… again now. If you did not update the tool and put it "
+                    f"back, something edited it. {len(changes)} change(s) on record. {caveat}")
         if changes:
             return (f"  [INFO  ] Audit code: sha256 {current[:12]}… unchanged since "
                     f"{_stamp_text(changes[-1]['at'])}; {len(changes)} earlier change(s) "
@@ -3846,8 +3861,8 @@ def describe_unconfirmed_listeners(old, new):
         why = _banner_text(new_entry.get("caveat") or new_entry.get("summary") or "", 140)
         lines.append(f"  [INFO  ] UPnP on {_banner_text(host, 60)}: read as {now} this run, "
                      f"{was} in the baseline, but the reading rests on no answer ({why}). "
-                     f"Not counted as a change; the baseline keeps {was}. The same reading "
-                     f"on the next run will count.")
+                     f"Not counted as a change; the saved baseline keeps {was} and "
+                     f"counts this reading, so the same reading on the next run will.")
     return "\n".join(lines) if lines else None
 
 
@@ -6910,12 +6925,23 @@ def check_sharing_services():
         loaded = _launchd_loaded("com.apple.AEServer")
         listening = check_port("127.0.0.1", 3031, timeout=0.4)
         if loaded or listening:
+            # Said from the evidence seen: the port can be held by something
+            # other than AEServer, and a note naming launchd when launchd said
+            # the opposite sends the reader looking for a service that is not there.
+            if loaded:
+                why = "launchd has the AEServer service loaded"
+            elif loaded is False:
+                why = ("something accepts connections on the eppc port 3031, though "
+                       "launchd does not report AEServer loaded — Remote Apple Events, "
+                       "or another program on that port")
+            else:
+                why = ("something accepts connections on the eppc port 3031; launchctl "
+                       "could not be asked")
             services.append({
                 "name": "Remote Apple Events",
                 "enabled": True,
                 "risk": "REVIEW",
-                "note": ("Allows remote AppleScript control (launchd has the AEServer "
-                         "service loaded; systemsetup needs sudo to say more)."),
+                "note": f"Allows remote AppleScript control ({why}; systemsetup needs sudo to say more).",
             })
         elif loaded is False:
             services.append({

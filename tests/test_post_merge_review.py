@@ -342,7 +342,7 @@ class TestTheAttestationLineIsTransient:
     def test_the_first_run_after_an_update_is_review_naming_both_digests(self, mod):
         receipts = _receipts(("A", "a" * 64), ("A", "b" * 64))
         line = mod.describe_code_attestation(receipts, current="c" * 64, chain="A")
-        assert "[REVIEW" in line and "changed since the last recorded run" in line
+        assert "[REVIEW" in line and "changed since the last recorded audit" in line
         assert "bbbbbbbbbbbb… → cccccccccccc…" in line and "did not update the tool" in line
 
     def test_each_network_of_one_run_sees_its_own_last_run(self, mod):
@@ -352,6 +352,38 @@ class TestTheAttestationLineIsTransient:
         receipts = _receipts(("A", "a" * 64), ("B", "a" * 64), ("A", "b" * 64))
         assert "[REVIEW" in mod.describe_code_attestation(receipts, current="b" * 64, chain="B")
         assert "[INFO" in mod.describe_code_attestation(receipts, current="b" * 64, chain="A")
+
+    def _beats(self, chain, code, *stamps):
+        return [{"kind": "heartbeat", "chain": chain, "code": code, "at": at} for at in stamps]
+
+    def test_an_edit_a_monitors_heartbeats_recorded_still_reaches_the_audit(self, mod):
+        # A monitor attests the script every quarter hour, so an edit on Friday
+        # is on the record by Friday 20:15. The Saturday audit compares with
+        # the last AUDIT, not the last heartbeat, or the heartbeat would be the
+        # thing that hid the edit from the only report anyone reads.
+        receipts = (_receipts(("A", "a" * 64))
+                    + self._beats("A", "a" * 64, "2026-10-12T00:15:00+00:00")
+                    + self._beats("A", "b" * 64, "2026-10-16T20:15:00+00:00", "2026-10-17T08:45:00+00:00"))
+        line = mod.describe_code_attestation(receipts, current="b" * 64, chain="A")
+        assert "[REVIEW" in line and "aaaaaaaaaaaa… → bbbbbbbbbbbb…" in line
+
+    def test_an_edit_put_back_between_audits_is_still_review(self, mod):
+        receipts = (_receipts(("A", "a" * 64))
+                    + self._beats("A", "b" * 64, "2026-10-16T20:15:00+00:00")
+                    + self._beats("A", "a" * 64, "2026-10-17T08:45:00+00:00"))
+        line = mod.describe_code_attestation(receipts, current="a" * 64, chain="A")
+        assert "[REVIEW" in line and "attested a different script (bbbbbbbbbbbb…)" in line
+        assert "aaaaaaaaaaaa… again now" in line
+
+    def test_a_hand_run_audit_that_saved_is_a_recorded_audit(self, mod):
+        # The documented limit: the run that saved printed the REVIEW itself.
+        receipts = _receipts(("A", "a" * 64), ("A", "b" * 64))
+        assert "[INFO" in mod.describe_code_attestation(receipts, current="b" * 64, chain="A")
+
+    def test_heartbeats_alone_are_the_record_when_no_audit_ever_saved(self, mod):
+        beats = self._beats("A", "a" * 64, "2026-10-12T00:15:00+00:00")
+        assert "[INFO" in mod.describe_code_attestation(beats, current="a" * 64, chain="A")
+        assert "[REVIEW" in mod.describe_code_attestation(beats, current="b" * 64, chain="A")
 
     def test_a_chain_with_no_record_falls_back_to_the_whole_record(self, mod):
         receipts = _receipts(("A", "a" * 64))

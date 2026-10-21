@@ -521,6 +521,22 @@ class TestSharingServicesRemoteAppleEvents:
         rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
         assert rae["enabled"] is True
 
+    def test_the_on_note_names_the_evidence_that_was_seen(self, mod, monkeypatch):
+        # The port can be held by another program; a note naming launchd when
+        # launchd said the opposite sends the reader after a service that is
+        # not there. Three distinct notes for three distinct observations.
+        _patch_sharing(monkeypatch, mod, systemsetup=NEEDS_ADMIN,
+                       launchd={AESERVER: _print_dump(AESERVER, "not running")})
+        by_launchd = _by_name(mod.check_sharing_services(), "Remote Apple Events")["note"]
+        _patch_sharing(monkeypatch, mod, systemsetup=NEEDS_ADMIN, open_ports=[3031])
+        by_port = _by_name(mod.check_sharing_services(), "Remote Apple Events")["note"]
+        _launchctl_unavailable(monkeypatch, mod, open_ports=[3031])
+        by_port_blind = _by_name(mod.check_sharing_services(), "Remote Apple Events")["note"]
+        assert "launchd has the AEServer service loaded" in by_launchd
+        assert "does not report AEServer loaded" in by_port and "another program" in by_port
+        assert "could not be asked" in by_port_blind
+        assert len({by_launchd, by_port, by_port_blind}) == 3
+
     def test_admin_access_message_and_no_launchctl_is_unknown_not_off(self, mod, monkeypatch):
         _launchctl_unavailable(monkeypatch, mod)
         rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
