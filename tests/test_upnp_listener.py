@@ -186,7 +186,9 @@ class TestUnknown:
         assert v["risk"] == "REVIEW"
 
     def test_it_stops_asking_a_port_that_does_not_speak_http(self, probe):
-        assert len(probe(speaks_http=False)["_calls"]) == 1
+        # One retry of the first silent GET (a dropped packet is not a verdict),
+        # then the remaining well-known paths on that port are not tried.
+        assert len(probe(speaks_http=False)["_calls"]) == 2
 
     def test_an_os_refusal_is_reported_as_a_refusal(self, probe):
         v = probe(refused=True, speaks_http=False)

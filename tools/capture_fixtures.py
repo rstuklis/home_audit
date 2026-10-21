@@ -60,6 +60,7 @@ COMMANDS = {
     "launchctl_print_sshd":     ["launchctl", "print", "system/com.openssh.sshd"],
     "launchctl_print_smbd":     ["launchctl", "print", "system/com.apple.smbd"],
     "launchctl_print_screensharing": ["launchctl", "print", "system/com.apple.screensharing"],
+    "launchctl_print_aeserver": ["launchctl", "print", "system/com.apple.AEServer"],
     "systemsetup_rae":          ["systemsetup", "-getremoteappleevents"],
     "security_trust":           ["security", "dump-trust-settings", "-d"],
     "wifi_sp_airport":          ["system_profiler", "SPAirPortDataType"],
@@ -79,7 +80,7 @@ MERGE_STDERR = {"security_trust"}
 # What they cannot do is produce a fixture: there is nothing on stdout to keep
 # unless the service is switched on.
 EXIT_STATUS_ONLY = {"launchctl_print_sshd", "launchctl_print_smbd",
-                    "launchctl_print_screensharing"}
+                    "launchctl_print_screensharing", "launchctl_print_aeserver"}
 
 # Ordered alternation, matched in one pass. Order is the whole point: a MAC
 # also satisfies the IPv6 pattern, so substituting separately turned

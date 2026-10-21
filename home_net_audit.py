@@ -1428,6 +1428,7 @@ def save_baseline(state, passphrase=None):
     state = {k: v for k, v in state.items() if not str(k).startswith("_")}
     memory = update_device_memory(load_baseline() or {}, state)
     state = carry_forward_unmeasured(state)
+    state = carry_forward_unconfirmed_listeners(state)
     # Only when there is something to remember: a state that says nothing about
     # devices gains no key telling the reader that nothing is remembered.
     if memory:
@@ -1946,7 +1947,10 @@ def read_receipts(source):
                     continue
                 try:
                     entry = json.loads(line)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
+                    # JSONDecodeError is a ValueError; RecursionError is what
+                    # json.loads raises for a line nested deeper than the
+                    # interpreter's stack, and it reached change detection.
                     continue
                 if isinstance(entry, dict):
                     entries.append(_normalise_receipt(entry))
@@ -1975,9 +1979,15 @@ def _normalise_receipt(entry):
                 clean[key] = value
         elif key == "interval":
             # json.loads accepts NaN and Infinity. NaN compares false with
-            # everything, so a NaN cadence made every window "not a gap".
-            if (isinstance(value, (int, float)) and not isinstance(value, bool)
-                    and math.isfinite(value)):
+            # everything, so a NaN cadence made every window "not a gap". It
+            # also accepts an integer past float range, which math.isfinite
+            # refuses with OverflowError — out of the change-detection section.
+            try:
+                finite = (isinstance(value, (int, float)) and not isinstance(value, bool)
+                          and math.isfinite(value))
+            except OverflowError:
+                finite = False
+            if finite:
                 clean[key] = value
         elif key == "keyed":
             clean[key] = bool(value)
@@ -2880,11 +2890,30 @@ def code_changes(receipts):
     return changes
 
 
-def describe_code_attestation(receipts):
+def _stamp_text(value):
+    """A timestamp from the off-host record, printed only if it parses as one.
+
+    The record is append-only and anyone who can append chose this string; it
+    used to be printed verbatim, which let a line with a crafted "published_at"
+    put its own words in the report and the TL;DR.
+    """
+    return value if _parse_stamp(value) else "an unrecorded time"
+
+
+def describe_code_attestation(receipts, current=None, chain=None):
     """A line on whether the audit program itself has changed, or None.
 
     Silent when nothing off-host has attested anything, so a deployment without
     a sink gains no line about a record it is not keeping.
+
+    `current` is the digest of the script running now and `chain` the network
+    this run is for. With them the question asked is the one worth asking
+    every run — has the program changed since the last run that recorded one,
+    on this chain — and the answer is REVIEW on the first run after a change
+    and INFO after that, naming when the last change was. Without them the
+    record alone is read, and any change ever on it is REVIEW: since the record
+    is append-only that was for ever, one update made the line a permanent
+    fixture, and the TL;DR could not tell the next edit from the one before.
     """
     seen = code_attestations(receipts)
     if not seen:
@@ -2892,12 +2921,29 @@ def describe_code_attestation(receipts):
     changes = code_changes(receipts)
     caveat = ("Self-reported: the script hashes itself, so this catches an edit "
               "that did not expect to be watched, not one that did.")
+    if current:
+        own = seen
+        if chain:
+            own = code_attestations([r for r in receipts or ()
+                                     if isinstance(r, dict) and r.get("chain") == chain]) or seen
+        last_digest, last_when = own[-1]
+        if current != last_digest:
+            return (f"  [REVIEW] Audit code: the script has changed since the last recorded "
+                    f"run ({_stamp_text(last_when)}): {last_digest[:12]}… → {current[:12]}…. "
+                    f"If you did not update the tool since then, something edited it. "
+                    f"{len(changes)} earlier change(s) on record. {caveat}")
+        if changes:
+            return (f"  [INFO  ] Audit code: sha256 {current[:12]}… unchanged since "
+                    f"{_stamp_text(changes[-1]['at'])}; {len(changes)} earlier change(s) "
+                    f"on record. {caveat}")
+        return (f"  [INFO  ] Audit code: sha256 {current[:12]}… unchanged across "
+                f"{len(seen)} off-host record(s). {caveat}")
     if not changes:
         return (f"  [INFO  ] Audit code: sha256 {seen[-1][0][:12]}… unchanged across "
                 f"{len(seen)} off-host record(s). {caveat}")
     last = changes[-1]
     return (f"  [REVIEW] Audit code: the script's digest changed at "
-            f"{last['at'] or 'an unrecorded time'} ({last['from'][:12]}… → "
+            f"{_stamp_text(last['at'])} ({last['from'][:12]}… → "
             f"{last['to'][:12]}…), {len(changes)} time(s) on record. If you did not "
             f"update the tool, something edited it. {caveat}")
 
@@ -3722,6 +3768,89 @@ def describe_mac(mac, labels=None, *states):
     return mac
 
 
+def upnp_verdict_counts(old_entry, new_entry):
+    """Whether a UPnP verdict that differs from the baseline's is a change.
+
+    A verdict confirmed by an answer counts. One that rests on no answer — a
+    description that could not be fetched, a control service that gave no HTTP
+    reply, a port that answered nothing — counts only when the same reading
+    comes back on the next run: silence twice running is not a dropped packet.
+    A baseline entry written before verdicts recorded their confirmation is
+    read as confirmed, so the comparison behaves for it as it always did.
+    """
+    if not isinstance(new_entry, dict):
+        return False
+    if new_entry.get("confirmed", True):
+        return True
+    old_entry = old_entry if isinstance(old_entry, dict) else {}
+    runs = old_entry.get("unconfirmed_runs")
+    return (old_entry.get("unconfirmed_state") == new_entry.get("state")
+            and isinstance(runs, int) and not isinstance(runs, bool) and runs >= 1)
+
+
+def _listener_verdicts(state):
+    value = (state or {}).get("upnp_listeners")
+    return value if isinstance(value, dict) else {}
+
+
+def carry_forward_unconfirmed_listeners(state, previous=None):
+    """Keep the baseline's confirmed UPnP verdict over this run's unconfirmed one.
+
+    Saving the unconfirmed verdict made the next confirmed run read as a change
+    back — the second alarm of the flap. The confirmed verdict stays the
+    reference, with `unconfirmed_state` and `unconfirmed_runs` recording what
+    this run read and how many runs in a row have read it, so the same reading
+    next run is counted (upnp_verdict_counts) and then adopted. Returns `state`
+    with a replaced "upnp_listeners" dict; the one passed in is not touched,
+    because the report of this run still shows what this run observed.
+    """
+    if previous is None:
+        previous = load_baseline() or {}
+    old_l, new_l = _listener_verdicts(previous), _listener_verdicts(state)
+    if not new_l:
+        return state
+    merged = dict(new_l)
+    for host, new_entry in new_l.items():
+        old_entry = old_l.get(host)
+        if not isinstance(new_entry, dict) or not isinstance(old_entry, dict):
+            continue
+        was, now = old_entry.get("state"), new_entry.get("state")
+        if not isinstance(was, str) or not isinstance(now, str) or was == now:
+            continue
+        if upnp_verdict_counts(old_entry, new_entry):
+            continue
+        kept = {k: v for k, v in old_entry.items()
+                if k not in ("unconfirmed_state", "unconfirmed_runs")}
+        runs = old_entry.get("unconfirmed_runs") if old_entry.get("unconfirmed_state") == now else 0
+        runs = runs if isinstance(runs, int) and not isinstance(runs, bool) and runs >= 0 else 0
+        kept["unconfirmed_state"] = now
+        kept["unconfirmed_runs"] = runs + 1
+        merged[host] = kept
+    state["upnp_listeners"] = merged
+    return state
+
+
+def describe_unconfirmed_listeners(old, new):
+    """One line per UPnP verdict held back from the change list, or None."""
+    old_l, new_l = _listener_verdicts(old), _listener_verdicts(new)
+    lines = []
+    for host in sorted(set(old_l) & set(new_l)):
+        old_entry, new_entry = old_l[host], new_l[host]
+        if not isinstance(old_entry, dict) or not isinstance(new_entry, dict):
+            continue
+        was, now = old_entry.get("state"), new_entry.get("state")
+        if not isinstance(was, str) or not isinstance(now, str) or was == now:
+            continue
+        if upnp_verdict_counts(old_entry, new_entry):
+            continue
+        why = _banner_text(new_entry.get("caveat") or new_entry.get("summary") or "", 140)
+        lines.append(f"  [INFO  ] UPnP on {_banner_text(host, 60)}: read as {now} this run, "
+                     f"{was} in the baseline, but the reading rests on no answer ({why}). "
+                     f"Not counted as a change; the baseline keeps {was}. The same reading "
+                     f"on the next run will count.")
+    return "\n".join(lines) if lines else None
+
+
 def diff_baseline(old, new, labels=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
@@ -3904,7 +4033,12 @@ def diff_baseline(old, new, labels=None):
     for host in sorted(set(old_listeners) & set(new_listeners)):
         was = (old_listeners[host] or {}).get("state") if isinstance(old_listeners[host], dict) else None
         now = (new_listeners[host] or {}).get("state") if isinstance(new_listeners[host], dict) else None
-        if isinstance(was, str) and isinstance(now, str) and was != now:
+        # A differing verdict that rests on no answer is held back (see
+        # upnp_verdict_counts and describe_unconfirmed_listeners): one dropped
+        # exchange used to print CHANGES DETECTED about a modem that had not
+        # changed, and the reverse the week after.
+        if isinstance(was, str) and isinstance(now, str) and was != now \
+                and upnp_verdict_counts(old_listeners[host], new_listeners[host]):
             note = f"UPnP on {_banner_text(host, 60)} CHANGED: was {was}, now {now}"
             if now == UPNP_LIVE_GATEWAY:
                 note += (". A UPnP gateway service will forward WAN ports for any "
@@ -5214,7 +5348,10 @@ def get_upnp_port_mappings(gateway):
             # description. A newline in it used to start a new report line at
             # column 0 — a forged section header, a forged rating — so every
             # field goes through the same cleaner as a device's banner.
-            m = re.search(fr"<[^>]*{tag}[^>]*>([^<]*)<", text, re.IGNORECASE)
+            # Bounded on both sides of the tag: with [^>]* a body of "<" runs
+            # and no ">" cost a rescan per "<", quadratic in a 64 KB reply.
+            m = re.search(fr"<[^<>]{{0,200}}{tag}[^<>]{{0,200}}>([^<]{{0,4096}})<",
+                          text, re.IGNORECASE)
             return _banner_text(html.unescape(m.group(1)), 120) if m else ""
 
         mappings.append({
@@ -5249,6 +5386,40 @@ _UPNP_GATEWAY_MARKERS = ("internetgatewaydevice", "wanipconnection",
 UPNP_DESCRIBED_OFF = "described-off"
 
 
+def _xml_text(body, tag, limit=400):
+    """The text of the first <tag>…</tag> in a device's description, or "".
+
+    Linear in the body, on purpose. The pattern this replaces,
+    <tag>\\s*([^<]{1,200}?)\\s*</tag>, backtracked quadratically — and the
+    unbounded [^<]+? form of it cubically — on a description that opens the
+    tag and then pads it with whitespace to the fetch limit, closing tag never
+    arriving. From any device that answers the sweep's discovery, 64 KB of that
+    held the audit's thread pool for twenty-five minutes; from the gateway, for
+    longer than the week. Nothing raised, so no abort line, no failure email,
+    no baseline and no report, and launchd would not start the next run while
+    this one was still going. The fetch budget bounds the download; this
+    bounds the parse: one bounded greedy run, no lazy quantifier to retry.
+    """
+    m = re.search(fr"<{tag}>([^<]{{0,{int(limit)}}})</{tag}>", body or "", re.I)
+    return m.group(1).strip() if m else ""
+
+
+def _xml_blocks(body, tag):
+    """Each <tag>…</tag> body of a description, read once, left to right.
+
+    re.findall(r"<tag>(.*?)</tag>") rescanned to the end of the body for every
+    opening tag that had no closing one — thousands of them in 64 KB — so the
+    body is split on the opening tag once and each piece read to its first
+    closing tag, which touches every byte once.
+    """
+    out = []
+    for piece in re.split(fr"(?i)<{tag}>", body or "")[1:]:
+        m = re.match(fr"(?is)(.*?)</{tag}>", piece)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
 def _upnp_control_check(host, port, path, description):
     """Ask the gateway service in `description` one read-only question.
 
@@ -5265,36 +5436,47 @@ def _upnp_control_check(host, port, path, description):
     service with a usable control URL in the description).
     """
     base = f"http://{host}:{port}{path if str(path).startswith('/') else '/' + str(path)}"
-    urlbase = re.search(r"<URLBase>\s*([^<]+?)\s*</URLBase>", description or "", re.I)
-    if urlbase and _upnp_url_points_at(urlbase.group(1), host):
-        base = urlbase.group(1)
+    urlbase = _xml_text(description, "URLBase", 2048)
+    if urlbase and _upnp_url_points_at(urlbase, host):
+        base = urlbase
     outcomes = []
-    services = re.findall(r"<service>(.*?)</service>", description or "", re.S | re.I)
-    for block in services:
-        st = re.search(r"<serviceType>\s*([^<]+?)\s*</serviceType>", block, re.I)
-        cu = re.search(r"<controlURL>\s*([^<]+?)\s*</controlURL>", block, re.I)
-        if not st or not cu:
+    retried = False
+    for block in _xml_blocks(description, "service"):
+        stype = _xml_text(block, "serviceType", 512)
+        control_url = _xml_text(block, "controlURL", 2048)
+        if not stype or not control_url:
             continue
-        stype = st.group(1)
         if "WANIPConnection" not in stype and "WANPPPConnection" not in stype:
             continue
         # Resolved the way the spec says — against URLBase, else the
         # description's own URL — and only back to the host being asked about,
         # over plain http: the same rule every other URL a device hands this
-        # tool is held to.
-        ctrl = urllib.parse.urljoin(base, html.unescape(cu.group(1)))
-        if not _upnp_url_points_at(ctrl, host):
+        # tool is held to. urljoin parses the device's string before
+        # _upnp_url_points_at can refuse it, and a bracketed host such as
+        # "http://[::1" is a ValueError there — out of the gateway probe and
+        # the whole audit, before the baseline, the report and the email.
+        try:
+            ctrl = urllib.parse.urljoin(base, html.unescape(control_url))
+            if not _upnp_url_points_at(ctrl, host):
+                continue
+            parts = urllib.parse.urlsplit(ctrl)
+        except ValueError:
             continue
-        parts = urllib.parse.urlsplit(ctrl)
         if parts.scheme != "http":
             continue
         c_port, c_path = parts.port or 80, parts.path or "/"
         soap = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
                 's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
                 f'<u:GetExternalIPAddress xmlns:u="{stype}"/></s:Body></s:Envelope>')
-        got = _http_post_plain(host, c_port, c_path, soap, {
-            "Content-Type": 'text/xml; charset="utf-8"',
-            "SOAPAction": f'"{stype}#GetExternalIPAddress"'})
+        headers = {"Content-Type": 'text/xml; charset="utf-8"',
+                   "SOAPAction": f'"{stype}#GetExternalIPAddress"'}
+        got = _http_post_plain(host, c_port, c_path, soap, headers)
+        if got is None and not retried:
+            # One lost exchange is a dropped packet or a busy modem, not the
+            # modem changing its mind. Asked once more — once per check — before
+            # the verdict is allowed to rest on the silence.
+            retried = True
+            got = _http_post_plain(host, c_port, c_path, soap, headers)
         if got is None:
             continue
         status, _srv, reply = got
@@ -5489,6 +5671,13 @@ def _http_plain(method, host, port, path, body, headers, timeout, limit, total):
         else:
             head, body = raw, b""
         lines = head.decode("iso-8859-1", "replace").splitlines()
+        if not lines:
+            # A reply that opens with a blank line has no status line to read.
+            # Indexing it raised IndexError past the except below: out of the
+            # name sweep, where it cost every device its UPnP name for the week,
+            # and out of the gateway probe, where it ended the audit. The
+            # http.client reader this replaced returned None for it; so does this.
+            return None
         if any(l.lower().replace(" ", "").startswith("transfer-encoding:chunked") for l in lines[1:101]):
             body = _dechunk(body)
         m = re.match(r"HTTP/\d\.\d\s+(\d{3})", lines[0])
@@ -5567,8 +5756,16 @@ def classify_upnp_listener(host, port=1900, onlink=None):
     targets = targets[:4] + [(port, path) for path in ("/",) + UPNP_DESCRIPTION_PATHS]
 
     description_port, description_path = None, "/"
+    retried = False
     for t_port, t_path in targets:
         got = _http_get_plain(host, t_port, t_path)
+        if got is None and not retried:
+            # A GET that came back with nothing is a dropped packet or a busy
+            # modem as often as a silent port. Asked once more — once per
+            # probe, so a port that really is silent costs one extra timeout,
+            # not one per path — before the verdict may rest on the silence.
+            retried = True
+            got = _http_get_plain(host, t_port, t_path)
         if got is None:
             # Nothing on this port speaks HTTP; the remaining well-known paths
             # on the same port would only repeat the timeout.
@@ -5593,9 +5790,16 @@ def classify_upnp_listener(host, port=1900, onlink=None):
         # the capability. One read-only question settles which this is.
         control = (_upnp_control_check(host, description_port, description_path, descriptions[0])
                    if descriptions else None)
+        # `confirmed` says whether the verdict rests on an answer that settles
+        # the question. diff_baseline counts a differing verdict as a change
+        # only when it is confirmed, or when the same unconfirmed reading comes
+        # back on the next run: one dropped exchange used to flip a switched-off
+        # modem to "live-gateway", print CHANGES DETECTED with advice to turn
+        # off what was already off, and flip back with a second alarm the week
+        # after.
         if control == "refused":
             verdict.update(
-                state=UPNP_DESCRIBED_OFF, risk="INFO",
+                state=UPNP_DESCRIBED_OFF, risk="INFO", confirmed=True,
                 summary=("SWITCHED OFF, description still published — the device "
                          "advertises a UPnP gateway service, but its control service "
                          "refuses every request. That is what a libupnp modem looks "
@@ -5605,7 +5809,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
                         "asked again every run, so a switch back on would show here."))
         else:
             verdict.update(
-                state=UPNP_LIVE_GATEWAY, risk="REVIEW",
+                state=UPNP_LIVE_GATEWAY, risk="REVIEW", confirmed=(control == "answered"),
                 summary=("LIVE — a UPnP gateway service answered. It can forward WAN "
                          "ports for any device that asks; turn UPnP off on this "
                          "device unless something needs it."))
@@ -5614,9 +5818,13 @@ def classify_upnp_listener(host, port=1900, onlink=None):
             elif descriptions:
                 verdict["caveat"] = ("Not confirmed: the control service gave no HTTP answer "
                                      "to a read-only request. Treated as live.")
+            else:
+                verdict["caveat"] = ("Not confirmed: the device answered discovery as a "
+                                     "gateway, but its description could not be fetched, so "
+                                     "its control service was not asked. Treated as live.")
     elif descriptions or any("urn:schemas-upnp-org:" in r.lower() for r in replies):
         verdict.update(
-            state=UPNP_LIVE_OTHER, risk="INFO",
+            state=UPNP_LIVE_OTHER, risk="INFO", confirmed=True,
             summary=("LIVE, but not a gateway service — UPnP answered without "
                      "offering port forwarding (typically media or USB sharing). "
                      "It cannot open WAN ports."))
@@ -5627,13 +5835,13 @@ def classify_upnp_listener(host, port=1900, onlink=None):
         # Calling that "cannot open WAN ports" was a verdict on evidence not
         # seen.
         verdict.update(
-            state=UPNP_UNKNOWN, risk="REVIEW",
+            state=UPNP_UNKNOWN, risk="REVIEW", confirmed=False,
             summary=("UNKNOWN — UPnP discovery answered, but the device "
                      "description could not be fetched, so whether a gateway "
                      "(port-forwarding) service is offered could not be determined."))
     elif http_answered:
         verdict.update(
-            state=UPNP_DORMANT, risk="INFO",
+            state=UPNP_DORMANT, risk="INFO", confirmed=False,
             summary=("DORMANT — the port is open but nothing behind it answered "
                      "as UPnP: no reply to discovery, no device description. "
                      "Typical of a UPnP web server left running after the "
@@ -5649,7 +5857,7 @@ def classify_upnp_listener(host, port=1900, onlink=None):
                 "observed, not proof the feature is off.")
     else:
         verdict.update(
-            state=UPNP_UNKNOWN, risk="REVIEW",
+            state=UPNP_UNKNOWN, risk="REVIEW", confirmed=False,
             summary=(local_network_denied_note("The UPnP probe") if refused else
                      "UNKNOWN — the port accepted a connection but answered "
                      "neither discovery nor HTTP, so what is listening could "
@@ -6586,6 +6794,24 @@ def _launchd_running(label):
     return False
 
 
+def _launchd_loaded(label):
+    """True if launchd has `label` loaded in the system domain, False if it
+    does not, None if launchctl could not be asked.
+
+    _launchd_running without the running test: a service launchd starts on
+    demand (Remote Apple Events' AEServer, woken when something connects to
+    its port) sits loaded and idle while switched on, and is not loaded at all
+    while switched off — its daemon plist ships disabled, and the Sharing
+    pane's switch is what enables it. Unprivileged, like the SSH probe.
+    """
+    try:
+        p = subprocess.run(["launchctl", "print", "system/" + label],
+                           capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return p.returncode == 0
+
+
 def check_sharing_services():
     """
     Query macOS for enabled sharing services — each is an inbound attack
@@ -6659,30 +6885,53 @@ def check_sharing_services():
         "note": "File shares visible on the network." if smb_on else "Disabled.",
     })
 
-    # Remote Apple Events: only determinable with root. Report UNKNOWN (never a
-    # false OFF) when the admin-access message comes back (note: exit code is 0).
+    # Remote Apple Events: systemsetup answers only with admin rights, and
+    # prints its refusal on stdout with exit 0. Without them launchd is asked
+    # instead — the same unprivileged question the SSH check puts to it — and
+    # the eppc port probed: loaded or listening is ON, not loaded is OFF, and
+    # UNKNOWN (never a false OFF) only when launchctl itself could not be
+    # asked. The row used to read UNKNOWN on every unattended run, for ever.
     rae_out = (run(["systemsetup", "-getremoteappleevents"], timeout=5) or "").lower()
-    if "you need administrator access" in rae_out or not rae_out.strip():
-        services.append({
-            "name": "Remote Apple Events",
-            "enabled": None,
-            "risk": "UNKNOWN",
-            "note": "Unknown — re-run this audit with sudo to determine its state.",
-        })
-    elif "remote apple events: on" in rae_out:
+    if "remote apple events: on" in rae_out:
         services.append({
             "name": "Remote Apple Events",
             "enabled": True,
             "risk": "REVIEW",
             "note": "Allows remote AppleScript control.",
         })
-    else:
+    elif "remote apple events:" in rae_out and "administrator" not in rae_out:
         services.append({
             "name": "Remote Apple Events",
             "enabled": False,
             "risk": "OK",
             "note": "Disabled.",
         })
+    else:
+        loaded = _launchd_loaded("com.apple.AEServer")
+        listening = check_port("127.0.0.1", 3031, timeout=0.4)
+        if loaded or listening:
+            services.append({
+                "name": "Remote Apple Events",
+                "enabled": True,
+                "risk": "REVIEW",
+                "note": ("Allows remote AppleScript control (launchd has the AEServer "
+                         "service loaded; systemsetup needs sudo to say more)."),
+            })
+        elif loaded is False:
+            services.append({
+                "name": "Remote Apple Events",
+                "enabled": False,
+                "risk": "OK",
+                "note": ("Disabled (launchd has no AEServer service loaded; systemsetup "
+                         "needs sudo to say more)."),
+            })
+        else:
+            services.append({
+                "name": "Remote Apple Events",
+                "enabled": None,
+                "risk": "UNKNOWN",
+                "note": "Unknown — re-run this audit with sudo to determine its state.",
+            })
 
     # mDNS / Bonjour: always on; informational.
     services.append({
@@ -8044,14 +8293,20 @@ def upnp_device_names(ips, wait=3.0, max_fetches=24):
 
     def fetch(item):
         ip, (port, path) = item
-        got = _http_get_plain(ip, port, path, timeout=3.0)
-        if not got or got[0] != 200:
-            return ip, ""
-        body = got[2]
-        for tag in ("friendlyName", "modelName"):
-            m = re.search(fr"<{tag}>\s*([^<]{{1,200}}?)\s*</{tag}>", body)
-            if m:
-                return ip, _device_name_text(html.unescape(m.group(1)))
+        try:
+            got = _http_get_plain(ip, port, path, timeout=3.0)
+            if not got or got[0] != 200:
+                return ip, ""
+            body = got[2]
+            for tag in ("friendlyName", "modelName"):
+                text = _xml_text(body, tag, 200)
+                if text:
+                    return ip, _device_name_text(html.unescape(text))
+        except Exception:                               # noqa: BLE001
+            # The description is the device's to write. One that breaks the
+            # reader costs that device its name, not every device theirs: an
+            # exception out of pool.map used to drop the whole UPnP source.
+            pass
         return ip, ""
 
     names = {}
@@ -8257,7 +8512,8 @@ def action_compare_baseline(state):
         # Reads both channels: a monitor-only deployment publishes heartbeats
         # for weeks without a single baseline receipt, and that is exactly where
         # an edited script has the longest to go unnoticed.
-        _code = describe_code_attestation(read_receipts(_sink))
+        _code = describe_code_attestation(read_receipts(_sink), current=script_digest(),
+                                          chain=chain_id())
         if _code:
             print(_code)
     old = load_baseline()
@@ -8288,6 +8544,9 @@ def action_compare_baseline(state):
     _back = describe_returning_devices(old, state, load_labels())
     if _back:
         print(_back)
+    _held = describe_unconfirmed_listeners(old, state)
+    if _held:
+        print(_held)
 
 
 # ---------------------------------------------------------------------------
@@ -8573,7 +8832,8 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         # Reads both channels: a monitor-only deployment publishes heartbeats
         # for weeks without a single baseline receipt, and that is exactly where
         # an edited script has the longest to go unnoticed.
-        _code = describe_code_attestation(read_receipts(_sink))
+        _code = describe_code_attestation(read_receipts(_sink), current=script_digest(),
+                                          chain=chain_id())
         if _code:
             tell(_code)
     old = load_baseline()
@@ -8595,6 +8855,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         _back = describe_returning_devices(old, state, load_labels())
         if _back:
             tell(_back)
+        _held = describe_unconfirmed_listeners(old, state)
+        if _held:
+            tell(_held)
     else:
         tell("No baseline saved yet. Use option 5 after reviewing results.")
 
@@ -8966,6 +9229,7 @@ def _main():
             tell(describe_modified_save_refusal())
         else:
             _record = save_baseline(state, passphrase=passphrase)
+            _RUN_PROGRESS["baseline_saved"] = True
             tell(f"\nBaseline saved to {BASELINE_FILE}")
             _pub = describe_publish_result(_record.get("_receipt"))
             if _pub:
@@ -8976,7 +9240,15 @@ def _main():
 
     if args.html_report:
         path = generate_html_report(state)
+        _RUN_PROGRESS["report_written"] = True
         print(f"HTML report saved to {path}")
+
+
+# What _main got done before an error, for main()'s abort line to read. The
+# baseline, its chain and the receipt are written before the HTML report, so
+# a renderer that raised used to produce a failure notice saying no baseline
+# existed while the sealed chain had already moved on.
+_RUN_PROGRESS = {"baseline_saved": False, "report_written": False}
 
 
 def main():
@@ -8988,14 +9260,20 @@ def main():
     HIGH and the exit code is non-zero, so the scheduled wrapper can send word
     that the audit did not run to completion.
     """
+    _RUN_PROGRESS.update(baseline_saved=False, report_written=False)
     try:
         _main()
     except KeyboardInterrupt:
         raise
     except Exception:                                   # noqa: BLE001 - the last line of defence
         import traceback
-        print("\n  [HIGH  ] AUDIT ABORTED by an unexpected error before it completed. "
-              "No baseline was saved and no report was written for this run.")
+        if _RUN_PROGRESS.get("baseline_saved"):
+            what = ("The baseline WAS saved before the error, so its chain has moved on; "
+                    + ("the HTML report was written." if _RUN_PROGRESS.get("report_written")
+                       else "the HTML report was NOT written."))
+        else:
+            what = "No baseline was saved and no report was written for this run."
+        print(f"\n  [HIGH  ] AUDIT ABORTED by an unexpected error before it completed. {what}")
         traceback.print_exc()
         sys.exit(2)
 

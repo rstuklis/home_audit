@@ -91,6 +91,22 @@ def _patch_sharing(monkeypatch, mod, launchd=None, print_disabled=None,
     return fake_subprocess, fake_run, fake_check_port
 
 
+def _launchctl_unavailable(monkeypatch, mod, systemsetup=NEEDS_ADMIN, open_ports=()):
+    """systemsetup blocked AND launchctl failing for the AEServer label.
+
+    Since the Remote Apple Events row learned to ask launchd, this is the only
+    configuration in which it may still read UNKNOWN.
+    """
+    _patch_sharing(monkeypatch, mod, systemsetup=systemsetup, open_ports=open_ports)
+
+    def broken(cmd, *args, **kwargs):
+        joined = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+        if "system/com.apple.AEServer" in joined:
+            raise FileNotFoundError(2, "No such file or directory: 'launchctl'")
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+    monkeypatch.setattr(subprocess, "run", broken)
+
+
 def _by_name(services, name):
     matches = [s for s in services if s["name"] == name]
     assert len(matches) == 1, f"expected exactly one {name!r}, got {len(matches)}"
@@ -455,15 +471,58 @@ class TestSharingServicesSMB:
 # check_sharing_services - Remote Apple Events
 # ---------------------------------------------------------------------------
 
-class TestSharingServicesRemoteAppleEvents:
-    def test_admin_access_message_reports_unknown_not_off(self, mod, monkeypatch):
-        """Regression, commit 4c349fd (home_net_audit.py:1459).
+AESERVER = "com.apple.AEServer"
 
-        `systemsetup -getremoteappleevents` needs admin rights and otherwise
-        prints an admin-access notice on stdout with EXIT CODE 0. The old code
-        parsed that as a value and reported a confident, false OFF.
-        """
+
+class TestLaunchdLoaded:
+    def test_a_loaded_idle_service_is_loaded(self, mod, monkeypatch):
+        # AEServer is started on demand: loaded and "not running" while on.
+        monkeypatch.setattr(subprocess, "run", make_subprocess_run(
+            {"launchctl print system/" + AESERVER: _print_dump(AESERVER, "not running")}))
+        assert mod._launchd_loaded(AESERVER) is True
+
+    def test_an_unloaded_label_is_not_loaded(self, mod, monkeypatch):
+        monkeypatch.setattr(subprocess, "run", make_subprocess_run(
+            {"launchctl print system/" + AESERVER: (113, "")}))
+        assert mod._launchd_loaded(AESERVER) is False
+
+    def test_a_failed_launchctl_is_none_not_off(self, mod, monkeypatch):
+        def broken(cmd, *a, **k):
+            raise FileNotFoundError(2, "launchctl")
+        monkeypatch.setattr(subprocess, "run", broken)
+        assert mod._launchd_loaded(AESERVER) is None
+
+
+class TestSharingServicesRemoteAppleEvents:
+    """Without sudo, `systemsetup -getremoteappleevents` prints an admin-access
+    notice on stdout with EXIT CODE 0 (commit 4c349fd read that as a false
+    OFF). The row then read UNKNOWN on every unattended run, for ever, on both
+    Macs. It now asks launchd — the same unprivileged question the SSH row
+    asks — and probes the eppc port, and keeps UNKNOWN for the case where
+    launchctl itself cannot be asked.
+    """
+
+    def test_admin_access_message_defers_to_launchd_not_loaded_is_off(self, mod, monkeypatch):
         _patch_sharing(monkeypatch, mod, systemsetup=NEEDS_ADMIN)
+        rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
+        assert rae["enabled"] is False
+        assert rae["risk"] == "OK"
+        assert "launchd" in rae["note"]
+
+    def test_admin_access_message_with_the_service_loaded_is_on(self, mod, monkeypatch):
+        _patch_sharing(monkeypatch, mod, systemsetup=NEEDS_ADMIN,
+                       launchd={AESERVER: _print_dump(AESERVER, "not running")})
+        rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
+        assert rae["enabled"] is True
+        assert rae["risk"] == "REVIEW"
+
+    def test_a_listener_on_the_eppc_port_is_on_whatever_launchd_says(self, mod, monkeypatch):
+        _patch_sharing(monkeypatch, mod, systemsetup=NEEDS_ADMIN, open_ports=[3031])
+        rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
+        assert rae["enabled"] is True
+
+    def test_admin_access_message_and_no_launchctl_is_unknown_not_off(self, mod, monkeypatch):
+        _launchctl_unavailable(monkeypatch, mod)
         rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
         assert rae["enabled"] is None
         assert rae["risk"] == "UNKNOWN"
@@ -471,10 +530,14 @@ class TestSharingServicesRemoteAppleEvents:
 
     @pytest.mark.parametrize("output", ["", "\n", "   \n\t\n"],
                              ids=["empty", "newline-only", "whitespace-only"])
-    def test_empty_systemsetup_output_reports_unknown(self, mod, monkeypatch, output):
+    def test_empty_systemsetup_output_defers_to_launchd(self, mod, monkeypatch, output):
         # run() returns "" when the binary is missing or the call timed out;
-        # "no answer" is not the same as "off".
-        _patch_sharing(monkeypatch, mod, systemsetup=output)
+        # "no answer" is not "off" — launchd decides, and if it cannot be
+        # asked either the row stays UNKNOWN.
+        _patch_sharing(monkeypatch, mod, systemsetup=output,
+                       launchd={AESERVER: _print_dump(AESERVER, "not running")})
+        assert _by_name(mod.check_sharing_services(), "Remote Apple Events")["enabled"] is True
+        _launchctl_unavailable(monkeypatch, mod, systemsetup=output)
         rae = _by_name(mod.check_sharing_services(), "Remote Apple Events")
         assert rae["enabled"] is None
         assert rae["risk"] == "UNKNOWN"
@@ -492,9 +555,9 @@ class TestSharingServicesRemoteAppleEvents:
         assert rae["risk"] == "OK"
 
     def test_unknown_is_not_reported_as_off(self, mod, monkeypatch):
-        # The whole point of the tri-state: the admin-blocked answer and the
-        # genuine Off answer must not produce the same row.
-        _patch_sharing(monkeypatch, mod, systemsetup=NEEDS_ADMIN)
+        # The whole point of the tri-state: an answer that could not be had
+        # and the genuine Off answer must not produce the same row.
+        _launchctl_unavailable(monkeypatch, mod)
         blocked = _by_name(mod.check_sharing_services(), "Remote Apple Events")
         _patch_sharing(monkeypatch, mod, systemsetup="Remote Apple Events: Off\n")
         genuinely_off = _by_name(mod.check_sharing_services(), "Remote Apple Events")
@@ -561,7 +624,7 @@ class TestSharingServicesReportShape:
         # audit must not claim a listener is disabled when it could not look.
         _patch_sharing(monkeypatch, mod, **self.ALL_OFF)
         off_note = _by_name(mod.check_sharing_services(), "Remote Apple Events")["note"]
-        _patch_sharing(monkeypatch, mod, **self.BLOCKED)
+        _launchctl_unavailable(monkeypatch, mod)
         blocked = _by_name(mod.check_sharing_services(), "Remote Apple Events")
         assert blocked["enabled"] is None
         assert blocked["note"] != off_note

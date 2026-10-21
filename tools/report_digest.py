@@ -124,7 +124,13 @@ def fingerprint(network, item):
     Numbers, addresses and digests inside a standing item move every week (a
     timestamp, a count, a hash), and must not make it look new.
     """
-    text = re.sub(r"[0-9a-f]{6,}…?|\d+", "#", item["text"].lower())
+    lowered = item["text"].lower()
+    text = re.sub(r"[0-9a-f]{6,}…?|\d+", "#", lowered)
+    # The audit-code line is the one place a digest IS the identity: the same
+    # wording with another pair of digests is another change, and the TL;DR has
+    # to call a second edit new rather than file it under the first.
+    if lowered.startswith("audit code:"):
+        text += "|" + ",".join(re.findall(r"\b[0-9a-f]{12}…", lowered))
     return f"{network}|{item['section']}|{item['risk']}|{text}"
 
 
