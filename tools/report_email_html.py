@@ -216,8 +216,13 @@ class _Page:
             f'<span style="{BAND_SUB}">{sub}</span></div>')
 
 
-def render(text):
-    """The full HTML document for one plain-text audit email."""
+def render(text, site=None):
+    """The full HTML document for one plain-text audit email.
+
+    `site` names the house the report is about ("beach house") when more than
+    one Mac mails the same inbox; it goes into the heading and the tab title,
+    and nowhere else, so a report without one renders exactly as before.
+    """
     lines = text.splitlines()
     page = _Page()
     generated = ""
@@ -274,17 +279,18 @@ def render(text):
     page.close()
 
     head_sub = html.escape(generated) if generated else ""
+    where = f" — {html.escape(site)}" if site else ""
     body = "\n".join(page.parts)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Home Network Audit Report</title>
+<title>Home Network Audit Report{where}</title>
 </head>
 <body style="margin:0;padding:0;background:{PAGE_BG};{KEEP_COLOUR}">
 <div style="max-width:960px;margin:0 auto;padding:24px 16px;background:{PAGE_BG};font-family:{FONT};color:{TEXT};{KEEP_COLOUR}">
-<h1 style="font-family:{FONT};color:{TEXT};font-size:26px;font-weight:700;border-bottom:3px solid {BLUE};padding-bottom:10px;margin:0 0 10px 0;">&#127968; Home Network Audit Report</h1>
+<h1 style="font-family:{FONT};color:{TEXT};font-size:26px;font-weight:700;border-bottom:3px solid {BLUE};padding-bottom:10px;margin:0 0 10px 0;">&#127968; Home Network Audit Report{where}</h1>
 <p style="font-family:{FONT};color:{TEXT};font-size:14px;margin:0 0 20px 0;">Generated: {head_sub} &nbsp;|&nbsp; Tool: home_net_audit.py</p>
 {body}
 <div style="font-family:{FONT};text-align:center;color:{MUTED};font-size:12px;margin-top:32px;">

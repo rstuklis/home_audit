@@ -313,6 +313,56 @@ def wrap(text, width=92, indent="  "):
     return "\n".join(lines)
 
 
+def digest(report_paths, state=None, skipped=(), claude=False):
+    """The whole block, as one string: the facts, then Claude's paragraph if
+    asked for and available. Moves the state file's "previous report" marker
+    on, as the command line always has; `tools/audit_mail.py` calls this
+    directly so the email and the command line cannot drift apart."""
+    skipped = list(skipped)
+    reports, full = [], []
+    for path in report_paths:
+        try:
+            with open(path, errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            skipped.append(f"{os.path.basename(path)}: report unreadable ({e})")
+            continue
+        full.append(text)
+        reports.append(parse_report(text, os.path.basename(path)))
+
+    previous = None
+    if state:
+        try:
+            with open(state) as f:
+                saved = json.load(f)
+            if isinstance(saved, dict) and isinstance(saved.get("flagged"), list):
+                previous = [x for x in saved["flagged"] if isinstance(x, str)]
+        except (OSError, ValueError):
+            previous = None
+
+    facts, fps = build_facts(reports, skipped, previous)
+    out = [facts]
+
+    if claude and reports:
+        paragraph, note = claude_paragraph("\n".join(full), facts)
+        out.append("")
+        if paragraph:
+            out.append("  IN PLAIN ENGLISH — written by Claude from the report below. If it "
+                       "disagrees with the")
+            out.append("  block above, the block is right.")
+            out.append(wrap(paragraph, indent="    "))
+        else:
+            out.append(f"  (No plain-English paragraph this time: {note}.)")
+
+    # Only a run that audited something may move the "previous report" marker.
+    if state and reports:
+        tmp = state + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"flagged": fps}, f, indent=1)
+        os.replace(tmp, state)
+    return "\n".join(out)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="TL;DR block for the audit email.")
     ap.add_argument("reports", nargs="*")
@@ -320,48 +370,7 @@ def main(argv=None):
     ap.add_argument("--skipped", action="append", default=[], metavar="NET: REASON")
     ap.add_argument("--claude", action="store_true", help="add a paragraph written by Claude")
     args = ap.parse_args(argv)
-
-    reports, full = [], []
-    for path in args.reports:
-        try:
-            with open(path, errors="replace") as f:
-                text = f.read()
-        except OSError as e:
-            args.skipped.append(f"{os.path.basename(path)}: report unreadable ({e})")
-            continue
-        full.append(text)
-        reports.append(parse_report(text, os.path.basename(path)))
-
-    previous = None
-    if args.state:
-        try:
-            with open(args.state) as f:
-                saved = json.load(f)
-            if isinstance(saved, dict) and isinstance(saved.get("flagged"), list):
-                previous = [x for x in saved["flagged"] if isinstance(x, str)]
-        except (OSError, ValueError):
-            previous = None
-
-    facts, fps = build_facts(reports, args.skipped, previous)
-    print(facts)
-
-    if args.claude and reports:
-        paragraph, note = claude_paragraph("\n".join(full), facts)
-        print("")
-        if paragraph:
-            print("  IN PLAIN ENGLISH — written by Claude from the report below. If it "
-                  "disagrees with the")
-            print("  block above, the block is right.")
-            print(wrap(paragraph, indent="    "))
-        else:
-            print(f"  (No plain-English paragraph this time: {note}.)")
-
-    # Only a run that audited something may move the "previous report" marker.
-    if args.state and reports:
-        tmp = args.state + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"flagged": fps}, f, indent=1)
-        os.replace(tmp, args.state)
+    print(digest(args.reports, args.state, args.skipped, args.claude))
     return 0
 
 

@@ -1,0 +1,404 @@
+"""tools/audit_mail.py — the one email both Macs send.
+
+The city Mac's email is the one the owner reads on a phone: the TL;DR, a
+version check, then each network's report as cards, text and HTML in one
+message and nothing attached. The beach Mac attached a PDF and sent the rest
+through Mail.app. This tool composes and sends the city email for both, from
+the iCloud address in the Keychain, the way the SMSF screener already does.
+"""
+
+import importlib.util
+import smtplib
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+TOOLS = Path(__file__).resolve().parent.parent / "tools"
+
+
+@pytest.fixture(scope="module")
+def am():
+    spec = importlib.util.spec_from_file_location("audit_mail", TOOLS / "audit_mail.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["audit_mail"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def eh():
+    spec = importlib.util.spec_from_file_location("report_email_html_am", TOOLS / "report_email_html.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+REPORT = """================================================================
+NETWORK INTERFACES
+================================================================
+  Your Mac's primary IP : 192.168.86.21
+  Default gateway       : 192.168.86.1
+
+================================================================
+ROUTER / GATEWAY PORT SCAN
+================================================================
+  [MEDIUM]    80  HTTP admin     Unencrypted web admin page.
+
+================================================================
+CONNECTED DEVICES
+================================================================
+  Total: 18 device(s) across 1 subnet(s) scanned.
+  5 unidentified device(s). Tag them with:
+
+================================================================
+CHANGE DETECTION (vs saved baseline)
+================================================================
+  [OK    ] Baseline integrity: Seal verified.
+Baseline from: 2026-10-20T11:12:56+00:00
+{verdict}
+
+================================================================
+Full audit complete. This is a snapshot, not a guarantee.
+"""
+
+
+@pytest.fixture
+def report(tmp_path):
+    def write(name="loveshack-h", verdict="No changes since baseline."):
+        path = tmp_path / f"{name}.txt"
+        path.write_text(REPORT.format(verdict=verdict), encoding="utf-8")
+        return f"{name}={path}"
+    return write
+
+
+# ---------------------------------------------------------------------------
+# Composing: the city layout
+# ---------------------------------------------------------------------------
+
+class TestCompose:
+    def test_the_layout_is_the_city_one(self, am, report):
+        body = am.compose([report()], site="beach house")
+        lines = body.splitlines()
+        assert lines[0] == "#" * 64 and lines[1].startswith("# Home network audit — 20") and lines[2] == "#" * 64
+        assert any(line.startswith("TL;DR") for line in lines)
+        assert "# NETWORK: loveshack-h — " in body and "   ip 192.168.86.21" in body
+        # The section itself (its boxed header), not its mention in the TL;DR.
+        assert body.index("TL;DR") < body.index("# NETWORK:") < body.index("ROUTER / GATEWAY PORT SCAN\n====")
+
+    def test_the_digest_names_the_network_not_the_file(self, am, report):
+        body = am.compose([report()])
+        assert "Networks audited : 1 of 1   (loveshack-h)" in body
+        assert "loveshack-h  no changes   18 devices, 5 unidentified" in body
+
+    def test_three_networks_in_the_order_given(self, am, report):
+        body = am.compose([report("loveshack"), report("loveshack-iot"), report("pearl")])
+        assert "Networks audited : 3 of 3   (loveshack, loveshack-iot, pearl)" in body
+        assert body.index("# NETWORK: loveshack —") < body.index("# NETWORK: loveshack-iot —") < body.index("# NETWORK: pearl —")
+
+    def test_an_unreadable_report_is_named_as_not_audited(self, am, report, tmp_path):
+        body = am.compose([report(), f"pearl={tmp_path / 'absent.txt'}"])
+        assert "Networks audited : 1 of 2" in body and "pearl" in body and "NOT AUDITED" in body
+
+    def test_the_version_check_card_follows_the_digest(self, am, report):
+        def git(cmd, **kw):
+            text = " ".join(cmd)
+            out = "0\t0\n" if "rev-list" in text else ""
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        body = am.compose([report()], repo="/some/checkout", runner=git)
+        assert "\nVERSION CHECK\n  Up to date with origin/master.\n" in body
+        assert body.index("TL;DR") < body.index("VERSION CHECK") < body.index("# NETWORK:")
+
+    def test_no_repo_no_version_card(self, am, report):
+        assert "VERSION CHECK" not in am.compose([report()])
+
+    def test_a_spec_must_name_the_network(self, am):
+        with pytest.raises(am.MailError):
+            am.parse_spec("=x.txt")
+        assert am.parse_spec("/tmp/pearl.txt") == ("pearl", "/tmp/pearl.txt")
+
+
+class TestVersionCheck:
+    def _runner(self, behind=0, ahead=0, dirty="", fetch_rc=0):
+        def git(cmd, **kw):
+            text = " ".join(cmd)
+            if "fetch" in text:
+                return subprocess.CompletedProcess(cmd, fetch_rc, "", "could not resolve host" if fetch_rc else "")
+            if "rev-list" in text:
+                return subprocess.CompletedProcess(cmd, 0, f"{ahead}\t{behind}\n", "")
+            return subprocess.CompletedProcess(cmd, 0, dirty, "")
+        return git
+
+    def test_up_to_date(self, am):
+        assert am.version_check("/r", self._runner()) == "Up to date with origin/master."
+
+    def test_behind_says_to_update(self, am):
+        assert am.version_check("/r", self._runner(behind=3)) == "3 commit(s) behind origin/master — run the update."
+
+    def test_local_edits_are_named(self, am):
+        assert "local edits" in am.version_check("/r", self._runner(dirty=" M home_net_audit.py"))
+
+    def test_a_failed_fetch_is_a_line_not_an_error(self, am):
+        assert am.version_check("/r", self._runner(fetch_rc=128)).startswith("Could not fetch origin/master")
+
+    def test_a_hung_git_is_a_line_not_an_error(self, am):
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 20)
+        assert am.version_check("/r", hang).startswith("Could not check the version")
+
+
+# ---------------------------------------------------------------------------
+# The subject
+# ---------------------------------------------------------------------------
+
+class TestSubject:
+    def test_changes_detected_wins(self, am, report):
+        body = am.compose([report("a"), report("b", "CHANGES DETECTED:\n  ! NEW device(s) since baseline: aa:bb")])
+        assert am.subject_for(body, None, "2026-10-25") == "[Home Net Audit] 2026-10-25 — CHANGES DETECTED"
+
+    def test_no_changes_and_the_site(self, am, report):
+        body = am.compose([report()])
+        assert am.subject_for(body, "beach house", "2026-10-25") == "[Home Net Audit] 2026-10-25 — beach house — no changes"
+
+    def test_an_unreadable_network_makes_it_incomplete(self, am, report, tmp_path):
+        body = am.compose([report(), f"pearl={tmp_path / 'absent.txt'}"])
+        assert am.verdict(body) == "AUDIT INCOMPLETE"
+
+    def test_a_first_audit(self, am, report):
+        body = am.compose([report(verdict="No baseline saved yet.")])
+        assert am.verdict(body) == "first audit"
+
+    def test_a_device_cannot_write_the_subject(self, am, report):
+        # Only the per-network lines above "Flagged items" are read.
+        body = am.compose([report()]).replace("FLAGGED ITEMS: 1", "FLAGGED ITEMS: 1 CHANGES DETECTED")
+        assert am.verdict(body) == "no changes"
+
+    def test_no_digest_no_verdict(self, am):
+        assert am.verdict("just text") == "report"
+
+
+# ---------------------------------------------------------------------------
+# The message and the send
+# ---------------------------------------------------------------------------
+
+class TestMessage:
+    def test_text_and_html_in_one_message_nothing_attached(self, am, report):
+        body = am.compose([report()], site="beach house")
+        msg = am.build_message("me@mac.com", ["you@mac.com"], body, site="beach house", today="2026-10-25")
+        assert msg.get_content_type() == "multipart/alternative"
+        assert [p.get_content_type() for p in msg.iter_parts()] == ["text/plain", "text/html"]
+        assert list(msg.iter_attachments()) == []
+        assert msg["From"] == "me@mac.com" and msg["To"] == "you@mac.com"
+        assert msg["Subject"] == "[Home Net Audit] 2026-10-25 — beach house — no changes"
+        assert msg["Date"] and msg["Message-ID"].endswith("@mac.com>")
+        assert msg.get_body(preferencelist=("plain",)).get_content() == body
+        html = msg.get_body(preferencelist=("html",)).get_content()
+        assert "Home Network Audit Report — beach house" in html and "loveshack-h" in html
+
+    def test_the_html_heading_names_the_site_only_when_given(self, eh):
+        plain = eh.render("TL;DR — x\n  Networks audited : 1 of 1\n")
+        assert "Home Network Audit Report</h1>" in plain and " — " not in plain.split("</h1>")[0].rsplit(">", 1)[1]
+        assert "Home Network Audit Report — beach house</h1>" in eh.render("TL;DR — x\n", site="beach house")
+        assert "<title>Home Network Audit Report — beach house</title>" in eh.render("x", site="beach house")
+
+
+class FakeSMTP:
+    instances = []
+
+    def __init__(self, host, port, timeout=None, fail=None):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.calls = []
+        FakeSMTP.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def ehlo(self):
+        self.calls.append("ehlo")
+
+    def starttls(self, context=None):
+        self.calls.append("starttls")
+        assert context is not None
+
+    def login(self, user, password):
+        self.calls.append(("login", user, password))
+        if password == "wrong":
+            raise smtplib.SMTPAuthenticationError(535, b"5.7.8 Authentication failed")
+
+    def send_message(self, msg):
+        self.calls.append(("send", msg["Subject"]))
+
+
+class TestSend:
+    def test_starttls_login_send(self, am):
+        FakeSMTP.instances.clear()
+        msg = am.new_message("me@mac.com", ["you@mac.com"], "s")
+        am.send(msg, "me@mac.com", "pw", smtp_class=FakeSMTP)
+        smtp = FakeSMTP.instances[-1]
+        assert (smtp.host, smtp.port, smtp.timeout) == ("smtp.mail.me.com", 587, 60)
+        assert smtp.calls == ["ehlo", "starttls", "ehlo", ("login", "me@mac.com", "pw"), ("send", "s")]
+
+    def test_a_refused_sign_in_says_how_to_fix_it(self, am):
+        msg = am.new_message("me@mac.com", ["you@mac.com"], "s")
+        with pytest.raises(am.MailError, match="app-specific password.*--install --reset-mail"):
+            am.send(msg, "me@mac.com", "wrong", smtp_class=FakeSMTP)
+
+    def test_a_network_failure_is_retried_once_on_a_scheduled_run(self, am, monkeypatch):
+        attempts = []
+
+        class Flaky(FakeSMTP):
+            def __init__(self, host, port, timeout=None):
+                super().__init__(host, port, timeout)
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise OSError("Network is unreachable")
+        monkeypatch.setattr(am.time, "sleep", lambda s: None)
+        msg = am.new_message("me@mac.com", ["you@mac.com"], "s")
+        am.send(msg, "me@mac.com", "pw", retry_wait=90.0, smtp_class=Flaky)
+        assert len(attempts) == 2
+
+    def test_without_a_retry_wait_a_failure_is_an_error(self, am):
+        class Down(FakeSMTP):
+            def __init__(self, host, port, timeout=None):
+                raise OSError("Network is unreachable")
+        msg = am.new_message("me@mac.com", ["you@mac.com"], "s")
+        with pytest.raises(am.MailError, match="could not send through smtp.mail.me.com:587"):
+            am.send(msg, "me@mac.com", "pw", smtp_class=Down)
+
+
+# ---------------------------------------------------------------------------
+# The Keychain
+# ---------------------------------------------------------------------------
+
+class FakeSecurity:
+    def __init__(self, items=None):
+        self.items = dict(items or {})        # service -> (account, password)
+        self.calls = []
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(cmd)
+        verb, args = cmd[1], cmd[2:]
+        service = args[args.index("-s") + 1] if "-s" in args else None
+        if verb == "find-generic-password":
+            if service not in self.items:
+                return subprocess.CompletedProcess(cmd, 44, "", "security: SecKeychainSearchCopyNext: The specified item could not be found.")
+            acct, pw = self.items[service]
+            if "-w" in args:
+                return subprocess.CompletedProcess(cmd, 0, pw + "\n", "")
+            return subprocess.CompletedProcess(cmd, 0, f'attributes:\n    "acct"<blob>="{acct}"\n    "svce"<blob>="{service}"\n', "")
+        if verb == "delete-generic-password":
+            if service in self.items:
+                del self.items[service]
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 44, "", "not found")
+        if verb == "add-generic-password":
+            self.items[service] = (args[args.index("-a") + 1], args[args.index("-w") + 1])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(cmd)
+
+
+class TestKeychain:
+    def test_nothing_stored_is_none(self, am, monkeypatch):
+        monkeypatch.setattr(am.subprocess, "run", FakeSecurity())
+        assert am.keychain_mail_account() is None
+
+    def test_store_read_forget(self, am, monkeypatch):
+        fake = FakeSecurity()
+        monkeypatch.setattr(am.subprocess, "run", fake)
+        am.keychain_store("rob@mac.com", "abcd-efgh-ijkl-mnop")
+        assert am.keychain_mail_account() == ("rob@mac.com", "abcd-efgh-ijkl-mnop")
+        assert fake.items == {"home_net_audit-mail": ("rob@mac.com", "abcd-efgh-ijkl-mnop")}
+        assert am.keychain_forget() == 1 and am.keychain_mail_account() is None
+
+    def test_a_locked_keychain_is_an_error_not_nothing_stored(self, am, monkeypatch):
+        monkeypatch.setattr(am.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+            cmd, 36, "", "security: SecKeychainSearchCopyNext: User interaction is not allowed."))
+        with pytest.raises(am.MailError, match="Lock when sleeping"):
+            am.keychain_mail_account()
+
+    def test_another_service_can_be_named(self, am, monkeypatch):
+        monkeypatch.setattr(am.subprocess, "run", FakeSecurity({"homenetaudit-smtp": ("r@gmail.com", "pw")}))
+        assert am.keychain_mail_account("homenetaudit-smtp") == ("r@gmail.com", "pw")
+        assert am.keychain_mail_account() is None
+
+
+# ---------------------------------------------------------------------------
+# The command line, as the wrappers call it
+# ---------------------------------------------------------------------------
+
+class TestCli:
+    @pytest.fixture
+    def wired(self, am, monkeypatch):
+        sent = []
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service=am.KEYCHAIN_SERVICE: ("me@mac.com", "pw"))
+        monkeypatch.setattr(am, "send", lambda msg, sender, pw, host, port, retry_wait=None, smtp_class=None:
+                            sent.append((msg, sender, host, port, retry_wait)))
+        return sent
+
+    def test_send_composes_sends_and_keeps_the_body(self, am, wired, report, tmp_path, capsys):
+        saved = tmp_path / "last_run.txt"
+        rc = am.main(["send", "--to", "rstuklis@mac.com", "--site", "beach house",
+                      "--save-body", str(saved), report()])
+        assert rc == 0
+        msg, sender, host, port, retry = wired[0]
+        assert msg["To"] == "rstuklis@mac.com" and sender == "me@mac.com" and (host, port) == ("smtp.mail.me.com", 587)
+        assert retry == 90.0
+        assert msg["Subject"].startswith("[Home Net Audit] ") and msg["Subject"].endswith(" — beach house — no changes")
+        assert saved.read_text(encoding="utf-8").startswith("#" * 64)
+        assert "EMAIL SENT to rstuklis@mac.com  (subject: [Home Net Audit]" in capsys.readouterr().out
+
+    def test_send_takes_an_assembled_body(self, am, wired, tmp_path):
+        body = tmp_path / "body.txt"
+        body.write_text("TL;DR — x\n  Networks audited : 1 of 1   (loveshack)\n    loveshack  CHANGES DETECTED\n", encoding="utf-8")
+        assert am.main(["send", "--to", "a@b", "--body", str(body)]) == 0
+        assert wired[0][0]["Subject"].endswith(" — CHANGES DETECTED")
+
+    def test_to_before_or_after_the_command_both_count(self, am, wired, report):
+        assert am.main(["--to", "a@b", "send", "--to", "c@d", report()]) == 0
+        assert wired[0][0]["To"] == "a@b, c@d"
+
+    def test_the_sender_is_the_recipient_when_none_is_given(self, am, wired, report):
+        assert am.main(["send", report()]) == 0
+        assert wired[0][0]["To"] == "me@mac.com"
+
+    def test_another_server_and_keychain_item(self, am, monkeypatch, report):
+        seen = {}
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service: seen.setdefault("service", service) and ("r@gmail.com", "pw"))
+        monkeypatch.setattr(am, "send", lambda msg, sender, pw, host, port, **k: seen.update(host=host, port=port))
+        assert am.main(["--smtp", "smtp.gmail.com:587", "--keychain", "homenetaudit-smtp", "send", "--to", "a@b", report()]) == 0
+        assert seen == {"service": "homenetaudit-smtp", "host": "smtp.gmail.com", "port": 587}
+
+    def test_notify_appends_the_tail_of_a_log(self, am, wired, tmp_path):
+        log = tmp_path / "run.log"
+        log.write_text("\n".join(f"line {n}" for n in range(100)), encoding="utf-8")
+        rc = am.main(["notify", "--to", "a@b", "--subject", "[Home Net Audit] the audit did not run",
+                      "--message", "exit 2", "--text", str(log), "--tail", "3"])
+        assert rc == 0
+        msg = wired[0][0]
+        assert msg["Subject"] == "[Home Net Audit] the audit did not run"
+        assert msg.get_content() == "exit 2\n\nline 97\nline 98\nline 99\n"
+        assert msg.get_content_type() == "text/plain"
+
+    def test_nothing_in_the_keychain_is_a_plain_message_and_exit_1(self, am, monkeypatch, report, capsys):
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service=None: None)
+        assert am.main(["send", "--to", "a@b", report()]) == 1
+        assert "--install first" in capsys.readouterr().err
+
+    def test_send_needs_reports_or_a_body(self, am, wired, capsys):
+        assert am.main(["send", "--to", "a@b"]) == 1
+        assert "NAME=REPORT.txt" in capsys.readouterr().err
+
+    def test_forget_mail(self, am, monkeypatch, capsys):
+        monkeypatch.setattr(am.subprocess, "run", FakeSecurity({"home_net_audit-mail": ("a@b", "pw")}))
+        assert am.main(["--forget-mail"]) == 0
+        assert "Removed 1 stored item(s)." in capsys.readouterr().out
+
+    def test_install_outside_a_terminal_refuses_plainly(self, am, monkeypatch, capsys):
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service=None: None)
+        monkeypatch.setattr(am.sys.stdin, "isatty", lambda: False)
+        assert am.main(["--install"]) == 1
+        assert "run --install in Terminal" in capsys.readouterr().err
