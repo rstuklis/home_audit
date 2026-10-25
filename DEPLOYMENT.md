@@ -390,7 +390,12 @@ since the previous report" mean something. `--claude` adds the plain-English
 paragraph when the Claude CLI is on the Mac, and goes without it when not.
 `--repo` prints the version check. `--save-body` keeps the text that was
 sent, `--save-html` the same report as the city Mac's HTML page, to open in a
-browser. `--site` goes into the subject and the page heading, so the two
+browser. When the send fails — the Mac woke without its network, Mail.app
+was waiting on a dialog — nothing moves on: the memory of the previous
+report is put back so next week's email still calls those items new, the
+last email that was sent stays in `last_run.txt`, and the one that did not go
+is kept beside it as `last_run.txt.unsent`, which the tool's own message
+says how to send by hand (`send --body`). `--site` goes into the subject and the page heading, so the two
 Macs' emails can be told apart: `[Home Net Audit] 2026-10-25 — beach house —
 no changes`.
 

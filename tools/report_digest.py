@@ -355,11 +355,17 @@ def digest(report_paths, state=None, skipped=(), claude=False):
             out.append(f"  (No plain-English paragraph this time: {note}.)")
 
     # Only a run that audited something may move the "previous report" marker.
+    # A marker that cannot be written costs that memory, not the block above it.
     if state and reports:
-        tmp = state + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"flagged": fps}, f, indent=1)
-        os.replace(tmp, state)
+        try:
+            tmp = state + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"flagged": fps}, f, indent=1)
+            os.replace(tmp, state)
+        except OSError as e:
+            out.append("")
+            out.append(f"  (The memory of this report could not be kept at {state}: {e.strerror or e}. "
+                       "Next time, nothing can be called new.)")
     return "\n".join(out)
 
 
