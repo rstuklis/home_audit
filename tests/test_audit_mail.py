@@ -402,3 +402,129 @@ class TestCli:
         monkeypatch.setattr(am.sys.stdin, "isatty", lambda: False)
         assert am.main(["--install"]) == 1
         assert "run --install in Terminal" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Through Mail.app: the beach Mac's way, addresses as they are, nothing stored
+# ---------------------------------------------------------------------------
+
+class TestMailApp:
+    def _runner(self, calls, rc=0, stderr=""):
+        def run(cmd, **kw):
+            body_path = cmd[2]
+            calls.append({"cmd": cmd, "script": kw.get("input"), "body": Path(body_path).read_text(encoding="utf-8"),
+                          "timeout": kw.get("timeout")})
+            return subprocess.CompletedProcess(cmd, rc, "", stderr)
+        return run
+
+    def test_the_message_goes_to_osascript_with_the_body_in_a_file(self, am):
+        calls = []
+        am.send_via_mail_app("[Home Net Audit] s", "line one — “quoted”\nline two\n", ["rstuklis@yahoo.com"],
+                             sender="robert@stuklis.net", runner=self._runner(calls))
+        call = calls[0]
+        assert call["cmd"][:2] == ["osascript", "-"]
+        assert call["cmd"][3:] == ["[Home Net Audit] s", "robert@stuklis.net", "rstuklis@yahoo.com"]
+        assert call["body"] == "line one — “quoted”\nline two\n"
+        assert 'tell application "Mail"' in call["script"] and "send msg" in call["script"]
+        assert "«class utf8»" in call["script"] and "attachment" not in call["script"]
+        assert not Path(call["cmd"][2]).exists()          # the temporary file is gone
+
+    def test_no_sender_means_mail_apps_default_account(self, am):
+        calls = []
+        am.send_via_mail_app("s", "b", ["a@b", "c@d"], runner=self._runner(calls))
+        assert calls[0]["cmd"][4:] == ["", "a@b", "c@d"]
+
+    def test_a_recipient_is_required(self, am):
+        with pytest.raises(am.MailError, match="--to"):
+            am.send_via_mail_app("s", "b", [], runner=self._runner([]))
+
+    def test_a_refusal_is_an_error_in_mails_words(self, am):
+        with pytest.raises(am.MailError, match="Mail.app refused the message: .*Can’t get account"):
+            am.send_via_mail_app("s", "b", ["a@b"], runner=self._runner([], rc=1, stderr="execution error: Mail got an error: Can’t get account. (-1728)"))
+
+    def test_a_missing_automation_grant_says_where_it_is_made(self, am):
+        err = "execution error: Not authorized to send Apple events to Mail. (-1743)"
+        with pytest.raises(am.MailError, match="Privacy & Security > Automation"):
+            am.send_via_mail_app("s", "b", ["a@b"], runner=self._runner([], rc=1, stderr=err))
+
+    def test_a_hung_mail_app_is_an_error_not_a_hang(self, am):
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        with pytest.raises(am.MailError, match="dialog"):
+            am.send_via_mail_app("s", "b", ["a@b"], runner=hang)
+
+
+class TestCliViaMailApp:
+    @pytest.fixture
+    def wired(self, am, monkeypatch):
+        sent = []
+        monkeypatch.setattr(am, "send_via_mail_app",
+                            lambda subject, body, recipients, sender=None, runner=None:
+                            sent.append((subject, body, recipients, sender)))
+        monkeypatch.setattr(am, "keychain_mail_account",
+                            lambda service=None: pytest.fail("Mail.app needs nothing from the Keychain"))
+        monkeypatch.setattr(am, "send", lambda *a, **k: pytest.fail("no SMTP on the Mail.app way"))
+        return sent
+
+    def test_send_through_mail_app_keeps_the_addresses_and_attaches_nothing(self, am, wired, report, tmp_path):
+        html = tmp_path / "last_run.html"
+        rc = am.main(["--via", "mail-app", "--from", "robert@stuklis.net", "send", "--to", "rstuklis@yahoo.com",
+                      "--site", "beach house", "--save-html", str(html), report()])
+        assert rc == 0
+        subject, body, recipients, sender = wired[0]
+        assert subject.startswith("[Home Net Audit] ") and subject.endswith(" — beach house — no changes")
+        assert body.startswith("#" * 64) and "# NETWORK: loveshack-h" in body
+        assert (recipients, sender) == (["rstuklis@yahoo.com"], "robert@stuklis.net")
+        assert "Home Network Audit Report — beach house" in html.read_text(encoding="utf-8")
+
+    def test_notify_through_mail_app(self, am, wired, tmp_path):
+        log = tmp_path / "run.log"
+        log.write_text("a\nb\nc\n", encoding="utf-8")
+        rc = am.main(["--via", "mail-app", "--from", "robert@stuklis.net", "notify", "--to", "rstuklis@yahoo.com",
+                      "--subject", "[Home Net Audit] AUDIT DID NOT RUN", "--message", "exit 2", "--text", str(log), "--tail", "2"])
+        assert rc == 0
+        assert wired[0] == ("[Home Net Audit] AUDIT DID NOT RUN", "exit 2\n\nb\nc", ["rstuklis@yahoo.com"], "robert@stuklis.net")
+
+    def test_test_email_through_mail_app(self, am, wired):
+        assert am.main(["--via", "mail-app", "--to", "rstuklis@yahoo.com", "--test-email"]) == 0
+        subject, body, recipients, sender = wired[0]
+        assert subject == "[Home Net Audit] test email" and "Mail.app" in body and sender is None
+
+    def test_mail_app_without_a_recipient_is_a_plain_error(self, am, monkeypatch, report, capsys):
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service=None: pytest.fail("not the Keychain"))
+        assert am.main(["--via", "mail-app", "send", report()]) == 1
+        assert "--to" in capsys.readouterr().err
+
+    def test_an_unreadable_log_is_said_in_the_note_not_an_error(self, am, wired, tmp_path):
+        rc = am.main(["--via", "mail-app", "notify", "--to", "a@b", "--subject", "s", "--text", str(tmp_path / "absent.log")])
+        assert rc == 0 and "could not be read" in wired[0][1]
+
+
+class TestSmtpWithAnExistingKeychainItem:
+    def test_a_password_only_item_sends_from_the_given_address(self, am, monkeypatch, report):
+        # The city Mac's Gmail item was stored by another script, password only.
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service: (None, "app-pw") if service == "homenetaudit-smtp" else None)
+        seen = {}
+        monkeypatch.setattr(am, "send", lambda msg, sender, pw, host, port, **k: seen.update(sender=sender, pw=pw, host=host, to=msg["To"]))
+        rc = am.main(["--smtp", "smtp.gmail.com:587", "--keychain", "homenetaudit-smtp", "--from", "robert.stuklis@gmail.com",
+                      "send", "--to", "robert.stuklis@gmail.com", report()])
+        assert rc == 0
+        assert seen == {"sender": "robert.stuklis@gmail.com", "pw": "app-pw", "host": "smtp.gmail.com", "to": "robert.stuklis@gmail.com"}
+
+    def test_a_password_only_item_without_from_says_so(self, am, monkeypatch, report, capsys):
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service: (None, "app-pw"))
+        assert am.main(["send", "--to", "a@b", report()]) == 1
+        assert "--from" in capsys.readouterr().err
+
+    def test_the_keychain_reader_returns_a_password_only_item(self, am, monkeypatch):
+        def security(cmd, **kw):
+            if "-w" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "app-pw\n", "")
+            return subprocess.CompletedProcess(cmd, 0, 'attributes:\n    "svce"<blob>="homenetaudit-smtp"\n', "")
+        monkeypatch.setattr(am.subprocess, "run", security)
+        assert am.keychain_mail_account("homenetaudit-smtp") == (None, "app-pw")
+
+    def test_a_missing_body_file_is_a_plain_error(self, am, monkeypatch, capsys):
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service=None: ("me@mac.com", "pw"))
+        assert am.main(["send", "--to", "a@b", "--body", "/nowhere/body.txt"]) == 1
+        assert "could not read --body" in capsys.readouterr().err

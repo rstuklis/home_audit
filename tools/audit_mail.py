@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""Send the audit email the way the city Mac's reads: one message, text and
-HTML, nothing attached.
+"""Send the audit email the way the city Mac's reads: one message, the whole
+report in it, nothing attached.
 
 Both Macs run the same audit; this makes them send the same email. The
 wrapper on each Mac captures the audit's output to a file per network and
 hands the files here. This composes the email the city Mac has been sending
 since September — a title line, the TL;DR block from tools/report_digest.py,
-a version check, then every network's report under its own banner — renders
-it with tools/report_email_html.py, and sends it through iCloud's mail server
-from the address kept in this Mac's Keychain. The PDF the beach Mac used to
-attach is gone: the whole report is the email, readable on a phone.
+a version check, then every network's report under its own banner — and
+sends it one of two ways:
 
-    audit_mail.py --install                        store the iCloud address and app-specific password
-    audit_mail.py --test-email [--to ADDR]         send a one-line test
-    audit_mail.py send --to ADDR [--site "beach house"] [--state FILE] [--claude]
-                       [--save-body FILE] [--repo DIR] NAME=REPORT.txt ...
+  --via mail-app   through Mail.app, from the account it already has, by the
+                   same AppleScript the beach Mac's wrapper has used all along.
+                   No password to store. Mail.app takes the body as plain
+                   text, so the email carries the report's text and layout;
+                   the coloured cards of the HTML version are kept on disk
+                   with --save-html, or come with the other way.
+  --via smtp       as text and HTML in one message, through a mail server,
+                   from an address whose app-specific password is in the
+                   Mac's login keychain (iCloud by default; --smtp and
+                   --keychain for another). The arrangement the SMSF
+                   screener's weekly email uses.
+
+    audit_mail.py send --via mail-app --from ADDR --to ADDR [--site "beach house"]
+                       [--state FILE] [--claude] [--repo DIR] [--save-body FILE]
+                       [--save-html FILE] NAME=REPORT.txt ...
     audit_mail.py send --to ADDR --body FILE       send a body another tool composed
     audit_mail.py notify --to ADDR --subject "…" [--text FILE | --message "…"]
+    audit_mail.py --test-email [--via mail-app --from ADDR] [--to ADDR]
+    audit_mail.py --install                        store an address and app-specific password (smtp)
 
-The password lives in the login keychain under the service home_net_audit-mail,
-written and read by the `security` tool, the same arrangement as the SMSF
-screener's weekly email. Stdlib only.
+Stdlib only.
 """
 
 import argparse
@@ -98,14 +107,14 @@ def keychain_mail_account(service=KEYCHAIN_SERVICE):
     if attrs.returncode != 0:
         raise _keychain_error(attrs)
     m = re.search(r'"acct"<blob>="([^"]*)"', attrs.stdout)
-    if not m:
-        return None
     pw = _security("find-generic-password", "-s", service, "-w")
     if pw.returncode == NOT_FOUND:
         return None
     if pw.returncode != 0:
         raise _keychain_error(pw)
-    return m.group(1), pw.stdout.rstrip("\n")
+    # An item written by hand or by another tool may carry no account; the
+    # password is still the password, and --from supplies the address.
+    return (m.group(1) if m else None), pw.stdout.rstrip("\n")
 
 
 def keychain_forget(service=KEYCHAIN_SERVICE):
@@ -323,17 +332,104 @@ def send(msg, sender, password, host=SMTP_HOST, port=SMTP_PORT, retry_wait=None,
             raise MailError(f"could not send through {host}:{port}: {exc}{hint}") from None
 
 
+MAIL_APP_SCRIPT = """\
+on run argv
+    set bodyPath to item 1 of argv
+    set theSubject to item 2 of argv
+    set theSender to item 3 of argv
+    set theRecipients to items 4 thru -1 of argv
+    set theBody to read (POSIX file bodyPath) as «class utf8»
+    tell application "Mail"
+        set msg to make new outgoing message with properties {subject:theSubject, content:theBody, visible:false}
+        if theSender is not "" then set sender of msg to theSender
+        repeat with addr in theRecipients
+            tell msg to make new to recipient at end of to recipients with properties {address:(addr as text)}
+        end repeat
+        send msg
+    end tell
+end run
+"""
+MAIL_APP_TIMEOUT = 180.0
+
+
+def send_via_mail_app(subject, body, recipients, sender=None, runner=subprocess.run):
+    """Hand the message to Mail.app, which sends it from the account it has.
+
+    The AppleScript the beach Mac's wrapper has always used, minus the
+    attachment: Mail.app holds the account, so nothing is stored here. The
+    body goes through a file read as UTF-8, not through the argument list,
+    which has a size limit a long report would meet. Mail's dictionary takes
+    the content as plain text; it cannot be given HTML.
+    """
+    if not recipients:
+        raise MailError("--via mail-app needs at least one --to address")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="audit-mail-", suffix=".txt",
+                                     delete=False) as f:
+        f.write(body)
+        path = f.name
+    try:
+        try:
+            done = runner(["osascript", "-", path, subject, sender or "", *recipients],
+                          input=MAIL_APP_SCRIPT, capture_output=True, text=True, timeout=MAIL_APP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise MailError("Mail.app did not take the message within three minutes; is it waiting on a "
+                            "dialog (an account password, or a permission prompt) nobody can see?") from None
+        except OSError as exc:
+            raise MailError(f"could not run osascript: {exc}") from None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout or "").strip()[:300] or f"exit code {done.returncode}"
+        hint = (" — the program running the audit is not allowed to control Mail.app: on a scheduled run "
+                "that is the launcher app, and the grant is made under System Settings > Privacy & "
+                "Security > Automation, or by running the wrapper once by hand and allowing the prompt"
+                if "Not authorized" in detail or "-1743" in detail else "")
+        raise MailError(f"Mail.app refused the message: {detail}{hint}")
+
+
 def recipients_for(args, sender):
     """--to before or after the subcommand, in the order given; the sender when none."""
-    return list(args.to) + list(getattr(args, "sub_to", [])) or [sender]
+    return list(args.to) + list(getattr(args, "sub_to", [])) or ([sender] if sender else [])
 
 
 def account_for(args):
+    """(sender, password) for the smtp way: the Keychain's address unless
+    --from names one, which an item stored without an account needs."""
     account = keychain_mail_account(args.keychain)
     if account is None:
-        raise MailError(f"no address and password in the Keychain under {args.keychain!r} yet; run "
+        raise MailError(f"no password in the Keychain under {args.keychain!r} yet; run "
                         "python3 tools/audit_mail.py --install first")
-    return account
+    sender = args.from_addr or account[0]
+    if not sender:
+        raise MailError(f"the Keychain item {args.keychain!r} carries no address; give the sender with --from")
+    return sender, account[1]
+
+
+def write_file(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def deliver(args, subject, body, html=None):
+    """Send by whichever way --via names. Returns the recipients."""
+    if args.via == "mail-app":
+        recipients = recipients_for(args, args.from_addr)
+        send_via_mail_app(subject, body, recipients, args.from_addr)
+        return recipients
+    sender, password = account_for(args)
+    recipients = recipients_for(args, sender)
+    msg = new_message(sender, recipients, subject)
+    msg.set_content(body)
+    if html is not None:
+        msg.add_alternative(html, subtype="html")
+    host, port = host_port(args.smtp)
+    send(msg, sender, password, host, port, retry_wait=getattr(args, "retry_wait", None))
+    return recipients
 
 
 def host_port(text):
@@ -369,60 +465,59 @@ def do_install(args):
         keychain_store(address, password, args.keychain)
         print("  Stored in the Keychain.")
     else:
-        print(f"Using the address already in the Keychain, {account[0]} (--reset-mail to change it).")
+        print(f"Using the Keychain item already there ({account[0] or 'no address; give one with --from'}); "
+              "--reset-mail to change it.")
     print("Now send yourself a test: python3 tools/audit_mail.py --test-email")
     return 0
 
 
 def do_test_email(args):
-    sender, password = account_for(args)
-    recipients = recipients_for(args, sender)
-    msg = new_message(sender, recipients, f"{SUBJECT_PREFIX} test email")
-    msg.set_content(f"This is a test from the home network audit on {socket.gethostname()}, sent "
-                    f"{dt.datetime.now():%Y-%m-%d %H:%M}. If you can read this, the weekly report is sent "
-                    f"the same way, from {sender} to {', '.join(recipients)}.")
-    host, port = host_port(args.smtp)
-    send(msg, sender, password, host, port)
+    way = "Mail.app" if args.via == "mail-app" else "the mail server"
+    text = (f"This is a test from the home network audit on {socket.gethostname()}, sent "
+            f"{dt.datetime.now():%Y-%m-%d %H:%M} through {way}. If you can read this, the weekly "
+            "report is sent the same way.")
+    recipients = deliver(args, f"{SUBJECT_PREFIX} test email", text)
     print(f"Test email sent to {', '.join(recipients)}.")
     return 0
 
 
 def do_send(args):
-    sender, password = account_for(args)
-    recipients = recipients_for(args, sender)
     if args.body:
-        with open(args.body, encoding="utf-8", errors="replace") as f:
-            body = f.read()
+        try:
+            with open(args.body, encoding="utf-8", errors="replace") as f:
+                body = f.read()
+        except OSError as exc:
+            raise MailError(f"could not read --body {args.body}: {exc.strerror or exc}") from None
     else:
         if not args.reports:
             raise MailError("give the reports as NAME=REPORT.txt, or an assembled body with --body FILE")
         body = compose(args.reports, site=args.site, title=args.title, state=args.state,
                        claude=args.claude, skipped=args.skipped, repo=args.repo)
-    if args.save_body:
-        tmp = args.save_body + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(body)
-        os.replace(tmp, args.save_body)
-    msg = build_message(sender, recipients, body, site=args.site)
-    host, port = host_port(args.smtp)
-    send(msg, sender, password, host, port, retry_wait=args.retry_wait)
-    print(f"EMAIL SENT to {', '.join(recipients)}  (subject: {msg['Subject']})")
+    html = _load("report_email_html").render(body, site=args.site)
+    try:
+        if args.save_body:
+            write_file(args.save_body, body)
+        if args.save_html:
+            write_file(args.save_html, html)
+    except OSError as exc:
+        raise MailError(f"could not keep a copy: {exc.strerror or exc} ({exc.filename})") from None
+    subject = subject_for(body, args.site)
+    recipients = deliver(args, subject, body, html)
+    print(f"EMAIL SENT to {', '.join(recipients)}  (subject: {subject})")
     return 0
 
 
 def do_notify(args):
     """A plain note — the wrapper's 'the audit did not run' message."""
-    sender, password = account_for(args)
-    recipients = recipients_for(args, sender)
     text = args.message or ""
     if args.text:
-        with open(args.text, encoding="utf-8", errors="replace") as f:
-            lines = f.read().splitlines()
+        try:
+            with open(args.text, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            lines = [f"(the log {args.text} could not be read: {exc.strerror or exc})"]
         text += ("\n\n" if text else "") + "\n".join(lines[-args.tail:])
-    msg = new_message(sender, recipients, args.subject)
-    msg.set_content(text or "(no message)")
-    host, port = host_port(args.smtp)
-    send(msg, sender, password, host, port, retry_wait=args.retry_wait)
+    recipients = deliver(args, args.subject, text or "(no message)")
     print(f"EMAIL SENT to {', '.join(recipients)}  (subject: {args.subject})")
     return 0
 
@@ -433,6 +528,12 @@ def build_parser():
                     help="Keychain service holding the address and app-specific password")
     ap.add_argument("--smtp", default=f"{SMTP_HOST}:{SMTP_PORT}", metavar="HOST[:PORT]",
                     help="mail server (STARTTLS); iCloud by default")
+    ap.add_argument("--via", choices=("smtp", "mail-app"), default="smtp",
+                    help="smtp: text and HTML through a mail server, password from the Keychain; "
+                         "mail-app: plain text through Mail.app's own account, nothing stored")
+    ap.add_argument("--from", dest="from_addr", metavar="ADDR",
+                    help="the sending address: Mail.app's account to send from, or the address for "
+                         "a Keychain item stored without one")
     ap.add_argument("--install", action="store_true", help="store the sending address and password")
     ap.add_argument("--reset-mail", action="store_true", help="with --install: ask again")
     ap.add_argument("--forget-mail", action="store_true", help="remove the stored pair")
@@ -451,6 +552,7 @@ def build_parser():
     s.add_argument("--repo", metavar="DIR", help="checkout to version-check against origin/master")
     s.add_argument("--body", metavar="FILE", help="send this assembled text instead of composing one")
     s.add_argument("--save-body", metavar="FILE", help="keep the composed text here (last_run.txt)")
+    s.add_argument("--save-html", metavar="FILE", help="keep the HTML rendering here, to open in a browser")
     s.add_argument("--retry-wait", type=float, default=90.0, metavar="SECONDS",
                    help="wait and try once more on a network failure (0 to never)")
     s.add_argument("reports", nargs="*", metavar="NAME=REPORT.txt")
