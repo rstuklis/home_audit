@@ -353,3 +353,86 @@ The honest framing is that this produces **tamper-evidence** — a signed,
 timestamped, off-host record that something changed on a given date — rather
 than prevention. For someone who later needs to establish when they were
 targeted, that is worth a great deal. It is not a shield.
+
+---
+
+## The weekly email
+
+Both Macs send the same email: the city one. One message, readable on a
+phone — the TL;DR block on top, a version check, then each network's report
+— and nothing attached. The addresses each Mac sends from and to stay as they
+are, and nothing new has to be set up or stored: `tools/audit_mail.py`
+composes that email from the audit's output files and hands it to whatever
+the Mac already sends with.
+
+**The city Mac already sends this email.** Nothing to change there.
+
+**The beach Mac** has sent through Mail.app all along, from its own account
+to the usual address, by an AppleScript in its wrapper, with the report
+attached as a PDF. The same AppleScript now carries the report itself as the
+body, and the PDF goes. In `~/.home_net_audit/run_audit.sh` the email step
+becomes one line — the wrapper already captures the audit's output; hand that
+file over as `NAME=FILE`:
+
+```sh
+"$PY" "$REPO/tools/audit_mail.py" --via mail-app --from robert@stuklis.net \
+    send --to rstuklis@yahoo.com --site "beach house" \
+    --state "$HOME/.home_net_audit/digest_state.json" --claude --repo "$REPO" \
+    --save-body "$HOME/.home_net_audit/last_run.txt" \
+    --save-html "$HOME/.home_net_audit/last_run.html" \
+    "loveshack-h=$OUT"
+```
+
+What those do: `--via mail-app` sends through Mail.app, from the account
+`--from` names, so no password is stored anywhere. `--state` is
+`report_digest.py`'s memory of the previous report, which is what makes "new
+since the previous report" mean something. `--claude` adds the plain-English
+paragraph when the Claude CLI is on the Mac, and goes without it when not.
+`--repo` prints the version check. `--save-body` keeps the text that was
+sent, `--save-html` the same report as the city Mac's HTML page, to open in a
+browser. `--site` goes into the subject and the page heading, so the two
+Macs' emails can be told apart: `[Home Net Audit] 2026-10-25 — beach house —
+no changes`.
+
+The step that printed the HTML report to PDF and the `osascript` that handed
+it to Mail.app go; `--html-report` can stay for the copy on disk. The audit's
+own output is what is sent, so the wrapper has to capture this run's output
+to its own file (`$OUT` above), not only append it to the running log. Mail's
+Automation permission is the one the wrapper already holds; it is granted to
+the program that runs the wrapper (the launcher app on a scheduled run), and
+a rebuild of that app asks for it again.
+
+**One limit, worth knowing.** Mail.app's AppleScript takes the body as plain
+text: it cannot be given HTML. So the beach email carries the report's text
+and layout as the city email does, without the coloured cards and badges of
+the city email's HTML. On a Mac, Mail > Settings > Fonts & Colors > "Use
+fixed-width font for plain text messages" keeps the report's columns
+aligned; the saved HTML page has the cards. Sending the HTML itself needs a
+mail server and an app-specific password in the Keychain — the way below —
+and that was declined, so it is not the default.
+
+**When the audit itself fails** (exit 2, or the wrapper's own checks), the
+wrapper sends a plain note the same way, with the tail of the log:
+
+```sh
+"$PY" "$REPO/tools/audit_mail.py" --via mail-app --from robert@stuklis.net \
+    notify --to rstuklis@yahoo.com \
+    --subject "[Home Net Audit] $(date +%F) — beach house — AUDIT DID NOT RUN" \
+    --message "home_net_audit.py exited $rc" --text "$LOG" --tail 60
+```
+
+A test of the step without waiting for the schedule:
+
+```sh
+python3 tools/audit_mail.py --via mail-app --from robert@stuklis.net --to rstuklis@yahoo.com --test-email
+```
+
+**The other way, for the record: text and HTML through a mail server.** With
+an app-specific password in the login keychain the tool sends the HTML page
+itself, as the city Mac does. `--install` stores an iCloud address and
+password under the service `home_net_audit-mail` (the arrangement the SMSF
+screener's weekly email uses); `--test-email` sends one line. A password
+another script already stored is used in place: `--smtp smtp.gmail.com:587
+--keychain homenetaudit-smtp --from robert.stuklis@gmail.com` reads the city
+Mac's Gmail item. Leave `--via` out, or say `--via smtp`, and the `send` and
+`notify` lines above are otherwise the same.
