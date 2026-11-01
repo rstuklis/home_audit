@@ -314,7 +314,7 @@ A review pass over the commit (four finders over the diff, two skeptics each; 24
 
 Deployment, by hand after merging and not in this repository: in `~/.home_net_audit/run_audit.sh` pass `--unmonitored` to `audit_here` for every network except the home one; mark the Arlo hub with `python3 home_net_audit.py --critical a4:11:62:2a:b9:0a`. The first Sunday prints one REVIEW "audit code changed" line per network, as every code change does, and one NEW flagged item for the reworded coverage line.
 
-# Round 5 — what the monitor found never reached anyone (2026-11-01)
+## Round 5 — the report and email pipeline (2026-11-01)
 `home_net_audit.py` @ `883364d` · the path from the monitor and the audits to the owner's inbox, read against the round-4 record (1 November 2026: twelve finders, three skeptics per finding, 31 confirmed, kept outside the repository) · the seven of its findings that sit between what the tool finds and the one person who reads it; the rest stay open · **fixed in this branch, 2187 tests passing.**
 
 Threat model (a), a false all-clear, and (e), a crash or hang before the report — an email that never comes is the all-clear nobody questions — with one (d), secrets, in passing.
