@@ -79,7 +79,7 @@ class TestListeners:
 
 class TestIpv6:
     def test_compact_keeps_the_router_rows_and_counts_the_rest(self, mod, monkeypatch, capsys):
-        monkeypatch.setattr(mod, "check_ipv6_routers", lambda known=None: {"risk": "OK", "note": "fine", "routers": []})
+        monkeypatch.setattr(mod, "check_ipv6_routers", lambda known=None, **kw: {"risk": "OK", "note": "fine", "routers": []})
         monkeypatch.setattr(mod, "get_ipv6_neighbours", lambda: {
             "fe80::1%en0": {"mac": "aa:aa:aa:aa:aa:aa", "router": True},
             "fe80::2%en0": {"mac": "bb:bb:bb:bb:bb:bb", "router": False},

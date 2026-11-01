@@ -238,6 +238,51 @@ Skip `--speedtest` on a metered link; it moves ~15 MB. Do **not** add
 `--probe-creds` to anything unattended — it sends real login attempts and can
 lock you out of your own router.
 
+### What the monitor remembers
+
+The monitor keeps, in its state file, every device it has seen on that network
+for the last 30 days, by MAC. A phone waking up, a printer coming back after a
+quiet afternoon, a hub rebooting — none of them is a "new device" when it
+reappears; a newcomer is named with your label for it, or marked as a private
+address. An address that answers with different hardware between two polls is
+HIGH: a DHCP lease moving to another device takes hours and passes through the
+table empty, a swap inside one poll is what ARP spoofing of a host looks like.
+
+### Several networks, one monitor
+
+A Mac that audits several networks in turn still runs one monitor, on the
+network it lives on. The heartbeat log is keyed by network, and it cannot know
+which network the monitor was meant for: when the Mac spent four days on the
+IoT network, the monitor heartbeated under that network's chain, and every
+audit of it afterwards read the silence since as "the monitor is not running
+now" at HIGH — for ever, since nothing leaves an append-only log. Tell the
+audit which networks have no monitor of their own:
+
+```sh
+python3 home_net_audit.py --compact --unmonitored      # a network without a monitor
+```
+
+Gaps found under that network's chain are then reported as information, with
+the last heartbeat named, and never as a stopped monitor. The home network's
+audit runs without the flag and keeps the HIGH.
+
+### Devices whose silence matters
+
+A device leaving is one "gone" line on the next run, and the baseline after
+that no longer holds it. For a speaker that is right; for a camera hub or an
+alarm panel the absence IS the finding for as long as it lasts. Mark them:
+
+```sh
+python3 home_net_audit.py --critical a4:11:62:2a:b9:0a      # saves the mark and exits
+python3 home_net_audit.py --not-critical a4:11:62:2a:b9:0a
+```
+
+A critical device that stops answering is its own change line on the run it
+leaves, a HIGH on every run after that while the device memory (30 days) still
+knows it on that network, and — on the network the monitor watches — pinged
+every poll and alerted HIGH after ten silent polls, with a REVIEW when it is
+back. The marks live in `critical.json` beside `labels.json`.
+
 ---
 
 ## What the observer does and does not audit
