@@ -1869,6 +1869,26 @@ def save_baseline(state, passphrase=None):
         state.pop("device_memory", None)
         given.pop("device_memory", None)
     history = read_history()
+    # A record one step ahead of its chain is a save that was interrupted
+    # between the record and its history line (see the write order below).
+    # Re-issuing its sequence number would put two different seals under one
+    # seq in the receipt log — the "seal_conflict" HIGH, about nothing. Only a
+    # record that verifies is repaired: a forged record placed at N+1 reads
+    # rolled_back, not history_behind, and never gets a chain line.
+    on_disk = load_baseline_record()
+    if history and _history_lags_record(on_disk, history[-1]) \
+            and verify_baseline(passphrase).get("status") == "history_behind":
+        _append_history({
+            "seq": on_disk["seq"],
+            "seal": on_disk["seal"],
+            "keyed": bool(on_disk.get("keyed")),
+            "ts": ((on_disk.get("state") or {}).get("timestamp")
+                   or datetime.now(timezone.utc).isoformat()),
+        })
+        # The receipt it may never have had. A duplicate of the same seal is
+        # not a conflict; a missing one would read as an unpublished run.
+        publish_receipt(on_disk)
+        history = read_history()
     prev = history[-1]["seal"] if history else None
     seq = (history[-1]["seq"] + 1) if history else 1
 
@@ -1894,14 +1914,25 @@ def save_baseline(state, passphrase=None):
     # Anything added after this line is runtime status, not sealed content, and
     # must never be written to disk or it would break its own seal.
 
+    # Record, history line, receipt — in that order. The receipt used to go
+    # out before the history line, so one OSError in the last write (a full
+    # disk, a sleep during the iCloud fsync) left a record and a receipt for
+    # seq N+1 beside a chain stopping at N: "rolled_back" HIGH the next week,
+    # then a second save of seq N+1 with a different seal, then
+    # "seal_conflict" HIGH ("treat the local baseline as untrusted") the week
+    # after, for a transient fault. With the local chain written before the
+    # off-host line, an interruption leaves at worst a run the sink never saw
+    # (unpublished_runs, REVIEW), or a record one step ahead of its chain
+    # (history_behind, REVIEW), which the next save repairs above.
     _write_json_atomic(BASELINE_FILE, record)
-    record["_receipt"] = publish_receipt(record)
+    _RUN_PROGRESS["baseline_saved"] = True
     _append_history({
         "seq": seq,
         "seal": record["seal"],
         "keyed": record["keyed"],
         "ts": state.get("timestamp") or datetime.now(timezone.utc).isoformat(),
     })
+    record["_receipt"] = publish_receipt(record)
     return record
 
 
@@ -2000,6 +2031,9 @@ def verify_baseline(passphrase=None):
       unverifiable   sealed with a passphrase that was not supplied
       modified       the seal does not match the contents
       rolled_back    valid record, but older than the chain has already recorded
+      history_behind valid record one step ahead of the chain and linked to it:
+                     a save interrupted before its history line (repaired by
+                     the next save)
       chain_missing  the record claims history that is not there
 
     The chain is read *first*, and that ordering is the point. Both cheap
@@ -2111,9 +2145,33 @@ def verify_baseline(passphrase=None):
 # overwrite remote history, an attacker on that host holds them too.
 # ---------------------------------------------------------------------------
 
+def _history_lags_record(record, last):
+    """Whether `record` is the chain's next link that never got its history line:
+    one past `last` in sequence, chained to `last`'s seal, and not a downgrade.
+
+    A keyed chain followed by an unkeyed record is never a lag, whatever the
+    seq and prev say: an unkeyed record is one anyone can write, and treating
+    it as the interrupted save would append it to the chain.
+    """
+    if not (isinstance(record, dict) and isinstance(last, dict)):
+        return False
+    seq, last_seq = record.get("seq"), last.get("seq")
+    for value in (seq, last_seq):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+    if seq != last_seq + 1:
+        return False
+    if not record.get("prev") or record.get("prev") != last.get("seal"):
+        return False
+    if last.get("keyed") and not record.get("keyed"):
+        return False
+    return True
+
+
 def _chain_position_problem(record, keyed):
-    """rolled_back or chain_missing for a record that does not sit at the chain's
-    head, else None. Needs no key: seq and seal are compared, not recomputed."""
+    """rolled_back, chain_missing or history_behind for a record that does not
+    sit at the chain's head, else None. Needs no key: seq and seal are
+    compared, not recomputed."""
     history = read_history()
     if not history:
         seq = record.get("seq", 1)
@@ -2123,6 +2181,16 @@ def _chain_position_problem(record, keyed):
                               "file is gone. It may have been removed to hide a change."}
         return None
     last = history[-1]
+    if _history_lags_record(record, last):
+        # Newer than the chain, and linked to it: a save that was interrupted
+        # after the record was written. Calling this a rollback said an older
+        # baseline had been put back, which is the opposite of what happened.
+        return {"status": "history_behind", "keyed": keyed,
+                "detail": f"The baseline is at run {record.get('seq')}, one ahead of the "
+                          f"chain's run {last.get('seq')}, and links to it: a save was "
+                          "interrupted after the record was written and before its "
+                          "history line. Nothing older was put back; the next save "
+                          "repairs the chain."}
     if record.get("seq") != last.get("seq") or record.get("seal") != last.get("seal"):
         return {"status": "rolled_back", "keyed": keyed,
                 "detail": f"The baseline is at run {record.get('seq')} but the chain "
@@ -3731,6 +3799,7 @@ def describe_baseline_integrity(report):
         "unverifiable": "REVIEW",
         "modified": "HIGH",
         "rolled_back": "HIGH",
+        "history_behind": "REVIEW",
         "chain_missing": "HIGH",
         # Both are the same claim as chain_missing seen from the other side —
         # the chain and the record disagree about whether this machine has ever
