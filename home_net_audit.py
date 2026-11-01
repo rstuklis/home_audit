@@ -89,6 +89,7 @@ BASELINE_DIR = os.path.expanduser(os.environ.get(DIR_ENV) or "~/.home_net_audit"
 BASELINE_FILE = os.path.join(BASELINE_DIR, "baseline.json")
 HISTORY_FILE  = os.path.join(BASELINE_DIR, "history.jsonl")
 LABELS_FILE   = os.path.join(BASELINE_DIR, "labels.json")
+CRITICAL_FILE = os.path.join(BASELINE_DIR, "critical.json")
 NETWORKS_FILE = os.path.join(BASELINE_DIR, "networks.json")
 
 # Read only when scutil is unavailable — i.e. when the audit is running from a
@@ -596,17 +597,42 @@ def parse_ndp_routers(out):
 
     Captured from the macOS runner, which has four utun interfaces.
     """
-    routers = []
+    return [e["address"] for e in parse_ndp_router_entries(out)]
+
+
+def parse_ndp_router_entries(out):
+    """`ndp -rn` as records: the address, and whether this machine has installed
+    a default route through it.
+
+    The flags column carries two different things. M and O are the Router
+    Advertisement's own flags (managed and other-config). I means the kernel
+    has INSTALLED a default route through this router; S marks a static one,
+    which is what a VPN tunnel's entry carries. The I is what decides how much
+    a new advertiser matters: a router macOS has not taken as a default route
+    cannot have rerouted anything yet. A HomeKit or Thread hub advertises a
+    private prefix and a route to its mesh and is listed here without the I; a
+    rogue that wants the traffic needs it.
+
+    The all-zeros-identifier rule and the de-duplication are the ones
+    parse_ndp_routers has always applied; it now reads through here.
+    """
+    entries = []
+    seen = set()
     for line in out.splitlines():
-        token = line.split()[0] if line.split() else ""
+        parts = line.split()
+        token = parts[0] if parts else ""
         addr, bare = _normalise_v6(token)
         if not addr:
             continue
         if ipaddress.ip_address(bare).packed[8:] == b"\x00" * 8:
             continue
-        if addr not in routers:
-            routers.append(addr)
-    return routers
+        if addr in seen:
+            continue
+        seen.add(addr)
+        m = re.search(r"flags=([A-Za-z]*)", line)
+        flags = m.group(1) if m else ""
+        entries.append({"address": addr, "installed": "I" in flags})
+    return entries
 
 
 def parse_neigh6_iproute(out):
@@ -656,63 +682,270 @@ def get_ipv6_neighbours():
     return parse_neigh6_iproute(run(["ip", "-6", "neigh", "show"]))
 
 
-def get_ipv6_routers():
-    """Every address currently advertising itself as an IPv6 default router."""
-    routers = parse_ndp_routers(run(["ndp", "-rn"]))
-    if routers:
-        return routers
+def get_ipv6_router_entries():
+    """Every advertising router as {"address", "installed"}.
+
+    `installed` is whether this machine has taken the router as an IPv6 default
+    route: read from ndp's flags on macOS, true by definition for a Linux
+    default route, and unknown (None) when the neighbour table's router flag is
+    the only source.
+    """
+    entries = parse_ndp_router_entries(run(["ndp", "-rn"]))
+    if entries:
+        return entries
     routers = parse_routes6_iproute(run(["ip", "-6", "route", "show", "default"]))
     if routers:
-        return routers
+        return [{"address": r, "installed": True} for r in routers]
     # Last resort: the neighbour table's own router flag. Less authoritative
     # than the routing table but better than reporting none at all.
-    return sorted(a for a, n in get_ipv6_neighbours().items() if n.get("router"))
+    return [{"address": a, "installed": None}
+            for a, n in sorted(get_ipv6_neighbours().items()) if n.get("router")]
 
 
-def check_ipv6_routers(known=None):
+def get_ipv6_routers():
+    """Every address currently advertising itself as an IPv6 default router."""
+    return [e["address"] for e in get_ipv6_router_entries()]
+
+
+def ipv6_router_details(entries, neighbours):
+    """{address: {"mac", "installed"}} — the identity a link-local address lacks.
+
+    A link-local address is made up by the device and remade on every reboot;
+    Apple devices in particular take a fresh one each time. The MAC behind it,
+    read from the neighbour table, is what stays the same, so the baseline and
+    the monitor compare routers by MAC and treat a new address on a known MAC as
+    the same router, renumbered.
+    """
+    details = {}
+    for e in entries or []:
+        if not isinstance(e, dict) or not e.get("address"):
+            continue
+        n = (neighbours or {}).get(e["address"]) or {}
+        details[e["address"]] = {"mac": n.get("mac"), "installed": e.get("installed")}
+    return details
+
+
+def _ipv6_router_mac(table, addr):
+    """The MAC a details table records for a router address, or None."""
+    entry = (table or {}).get(addr) if isinstance(table, dict) else None
+    mac = entry.get("mac") if isinstance(entry, dict) else None
+    return mac.lower() if isinstance(mac, str) and mac else None
+
+
+def _ipv6_router_installed(table, addr):
+    """True/False as a details table records for a router address; None when it
+    recorded nothing — a baseline from before the flag was kept, or a platform
+    that cannot read it."""
+    entry = (table or {}).get(addr) if isinstance(table, dict) else None
+    value = entry.get("installed") if isinstance(entry, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _renumbering_is_suspect(mac, now_installed, known, known_details, routers):
+    """Whether a router at a new address with a MAC the baseline knows is a
+    stranger rather than the same router renumbered.
+
+    Any device on the LAN can put any MAC in a Router Advertisement's
+    link-layer option, so the MAC alone proves nothing; what a clone wants is
+    the default route. A new address that is not a default route is the hub
+    rebooting, whatever its MAC. One that is carrying this machine's default
+    route is a stranger when the MAC's baseline router never carried it, or
+    when that router is still advertising beside the newcomer — a genuine
+    renumbering retires the old address, a clone leaves it in place.
+    """
+    if not now_installed or not mac:
+        return False
+    former = [a for a in (known or []) if _ipv6_router_mac(known_details, a) == mac]
+    if not former:
+        return False
+    if not any(_ipv6_router_installed(known_details, a) is True for a in former):
+        return True
+    return any(a in (routers or []) for a in former)
+
+
+def parse_ndp_prefixes(out):
+    """macOS `ndp -pn` -> {router address: [prefixes it advertises]}.
+
+        fdca:7af7:13bd:4743::/64 if=en0
+        flags=ALO vltime=1800, pltime=1800, expire=29m50s, ref=1
+          advertised by
+            fe80::87e:f5b1:f821:c252%en0 (reachable)
+        fe80::%en0/64 if=en0
+        flags=AILSO vltime=infinity, pltime=infinity, expire=Never, ref=0
+          No advertising router
+
+    The prefix line and its flags line both start at column 0; the routers are
+    the indented addresses under "advertised by". Link-local prefixes are
+    nobody's advertisement and are skipped.
+    """
+    by_router = {}
+    prefix = None
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if not line[0].isspace():
+            token = parts[0]
+            if "/" in token and " if=" in line:
+                net, _, _plen = token.partition("/")
+                addr, _ = _normalise_v6(net)
+                prefix = token if addr and not addr.lower().startswith("fe80:") else None
+            elif not token.startswith("flags="):
+                prefix = None
+            continue
+        if prefix is None:
+            continue
+        addr, _ = _normalise_v6(parts[0])
+        if addr:
+            routers = by_router.setdefault(addr, [])
+            if prefix not in routers:
+                routers.append(prefix)
+    return by_router
+
+
+def get_ipv6_prefixes():
+    """Advertised prefixes per router, where the platform can say (macOS)."""
+    return parse_ndp_prefixes(run(["ndp", "-pn"]))
+
+
+def _named_router_sentence(addresses, details, labels):
+    parts = []
+    for r in addresses:
+        mac = _ipv6_router_mac(details, r)
+        label = _banner_text((labels or {}).get(mac) or "", 60) or "a labelled device"
+        parts.append(f"{label} ({mac}) from {r}")
+    return ("A device you have labelled has started advertising as an IPv6 router: "
+            + "; ".join(parts) + ".")
+
+
+def check_ipv6_routers(known=None, known_details=None, details=None, labels=None):
     """Classify the advertising routers against the ones seen before.
 
-    `known` is the baseline's list. Absolute counts alone are not enough: one
+    `known` is the baseline's list of router addresses, `known_details` the
+    baseline's {address: {"mac", "installed"}} for them, and `details` this
+    run's (read now when not given). Absolute counts alone are not enough: one
     router is normal, and on a network that legitimately has two the count
     would cry wolf forever. A router that was never in the baseline is the
     signal worth waking someone for.
+
+    "Never in the baseline" is decided by MAC where one is known, not by
+    address. A link-local address is the device's to make up and Apple devices
+    take a fresh one on every reboot, so by address alone the household's own
+    HomeKit hub was a HIGH "rogue router" three times in three months. The same
+    MAC at a new address is the same router, renumbered: said at INFO, never
+    alarmed. A new MAC is a new router, and how much that matters depends on
+    what it has achieved: a router this machine has installed as its IPv6
+    default route can already be carrying the traffic and is HIGH whatever it
+    is; one that is not, and whose MAC the owner has labelled, is REVIEW with
+    the label — a hub behaving like a hub; one nobody has named is HIGH.
     """
-    routers = get_ipv6_routers()
-    known = list(known or [])
-    unexpected = [r for r in routers if r not in known] if known else []
+    if details is None:
+        details = ipv6_router_details(get_ipv6_router_entries(), get_ipv6_neighbours())
+        if details:
+            # What each router hands out, so a known hub that starts advertising
+            # a new prefix is a change and not merely "the same MAC as before".
+            # Recorded for every router, as an empty list when it hands out
+            # nothing: "recorded none" and "never recorded" have to differ, or
+            # a hub that starts advertising a prefix would never be a change.
+            prefixes = get_ipv6_prefixes()
+            for addr, entry in details.items():
+                entry["prefixes"] = sorted(prefixes.get(addr) or [])
+    details = details if isinstance(details, dict) else {}
+    routers = list(details)
+    known = [k for k in (known or []) if isinstance(k, str)]
+    known_details = known_details if isinstance(known_details, dict) else {}
+    labels = labels or {}
+
+    known_macs = {_ipv6_router_mac(known_details, a) for a in known} - {None}
+    renumbered = []
+    unexpected = []
+    promoted = []        # known routers that now carry this machine's default route
+    if known:
+        for r in routers:
+            now_installed = _ipv6_router_installed(details, r) is True
+            mac = _ipv6_router_mac(details, r)
+            if r in known:
+                if now_installed and _ipv6_router_installed(known_details, r) is False:
+                    promoted.append(r)
+                continue
+            if (mac and mac in known_macs
+                    and not _renumbering_is_suspect(mac, now_installed, known, known_details, routers)):
+                former = sorted(a for a in known if _ipv6_router_mac(known_details, a) == mac)
+                renumbered.append({"address": r, "mac": mac, "was": former[0] if former else None})
+            else:
+                # A MAC the baseline knows at a new address that is carrying the
+                # default route is not "the hub rebooted": it is what a rogue
+                # that copied the hub's MAC looks like, and is judged below as
+                # the stranger it is.
+                unexpected.append(r)
+    installed = [r for r in unexpected if _ipv6_router_installed(details, r) is True]
+    named = [r for r in unexpected if r not in installed
+             and _ipv6_router_mac(details, r) and _ipv6_router_mac(details, r) in labels]
+    strangers = [r for r in unexpected if r not in installed and r not in named]
+    base = {"routers": routers, "unexpected": unexpected, "details": details,
+            "renumbered": renumbered, "promoted": promoted}
 
     if not routers:
-        return {"routers": [], "unexpected": [], "risk": "INFO",
-                "note": "No IPv6 router is advertising on this link."}
-    if unexpected:
-        return {"routers": routers, "unexpected": unexpected, "risk": "HIGH",
-                "note": f"IPv6 router(s) not in the baseline: {', '.join(unexpected)}. "
-                        "A rogue Router Advertisement makes the sender your default "
-                        "gateway for IPv6, and macOS prefers IPv6 — traffic would "
-                        "reroute with nothing visible on the IPv4 side."}
+        return dict(base, risk="INFO", note="No IPv6 router is advertising on this link.")
+    if installed or strangers or promoted:
+        parts = []
+        if installed or strangers:
+            parts.append(f"IPv6 router(s) not in the baseline: {', '.join(installed + strangers)}. "
+                         "A rogue Router Advertisement makes the sender your default "
+                         "gateway for IPv6, and macOS prefers IPv6 — traffic would "
+                         "reroute with nothing visible on the IPv4 side.")
+        if installed:
+            parts.append(f"This machine HAS installed {', '.join(installed)} as its IPv6 "
+                         "default route, so its IPv6 traffic is already going there.")
+        if promoted:
+            parts.append(f"{', '.join(promoted)} advertised in the baseline without being "
+                         "taken as a default route; this machine has now installed it as one, "
+                         "so its IPv6 traffic goes there. A router that was harmless last "
+                         "week and carries the traffic this week is the change a rogue "
+                         "advertisement makes.")
+        if named:
+            parts.append(_named_router_sentence(named, details, labels))
+        return dict(base, risk="HIGH", note=" ".join(parts))
+    if named:
+        return dict(base, risk="REVIEW",
+                    note=_named_router_sentence(named, details, labels)
+                    + " This machine has not taken it as a default route. A HomeKit or "
+                      "Thread hub advertises like this; a rogue would have to clone that "
+                      "MAC. Confirm it is yours — saving a baseline remembers it.")
+    if renumbered:
+        said = "; ".join(
+            f"{describe_mac(r['mac'], labels)} now advertises from {r['address']}"
+            + (f" (the baseline knew it as {r['was']})" if r.get("was") else "")
+            for r in renumbered)
+        head = (f"One IPv6 router advertising ({routers[0]})" if len(routers) == 1
+                else f"{len(routers)} IPv6 routers advertising ({', '.join(routers)})")
+        return dict(base, risk="INFO",
+                    note=f"{head}, all of them known by MAC. {said}. Same device, new "
+                         "link-local address — Apple devices take one on every reboot. "
+                         "Not a new router.")
     if len(routers) > 1 and not known:
-        return {"routers": routers, "unexpected": [], "risk": "HIGH",
-                "note": f"{len(routers)} IPv6 routers are advertising: "
-                        f"{', '.join(routers)}. More than one is the classic sign of "
-                        "a rogue Router Advertisement; confirm every one is yours, "
-                        "then save a baseline so only new ones are flagged."}
+        return dict(base, risk="HIGH",
+                    note=f"{len(routers)} IPv6 routers are advertising: "
+                         f"{', '.join(routers)}. More than one is the classic sign of "
+                         "a rogue Router Advertisement; confirm every one is yours, "
+                         "then save a baseline so only new ones are flagged.")
     if len(routers) > 1:
         # Every one of them is in the baseline, so the operator has already
         # accepted this network's shape. Re-flagging it HIGH on every run would
         # train them to skip the section that shows a genuinely new router.
-        return {"routers": routers, "unexpected": [], "risk": "OK",
-                "note": f"{len(routers)} IPv6 routers advertising "
-                        f"({', '.join(routers)}), all of them in the baseline."}
-    return {"routers": routers, "unexpected": [], "risk": "OK",
-            "note": f"One IPv6 router advertising ({routers[0]}), matching the baseline."
-                    if known else
-                    f"One IPv6 router advertising ({routers[0]}). No baseline to "
-                    "compare against yet — save one so a second router would show up."}
+        return dict(base, risk="OK",
+                    note=f"{len(routers)} IPv6 routers advertising "
+                         f"({', '.join(routers)}), all of them in the baseline.")
+    return dict(base, risk="OK",
+                note=f"One IPv6 router advertising ({routers[0]}), matching the baseline."
+                     if known else
+                     f"One IPv6 router advertising ({routers[0]}). No baseline to "
+                     "compare against yet — save one so a second router would show up.")
 
 
-def action_ipv6_routers(known=None, compact=False):
+def action_ipv6_routers(known=None, compact=False, known_details=None, labels=None):
     hr("IPv6 ROUTER ADVERTISEMENTS")
-    result = check_ipv6_routers(known)
+    result = check_ipv6_routers(known, known_details=known_details, labels=labels)
     neighbours = get_ipv6_neighbours()
     print(f"  IPv6 neighbours seen : {len(neighbours)}")
     # Compact keeps the rows this section exists for — whoever is advertising
@@ -724,7 +957,9 @@ def action_ipv6_routers(known=None, compact=False):
         if compact and not n.get("router"):
             continue
         flag = "  <-- advertising as a router" if n.get("router") else ""
-        print(f"    {addr:<42} {n['mac']}{flag}")
+        label = _banner_text((labels or {}).get(n.get("mac")) or "", 60)
+        who = f"  [{label}]" if label else ""
+        print(f"    {addr:<42} {n['mac']}{who}{flag}")
         shown += 1
     if compact and len(neighbours) > shown:
         print(f"    ({len(neighbours) - shown} ordinary neighbour(s) not listed; "
@@ -2164,23 +2399,50 @@ def compare_with_receipts(record, receipts, sink=None):
 # no network round trips — so it is safe to poll every minute on a Pi.
 # ---------------------------------------------------------------------------
 
-def monitor_snapshot():
+def monitor_snapshot(critical_ips=()):
     """The cheap half of the audit: what an attacker has to change to redirect you.
 
     The gateway is pinged first, as check_arp_spoofing does. Without it an entry
     that has aged out of the ARP cache reads as gateway_mac=None, and a None in
     the reference is worse than useless — see carry_forward_gateway_mac.
+
+    `critical_ips` are pinged for the same reason: a camera hub that never talks
+    to this machine ages out of its ARP cache while perfectly healthy, and
+    absence has to mean absence before it is worth an alert.
+
+    Neighbours are kept twice: the sorted address list the comparison has always
+    used, and {ip: mac}, which is what lets the loop tell a device coming back
+    from one arriving, and an address that changed hardware from one that did
+    not. Routers likewise carry the MAC behind each link-local address.
     """
     gateway = get_default_gateway()
     if gateway:
         ping(gateway)
+    for ip in critical_ips or ():
+        if ip and ip != gateway:
+            ping(ip)
     arp = read_arp_table()
+    neighbour_macs = {ip: mac for ip, mac in arp.items() if is_neighbour_entry(ip, mac)}
+    entries = get_ipv6_router_entries()
+    routers = [e["address"] for e in entries]
+    router_macs = {}
+    router_installed = {e["address"]: bool(e.get("installed"))
+                        for e in entries if e.get("installed") is not None}
+    if routers:
+        v6 = get_ipv6_neighbours()
+        for addr in routers:
+            mac = (v6.get(addr) or {}).get("mac")
+            if mac:
+                router_macs[addr] = mac
     return {
         "gateway": gateway,
         "gateway_mac": arp.get(gateway) if gateway else None,
-        "ipv6_routers": get_ipv6_routers(),
+        "ipv6_routers": routers,
+        "ipv6_router_macs": router_macs,
+        "ipv6_router_installed": router_installed,
         "dns": get_dns_servers(),
-        "neighbours": sorted(ip for ip, mac in arp.items() if is_neighbour_entry(ip, mac)),
+        "neighbours": sorted(neighbour_macs),
+        "neighbour_macs": neighbour_macs,
     }
 
 
@@ -2236,11 +2498,17 @@ def carry_forward_blank_fields(snapshot, previous):
         # gateway MAC, and carry_forward_gateway_mac already says so. Storing
         # the blank is what re-reported every neighbour as new a poll later.
         out["neighbours"] = list(previous["neighbours"])
+        if previous.get("neighbour_macs") and not out.get("neighbour_macs"):
+            out["neighbour_macs"] = dict(previous["neighbour_macs"])
     if not out.get("ipv6_routers") and previous.get("ipv6_routers"):
         # A router that stops advertising is not an event, so carrying costs
         # nothing; storing the blank made the same router a HIGH "new IPv6
         # router" on the poll after an `ndp` timeout.
         out["ipv6_routers"] = list(previous["ipv6_routers"])
+        if previous.get("ipv6_router_macs") and not out.get("ipv6_router_macs"):
+            out["ipv6_router_macs"] = dict(previous["ipv6_router_macs"])
+        if previous.get("ipv6_router_installed") and not out.get("ipv6_router_installed"):
+            out["ipv6_router_installed"] = dict(previous["ipv6_router_installed"])
     if not carried:
         return (out if out != snapshot else snapshot), None
     return out, {
@@ -2278,11 +2546,28 @@ def carry_forward_gateway_mac(snapshot, previous):
                   "hidden the next change."}
 
 
-def diff_snapshots(old, new):
+def describe_monitor_mac(mac, labels=None):
+    """`mac` with the owner's label, or marked as a private address — the only
+    two kinds of text the monitor adds to an alert, neither the device's to
+    choose."""
+    mac = str(mac or "").lower()
+    named = describe_mac(mac, labels)
+    if named == mac and is_randomized_mac(mac):
+        return f"{mac} {PRIVATE_MAC_VENDOR}"
+    return named
+
+
+def diff_snapshots(old, new, memory=None, labels=None):
     """Compare two snapshots into a list of {severity, kind, detail}.
 
     Ordered by how directly the change redirects traffic. A changed gateway MAC
     and a new IPv6 router are the two that mean someone is already in the path.
+
+    `memory` is what earlier polls on this network remembered ({mac: ...}, see
+    update_monitor_memory): a neighbour whose MAC is in it is a device coming
+    back, not arriving, and is not reported. Without it — the first polls after
+    an upgrade, or a reference saved before MACs were kept — the neighbour
+    comparison is by address, as it always was.
     """
     events = []
     if not old:
@@ -2302,12 +2587,78 @@ def diff_snapshots(old, new):
                       "its IP stayed the same. That is what ARP poisoning looks "
                       "like — someone may now be between this machine and the router."})
 
-    appeared = [r for r in new.get("ipv6_routers", []) if r not in old.get("ipv6_routers", [])]
+    # An address that answered with one hardware address a minute ago and
+    # another now. A DHCP lease moving to a different device takes hours and
+    # passes through the table empty; a swap inside one poll is what ARP
+    # spoofing of a host other than the gateway looks like — the one host-level
+    # signal nothing else watches.
+    old_nm = old.get("neighbour_macs") if isinstance(old.get("neighbour_macs"), dict) else {}
+    new_nm = new.get("neighbour_macs") if isinstance(new.get("neighbour_macs"), dict) else {}
+    for ip in sorted(set(old_nm) & set(new_nm)):
+        if ip in (old.get("gateway"), new.get("gateway")):
+            continue                        # gateway_mac_changed above covers it
+        was, now = str(old_nm[ip] or "").lower(), str(new_nm[ip] or "").lower()
+        if was and now and was != now:
+            events.append({
+                "severity": "HIGH", "kind": "neighbour_mac_changed",
+                "detail": f"The device at {ip} changed hardware address from "
+                          f"{describe_monitor_mac(was, labels)} to "
+                          f"{describe_monitor_mac(now, labels)} between two polls. A DHCP "
+                          "lease moving to another device takes hours and passes through "
+                          "the table empty; a swap inside one poll is what ARP spoofing "
+                          "of a host looks like."})
+
+    # Routers by MAC where the snapshot kept one: a router at a new link-local
+    # address with a MAC seen advertising before is the same router renumbered
+    # — Apple devices take a new address on every reboot — and is said at INFO.
+    old_rm = old.get("ipv6_router_macs") if isinstance(old.get("ipv6_router_macs"), dict) else {}
+    new_rm = new.get("ipv6_router_macs") if isinstance(new.get("ipv6_router_macs"), dict) else {}
+    old_router_macs = {str(m).lower() for m in old_rm.values() if m}
+    old_ri = old.get("ipv6_router_installed") if isinstance(old.get("ipv6_router_installed"), dict) else {}
+    new_ri = new.get("ipv6_router_installed") if isinstance(new.get("ipv6_router_installed"), dict) else {}
+    old_routers = old.get("ipv6_routers", []) or []
+    new_routers = new.get("ipv6_routers", []) or []
+    appeared, renumbered, promoted = [], [], []
+    for r in new_routers:
+        if r in old_routers:
+            if new_ri.get(r) is True and old_ri.get(r) is False:
+                promoted.append(r)
+            continue
+        mac = str(new_rm.get(r) or "").lower() or None
+        was = sorted(a for a, m in old_rm.items() if mac and str(m or "").lower() == mac)
+        # A known MAC at a new address is a renumbering — unless the newcomer is
+        # carrying the default route while the MAC's known router never did, or
+        # while that router is still advertising beside it. A MAC is the
+        # sender's to choose; that is what a rogue that copied it looks like.
+        cloned = (bool(was) and new_ri.get(r) is True
+                  and (not any(old_ri.get(a) is True for a in was)
+                       or any(a in new_routers for a in was)))
+        if mac and mac in old_router_macs and not cloned:
+            renumbered.append((r, mac, was[0] if was else None))
+        else:
+            appeared.append(r)
+    if promoted:
+        events.append({
+            "severity": "HIGH", "kind": "ipv6_router_installed",
+            "detail": "IPv6 router now carrying this machine's default route: "
+                      + ", ".join(f"{r} ({describe_monitor_mac(new_rm[r], labels)})" if new_rm.get(r) else r
+                                  for r in promoted)
+                      + ". It advertised without being taken as one before; a router that "
+                        "was harmless a minute ago and carries the traffic now is the change "
+                        "a rogue advertisement makes."})
     if appeared:
         events.append({
             "severity": "HIGH", "kind": "ipv6_router_appeared",
             "detail": f"New IPv6 router advertising: {', '.join(appeared)}. A rogue "
                       "Router Advertisement reroutes traffic with no IPv4 sign."})
+    if renumbered:
+        events.append({
+            "severity": "INFO", "kind": "ipv6_router_renumbered",
+            "detail": "IPv6 router renumbered: " + "; ".join(
+                f"{describe_monitor_mac(mac, labels)} now advertises from {r}"
+                + (f" (was {was})" if was else "")
+                for r, mac, was in renumbered)
+            + ". Same device, new link-local address; not a new router."})
 
     if set(old.get("dns", [])) != set(new.get("dns", [])):
         events.append({
@@ -2315,10 +2666,17 @@ def diff_snapshots(old, new):
             "detail": f"DNS resolvers changed from {old.get('dns')} to {new.get('dns')}."})
 
     new_neighbours = [n for n in new.get("neighbours", []) if n not in old.get("neighbours", [])]
+    if new_nm and memory:
+        # Known by identity: a device remembered on this network within the
+        # memory window is back, not new, whatever address it holds now.
+        new_neighbours = [ip for ip in new_neighbours
+                          if not (new_nm.get(ip) and str(new_nm[ip]).lower() in memory)]
     if new_neighbours:
+        named = [f"{ip} ({describe_monitor_mac(new_nm[ip], labels)})" if new_nm.get(ip) else ip
+                 for ip in new_neighbours]
         events.append({
             "severity": "REVIEW", "kind": "neighbour_appeared",
-            "detail": f"New device(s) on the LAN: {', '.join(new_neighbours)}."})
+            "detail": f"New device(s) on the LAN: {', '.join(named)}."})
 
     return events
 
@@ -2358,6 +2716,14 @@ def diff_snapshots(old, new):
 # running has state here; monitor_state_file() returns the per-network one that
 # is actually used, and falls back to this when it is the only thing present.
 MONITOR_STATE_FILE = os.path.join(BASELINE_DIR, "monitor_state.json")
+# How long the monitor remembers a device after it last answered, so a phone
+# waking up or a printer coming back is not "new". The weekly audit keeps the
+# same window (DEVICE_MEMORY_DAYS).
+MONITOR_MEMORY_DAYS = 30
+MONITOR_MEMORY_LIMIT = 1024
+# Polls a critical device may miss before its silence is alerted: ten minutes
+# at the default interval, long enough for a reboot, short enough to matter.
+CRITICAL_ABSENT_POLLS = 10
 
 # How often liveness is published. Every poll would mean 1440 sink writes a day
 # to say nothing; this bounds it. The cost is that a gap is only resolvable to
@@ -2458,7 +2824,124 @@ def load_monitor_queue():
     return [e for e in (queue or []) if isinstance(e, dict)][:MONITOR_QUEUE_LIMIT]
 
 
-def save_monitor_state(snapshot, at=None, undelivered=None):
+def load_monitor_memory():
+    """{mac: {"ip", "first_seen", "last_seen", ...}} as the last poll on this
+    network left it, read defensively; {} when nothing is remembered."""
+    try:
+        with open(monitor_state_file()) as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    memory = saved.get("memory") if isinstance(saved, dict) else None
+    out = {}
+    for mac, entry in (memory.items() if isinstance(memory, dict) else []):
+        if not (isinstance(mac, str) and isinstance(entry, dict)):
+            continue
+        mac = mac.lower()
+        last = entry.get("last_seen")
+        if not _MAC_SHAPE.match(mac) or _parse_stamp(last) is None:
+            continue
+        kept = dict(entry)
+        kept["first_seen"] = entry.get("first_seen") if _parse_stamp(entry.get("first_seen")) else last
+        kept["ip"] = entry.get("ip") if isinstance(entry.get("ip"), str) else None
+        out[mac] = kept
+    return out
+
+
+def update_monitor_memory(memory, snapshot, now=None):
+    """The memory after a poll: every neighbour seen now refreshed with its
+    address, the rest kept for MONITOR_MEMORY_DAYS from the last time they
+    answered, newest first past MONITOR_MEMORY_LIMIT.
+
+    What this buys: a phone that sleeps and wakes, a printer that drops out of
+    the ARP cache between jobs, a hub that reboots — none of them is "new" when
+    it comes back. The weekly audit learned this (DEVICE_MEMORY_DAYS); the
+    monitor compared bare address lists and raised hundreds of "new device"
+    alerts a week for the household's own devices, which is how a real one
+    gets missed. A snapshot with no MAC table (a poll that could not read ARP)
+    teaches nothing and expires nothing: "not seen" is not "not there".
+    """
+    now = now or _utcnow()
+    stamp = now.isoformat()
+    memory = {str(m).lower(): dict(e) for m, e in (memory or {}).items() if isinstance(e, dict)}
+    table = snapshot.get("neighbour_macs") if isinstance(snapshot, dict) else None
+    if not isinstance(table, dict) or not table:
+        return memory
+    for ip, mac in table.items():
+        mac = str(mac or "").lower()
+        if not _MAC_SHAPE.match(mac):
+            continue
+        entry = memory.get(mac) or {"first_seen": stamp}
+        entry["last_seen"] = stamp
+        entry["ip"] = ip
+        memory[mac] = entry
+    cutoff = now - timedelta(days=MONITOR_MEMORY_DAYS)
+    memory = {m: e for m, e in memory.items()
+              if (_parse_stamp(e.get("last_seen")) or now) >= cutoff}
+    if len(memory) > MONITOR_MEMORY_LIMIT:
+        keep = sorted(memory, key=lambda m: memory[m].get("last_seen") or "",
+                      reverse=True)[:MONITOR_MEMORY_LIMIT]
+        memory = {m: memory[m] for m in keep}
+    return memory
+
+
+def _poll_count(value):
+    """A counter read back from the state file: a whole number or nothing."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def critical_device_events(critical, snapshot, memory, labels=None, polls=None):
+    """Alerts for critical devices that have stopped answering, and for their
+    return. The absence counters live in `memory` and are updated in place.
+
+    Silence is counted in polls, not time: a poll that could not read the ARP
+    table (no MAC table, or an empty one) is skipped, because an unreadable
+    table is not evidence that the hub is gone. The caller hands over the
+    poll's own reading, never a carried-forward one. A device never seen on
+    this network has nothing to go missing from; the mark means something only
+    where the device has answered.
+    """
+    polls = CRITICAL_ABSENT_POLLS if polls is None else polls
+    events = []
+    critical = {str(m).lower() for m in (critical or ()) if isinstance(m, str)}
+    table = snapshot.get("neighbour_macs") if isinstance(snapshot, dict) else None
+    # An empty table is an unreadable one: a readable table always holds the
+    # gateway this machine has just pinged.
+    if not critical or not isinstance(table, dict) or not table:
+        return events
+    present = {}
+    for ip, mac in table.items():
+        if mac:
+            present.setdefault(str(mac).lower(), ip)
+    for mac in sorted(critical):
+        entry = memory.get(mac)
+        if entry is None:
+            continue
+        if mac in present:
+            if entry.get("absent_alerted"):
+                events.append({
+                    "severity": "REVIEW", "kind": "critical_device_back",
+                    "detail": f"Critical device {describe_monitor_mac(mac, labels)} is "
+                              f"answering again at {present[mac]} after "
+                              f"{_poll_count(entry.get('absent_polls'))} poll(s) of silence."})
+            entry["absent_polls"] = 0
+            entry["absent_alerted"] = False
+            continue
+        entry["absent_polls"] = _poll_count(entry.get("absent_polls")) + 1
+        if entry["absent_polls"] >= polls and not entry.get("absent_alerted"):
+            entry["absent_alerted"] = True
+            when = (entry.get("last_seen") or "")[:16].replace("T", " ")
+            events.append({
+                "severity": "HIGH", "kind": "critical_device_absent",
+                "detail": f"Critical device {describe_monitor_mac(mac, labels)} has not "
+                          f"answered for {entry['absent_polls']} poll(s) (last seen {when} "
+                          f"UTC at {entry.get('ip') or 'an unknown address'}). It is marked "
+                          "critical, so if it is not off on purpose it is not protecting "
+                          "anything."})
+    return events
+
+
+def save_monitor_state(snapshot, at=None, undelivered=None, memory=None):
     """Persist the reference snapshot so the next start has something to diff.
 
     Returns True on success. A monitor that cannot persist its reference still
@@ -2479,6 +2962,8 @@ def save_monitor_state(snapshot, at=None, undelivered=None):
             # nothing to retry: the HIGH that an in-path attacker dropped was
             # simply gone.
             payload["undelivered"] = list(undelivered)[-MONITOR_QUEUE_LIMIT:]
+        if memory:
+            payload["memory"] = memory
         _write_json_atomic(monitor_state_file(), payload)
         return True
     except OSError:
@@ -2625,26 +3110,51 @@ def describe_clock_anomalies(heartbeats, now=None):
     return "\n".join(lines) if lines else None
 
 
-def describe_observation_gaps(gaps):
+def describe_observation_gaps(gaps, monitored=True):
     """A risk-tagged line naming when nobody was watching, or None if nobody was.
 
     Silent when observation was continuous, so a healthy monitor adds no noise —
     the same bargain describe_comparison_coverage makes.
+
+    `monitored=False` is the wrapper saying this network has no monitor of its
+    own (--unmonitored): the one monitor process runs on the home network, and
+    the heartbeat log cannot know that. Left to the log alone, a network the Mac
+    once sat on for a few days — heartbeating under that network's chain the
+    whole time — read as "the monitor is not running now" at HIGH on every
+    audit afterwards, for ever, the open window growing by a week each time.
+    Said as information instead, with the last heartbeat named, and never as a
+    stopped monitor.
     """
     if not gaps:
         return None
     open_gap = [g for g in gaps if g.get("end") is None]
     longest = max(g["seconds"] for g in gaps)
+    last_beat = _stamp_text(open_gap[0]["start"]) if open_gap else None
+    if not monitored:
+        if open_gap:
+            return (f"  [INFO  ] Observation coverage: no continuous monitor is expected on "
+                    f"this network (--unmonitored). {len(gaps)} window(s) with no heartbeat "
+                    f"are on record under its chain, the last heartbeat at {last_beat}; "
+                    "they are not read as a stopped monitor. Between audits nothing "
+                    "watches this network.")
+        return (f"  [INFO  ] Observation coverage: {len(gaps)} window(s) with no heartbeat, "
+                f"the longest {_format_duration(longest)}, on a network audited with "
+                "--unmonitored — yet its heartbeats are current, so a monitor is running "
+                "on this network's chain after all.")
     risk = "HIGH" if open_gap else "REVIEW"
     if open_gap:
         tail = (f"including one still open ({_format_duration(open_gap[0]['seconds'])} "
-                "with no heartbeat) — the monitor is not running now")
+                f"with no heartbeat since {last_beat}) — the monitor is not running now")
     else:
         tail = f"the longest {_format_duration(longest)}"
-    return (f"  [{risk:6}] Observation coverage: {len(gaps)} window(s) with no "
+    line = (f"  [{risk:6}] Observation coverage: {len(gaps)} window(s) with no "
             f"monitoring, {tail}. Changes made and reverted inside those windows "
             "left no trace. Nothing is reported about them, which is not the same "
             "as nothing having happened.")
+    if open_gap:
+        line += (" If no monitor is meant to watch this network, audit it with "
+                 "--unmonitored and this becomes an informational line.")
+    return line
 
 
 def resolve_alert_sink(explicit=None):
@@ -2730,6 +3240,10 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     if undelivered:
         printer(f"  [REVIEW] {len(undelivered)} alert(s) queued by an earlier run were "
                 "never delivered; retrying them.")
+    # What this network's earlier polls remembered: who is a household device
+    # and where each critical one last answered. Read once; carried and saved
+    # with the reference every poll.
+    memory = load_monitor_memory()
     state_warned = False
     heartbeat_warned = False
 
@@ -2787,7 +3301,15 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     try:
         while iterations is None or count < iterations:
             polled_at = clock()
-            snapshot = monitor_snapshot()
+            labels = load_labels()
+            critical = load_critical()
+            critical_ips = [memory[m].get("ip") for m in sorted(critical)
+                            if m in memory and memory[m].get("ip")]
+            snapshot = monitor_snapshot(critical_ips) if critical_ips else monitor_snapshot()
+            # This poll's own reading, before any carry-forward: what nobody saw
+            # this minute must neither count a critical device silent nor teach
+            # the memory that every device was seen just now.
+            observed = snapshot
             snapshot, blank = carry_forward_blank_fields(snapshot, previous)
             if blank:
                 raised.append(blank)
@@ -2798,7 +3320,7 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 raised.append(carried)
                 printer(f"  [{carried['severity']:6}] {carried['detail']}")
                 _deliver(carried)
-            for event in diff_snapshots(previous, snapshot):
+            for event in diff_snapshots(previous, snapshot, memory=memory, labels=labels):
                 if resumed_gap is not None:
                     # The finding is real, but it was not witnessed happening,
                     # and the reader is entitled to know which of those they have.
@@ -2810,11 +3332,19 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 printer(f"  [{event['severity']:6}] {event['detail']}")
                 _deliver(event)
 
+            for event in critical_device_events(critical, observed, memory, labels):
+                raised.append(event)
+                printer(f"  [{event['severity']:6}] {event['detail']}")
+                _deliver(event)
+            # After the comparison, never before it: a device learned on this
+            # poll would otherwise be "remembered" by the time it was compared.
+            memory = update_monitor_memory(memory, observed, polled_at)
             previous = snapshot
             last_polled_at = polled_at
             resumed_gap = None          # only the first comparison spans the gap
             _retry_undelivered()
-            if (not save_monitor_state(snapshot, polled_at, undelivered=undelivered)
+            if (not save_monitor_state(snapshot, polled_at, undelivered=undelivered,
+                                       memory=memory)
                     and not state_warned):
                 state_warned = True
                 printer("  [HIGH  ] The reference snapshot could not be written to "
@@ -2853,7 +3383,7 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
             # rewritten with it so the next start retries what this one could
             # not — stamped with the last poll that actually completed, never
             # with now, or a stop during the first poll would erase the gap.
-            save_monitor_state(previous, last_polled_at, undelivered)
+            save_monitor_state(previous, last_polled_at, undelivered, memory=memory)
     if undelivered:
         printer(f"  [HIGH  ] {len(undelivered)} alert(s) never left this machine. "
                 "They are queued for the next start and listed above — if this "
@@ -3310,17 +3840,42 @@ def describe_evidence_basis(state, compact=False):
 
 
 def load_labels():
+    """The owner's {mac: name}, read defensively: the monitor reads this every
+    poll, and a hand edit that leaves the file unreadable or shaped as a list
+    costs the names, not the process."""
     try:
         with open(LABELS_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
+    return saved if isinstance(saved, dict) else {}
 
 
 def save_labels(labels):
     os.makedirs(BASELINE_DIR, exist_ok=True)
     with open(LABELS_FILE, "w") as f:
         json.dump(labels, f, indent=2)
+
+
+def load_critical():
+    """The MACs the owner marked critical with --critical, lowercased, as a set.
+
+    A plain list in critical.json beside labels.json. Read defensively: a
+    hand-edited file with a typo costs that entry, not the audit.
+    """
+    try:
+        with open(CRITICAL_FILE) as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    macs = saved if isinstance(saved, list) else (list(saved) if isinstance(saved, dict) else [])
+    return {m.lower() for m in macs if isinstance(m, str) and _MAC_SHAPE.match(m.lower())}
+
+
+def save_critical(macs):
+    os.makedirs(BASELINE_DIR, exist_ok=True)
+    with open(CRITICAL_FILE, "w") as f:
+        json.dump(sorted({str(m).lower() for m in macs}), f, indent=2)
 
 
 def load_networks():
@@ -3756,6 +4311,79 @@ def describe_returning_devices(old, new, labels=None):
     return "\n".join(lines)
 
 
+def renumbered_ipv6_routers(old, new):
+    """[(mac, new address, former address)]: routers advertising from a new
+    link-local address under a MAC the baseline already knew as a router."""
+    old_det = old.get("ipv6_router_details") if isinstance(old.get("ipv6_router_details"), dict) else {}
+    new_det = new.get("ipv6_router_details") if isinstance(new.get("ipv6_router_details"), dict) else {}
+    old_ra = [a for a in (old.get("ipv6_routers") or []) if isinstance(a, str)]
+    new_ra = [a for a in (new.get("ipv6_routers") or []) if isinstance(a, str)]
+    out = []
+    for addr in sorted(new_ra):
+        if addr in old_ra:
+            continue
+        mac = _ipv6_router_mac(new_det, addr)
+        if not mac:
+            continue
+        if _renumbering_is_suspect(mac, _ipv6_router_installed(new_det, addr) is True,
+                                   old_ra, old_det, new_ra):
+            continue                  # diff_baseline reports it as a new router
+        former = sorted(a for a in old_ra if _ipv6_router_mac(old_det, a) == mac)
+        if former:
+            out.append((mac, addr, former[0]))
+    return out
+
+
+def describe_ipv6_renumbering(old, new, labels=None):
+    """An INFO line per router that is the same device at a new address, or None.
+
+    Said every time it happens, by name, because it is worth knowing that the
+    hub rebooted; never counted as a change, because it is not one."""
+    moved = renumbered_ipv6_routers(old, new)
+    if not moved:
+        return None
+    return "\n".join(
+        f"  [INFO  ] IPv6 router renumbered: {describe_mac(mac, labels, new, old)} now "
+        f"advertises from {addr} (the baseline knew it as {was}). Same device, new "
+        "link-local address — Apple devices take one on every reboot. Not counted as "
+        "a new router."
+        for mac, addr, was in moved)
+
+
+def describe_critical_absences(old, new, critical, labels=None):
+    """A HIGH line naming every critical device this run did not find, or None.
+
+    The change lines say "gone" once, on the run after a device leaves, and the
+    next baseline no longer holds it; for a speaker that is right. A camera hub
+    or an alarm panel is different: its absence IS the finding for as long as
+    it lasts. So this line repeats on every run while the device memory (30
+    days) still remembers the device on this network — and only there, since a
+    hub marked critical from the sofa is still a device of one network.
+    """
+    critical = {str(m).lower() for m in (critical or ()) if isinstance(m, str)}
+    if not critical or not devices_identified(new):
+        return None
+    present = set()
+    for d in new.get("devices") or []:
+        mac = d.get("mac") if isinstance(d, dict) else None
+        if isinstance(mac, str):
+            present.add(mac.lower())
+    memory = remembered_devices(old)
+    missing = []
+    for mac in sorted(critical - present):
+        entry = memory.get(mac)
+        if not entry:
+            continue
+        when = (entry.get("last_seen") or "")[:16].replace("T", " ")
+        missing.append(f"{describe_mac(mac, labels, old)} (last seen {when} UTC)")
+    if not missing:
+        return None
+    return (f"  [HIGH  ] Critical device(s) not answering on this network: "
+            + "; ".join(missing) + ". Marked critical with --critical: if it is not off "
+            "on purpose, it is not protecting anything. Said on every run until it "
+            "answers or the memory of it expires.")
+
+
 def describe_mac(mac, labels=None, *states):
     """`mac` with what is known about it in brackets: the owner's label, or
     failing that the vendor recorded for it in one of `states`.
@@ -3866,7 +4494,7 @@ def describe_unconfirmed_listeners(old, new):
     return "\n".join(lines) if lines else None
 
 
-def diff_baseline(old, new, labels=None):
+def diff_baseline(old, new, labels=None, critical=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
     #
@@ -3957,6 +4585,18 @@ def diff_baseline(old, new, labels=None):
     appeared -= set(returning_devices(old, new))
     # An arrival is described from this run, where it was seen; a departure from
     # the baseline, the only place it still exists.
+    # A device the owner marked critical (--critical) leaving is said first and
+    # on its own line: a camera hub going quiet is not the same finding as a
+    # speaker going to sleep, and the plain "gone" line reads as the latter.
+    # describe_critical_absences repeats the finding on every later run while
+    # the device is still remembered; this line is the change itself.
+    critical = {str(m).lower() for m in (critical or ()) if isinstance(m, str)}
+    lost = sorted(vanished & critical)
+    vanished -= critical
+    if lost:
+        notes.append("CRITICAL device(s) gone since baseline: "
+                     + ", ".join(describe_mac(m, labels, old) for m in lost)
+                     + " — marked critical, so a security device has stopped answering.")
     if appeared:
         notes.append("NEW device(s) since baseline: "
                      + ", ".join(describe_mac(m, labels, new) for m in sorted(appeared)))
@@ -4120,15 +4760,65 @@ def diff_baseline(old, new, labels=None):
             "self-signed and stable, so this means it was re-issued or something "
             "is answering in the router's place.")
 
-    old_ra = set(old.get("ipv6_routers", []))
-    new_ra = set(new.get("ipv6_routers", []))
-    if new_ra - old_ra:
+    # Routers are compared by MAC where both sides recorded one. A router at a
+    # new link-local address with a MAC the baseline knows is the same router,
+    # renumbered — Apple devices take a fresh address on every reboot — and is
+    # reported by describe_ipv6_renumbering at INFO, not here as a change.
+    # Without a MAC on either side the address is all there is, and the
+    # comparison is what it always was.
+    old_ra = {a for a in (old.get("ipv6_routers") or []) if isinstance(a, str)}
+    new_ra = {a for a in (new.get("ipv6_routers") or []) if isinstance(a, str)}
+    old_det = old.get("ipv6_router_details") if isinstance(old.get("ipv6_router_details"), dict) else {}
+    new_det = new.get("ipv6_router_details") if isinstance(new.get("ipv6_router_details"), dict) else {}
+    old_ra_macs = {_ipv6_router_mac(old_det, a) for a in old_ra} - {None}
+    new_ra_macs = {_ipv6_router_mac(new_det, a) for a in new_ra} - {None}
+
+    def suspect(addr):
+        return _renumbering_is_suspect(_ipv6_router_mac(new_det, addr),
+                                       _ipv6_router_installed(new_det, addr) is True,
+                                       sorted(old_ra), old_det, sorted(new_ra))
+    ra_new = sorted(a for a in new_ra - old_ra
+                    if _ipv6_router_mac(new_det, a) not in old_ra_macs or suspect(a))
+    ra_gone = sorted(a for a in old_ra - new_ra if _ipv6_router_mac(old_det, a) not in new_ra_macs)
+    if ra_new:
         notes.append(
             "NEW IPv6 router advertising on the LAN: "
-            f"{sorted(new_ra - old_ra)} — a rogue Router Advertisement would "
+            f"{ra_new} — a rogue Router Advertisement would "
             "look exactly like this, and reroutes traffic with no IPv4 sign.")
-    if old_ra - new_ra:
-        notes.append(f"IPv6 router(s) no longer advertising: {sorted(old_ra - new_ra)}")
+    if ra_gone:
+        notes.append(f"IPv6 router(s) no longer advertising: {ra_gone}")
+    # A router the baseline knew that has since been taken as this machine's
+    # IPv6 default route (judged by address: a MAC is the sender's to choose),
+    # or that now hands out a prefix it did not before (judged by address or
+    # MAC), has changed what it can do.
+    for addr in sorted(new_ra):
+        entry = new_det.get(addr) if isinstance(new_det.get(addr), dict) else {}
+        mac = _ipv6_router_mac(new_det, addr)
+        who = describe_mac(mac, labels, new, old) if mac else addr
+        if (addr in old_ra and _ipv6_router_installed(new_det, addr) is True
+                and _ipv6_router_installed(old_det, addr) is False):
+            notes.append(
+                f"IPv6 router {who} is now this machine's IPv6 default route (via {addr}); "
+                "in the baseline it advertised without being taken as one. This machine's "
+                "IPv6 traffic now goes through it.")
+        before = [old_det.get(a) for a in old_ra
+                  if a == addr or (mac and _ipv6_router_mac(old_det, a) == mac)]
+        before = [b for b in before if isinstance(b, dict)]
+        # "Recorded none" (an empty list) counts as a record; a baseline with no
+        # prefixes key at all predates them and says nothing.
+        recorded = [b for b in before if isinstance(b.get("prefixes"), list)]
+        if not recorded:
+            continue
+        was_prefixes = set()
+        for b in recorded:
+            was_prefixes |= {p for p in b["prefixes"] if isinstance(p, str)}
+        now_prefixes = {p for p in (entry.get("prefixes") or []) if isinstance(p, str)}
+        extra = sorted(now_prefixes - was_prefixes)
+        if extra:
+            notes.append(
+                f"IPv6 router {who} now also advertises prefix(es) {extra}, not in the "
+                "baseline. A new prefix hands every device on the LAN an address and a "
+                "path it did not have.")
     if set(old.get("dns", [])) != set(new.get("dns", [])):
         notes.append(f"DNS servers CHANGED: was {old.get('dns')}, now {new.get('dns')}")
 
@@ -7077,7 +7767,8 @@ RENDERED_STATE_KEYS = frozenset({
     "devices", "scanned_subnets", "wifi", "wifi_bssids", "arp_spoof", "firewall",
     "sharing", "default_creds", "speed_download_mbps", "speed_upload_mbps",
     "upnp", "dhcp", "listening", "router_hostname", "evil_twin", "ipv6",
-    "ipv6_routers", "interception", "router_tls", "dsl", "upnp_listeners",
+    "ipv6_routers", "ipv6_router_details", "interception", "router_tls", "dsl",
+    "upnp_listeners",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
     # Bookkeeping written by save_baseline: which devices this network has seen.
@@ -8512,7 +9203,7 @@ def action_save_baseline(state):
     print(f"Saved sections: {', '.join(keys)}")
 
 
-def action_compare_baseline(state):
+def action_compare_baseline(state, unmonitored=False):
     hr("CHANGE DETECTION (vs saved baseline)")
     _subnet, _ = use_current_network_baseline()
     _net_line = describe_current_network(_subnet)
@@ -8526,7 +9217,7 @@ def action_compare_baseline(state):
         # Silent unless a monitor has actually run, so an audit-only user gains
         # no noise from a feature they are not using.
         _beats = read_heartbeats(_sink)
-        _gaps = describe_observation_gaps(observation_gaps(_beats))
+        _gaps = describe_observation_gaps(observation_gaps(_beats), monitored=not unmonitored)
         if _gaps:
             print(_gaps)
         # Future-stamped heartbeats are excluded from the coverage check above,
@@ -8554,7 +9245,7 @@ def action_compare_baseline(state):
         print("No data collected in this session to compare.")
         print("Run a Full Audit or individual checks first.")
         return
-    changes = diff_baseline(old, state, load_labels())
+    changes = diff_baseline(old, state, load_labels(), critical=load_critical())
     print(f"Baseline from: {old.get('timestamp', '?')}")
     # Above the verdict, because it qualifies the verdict: it is as true of a
     # short list of changes as it is of "No changes since baseline."
@@ -8570,6 +9261,12 @@ def action_compare_baseline(state):
     _back = describe_returning_devices(old, state, load_labels())
     if _back:
         print(_back)
+    _renumbered = describe_ipv6_renumbering(old, state, load_labels())
+    if _renumbered:
+        print(_renumbered)
+    _critical = describe_critical_absences(old, state, load_critical(), load_labels())
+    if _critical:
+        print(_critical)
     _held = describe_unconfirmed_listeners(old, state)
     if _held:
         print(_held)
@@ -8654,7 +9351,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
                       upstream_ip=None, tplink_password=None, subnet_overrides=None,
                       extra_subnets=None, probe_creds=False, no_discovery=False,
                       no_names=False, compact=False, host_sections_brief=False,
-                      upstream_reference=None):
+                      upstream_reference=None, unmonitored=False):
     state = {"timestamp": datetime.now(timezone.utc).isoformat()}
 
     hr("NETWORK INTERFACES")
@@ -8786,9 +9483,16 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     state["wifi_bssids"] = remembered_bssids(
         (load_baseline() or {}).get("wifi_bssids"), twin["bssids"])
 
-    ra = action_ipv6_routers((load_baseline() or {}).get("ipv6_routers"), compact=compact)
+    _known_ra = load_baseline() or {}
+    ra = action_ipv6_routers(_known_ra.get("ipv6_routers"), compact=compact,
+                             known_details=_known_ra.get("ipv6_router_details"),
+                             labels=load_labels())
     state["ipv6"] = ra
     state["ipv6_routers"] = ra["routers"]
+    # Sealed beside the addresses: the MAC behind each router and whether this
+    # machine took it as a default route, so the next run can tell a renumbered
+    # hub from a new router.
+    state["ipv6_router_details"] = ra.get("details") or {}
 
     # The three sections about this machine rather than the network. Always
     # checked and always recorded; printed in brief when an earlier network in
@@ -8846,7 +9550,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         # Silent unless a monitor has actually run, so an audit-only user gains
         # no noise from a feature they are not using.
         _beats = read_heartbeats(_sink)
-        _gaps = describe_observation_gaps(observation_gaps(_beats))
+        _gaps = describe_observation_gaps(observation_gaps(_beats), monitored=not unmonitored)
         if _gaps:
             tell(_gaps)
         # Future-stamped heartbeats are excluded from the coverage check above,
@@ -8867,7 +9571,7 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     if _freshness:
         tell(_freshness)
     if old:
-        changes = diff_baseline(old, state, load_labels())
+        changes = diff_baseline(old, state, load_labels(), critical=load_critical())
         tell(f"Baseline from: {old.get('timestamp', '?')}")
         _coverage = describe_comparison_coverage(old, state)
         if _coverage:
@@ -8881,6 +9585,12 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
         _back = describe_returning_devices(old, state, load_labels())
         if _back:
             tell(_back)
+        _renumbered = describe_ipv6_renumbering(old, state, load_labels())
+        if _renumbered:
+            tell(_renumbered)
+        _critical = describe_critical_absences(old, state, load_critical(), load_labels())
+        if _critical:
+            tell(_critical)
         _held = describe_unconfirmed_listeners(old, state)
         if _held:
             tell(_held)
@@ -9130,6 +9840,17 @@ def _main():
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
                     help="Tag a device MAC with a friendly name")
+    ap.add_argument("--critical", nargs="+", metavar="MAC",
+                    help="Mark device(s) whose silence matters — a camera hub, an alarm. "
+                         "Gone from a network it was seen on, a critical device is HIGH "
+                         "on every run until it answers, and --monitor alerts within "
+                         "minutes. Given on its own, saves the mark and exits.")
+    ap.add_argument("--not-critical", nargs="+", metavar="MAC",
+                    help="Remove the critical mark from device(s).")
+    ap.add_argument("--unmonitored", action="store_true",
+                    help="This network has no continuous monitor of its own (--monitor "
+                         "runs on another network). Heartbeat gaps found under its chain "
+                         "are reported as information, never as a stopped monitor.")
     ap.add_argument("--no-discovery", action="store_true",
                     help="Skip the LAN device sweep")
     ap.add_argument("--no-speedtest", action="store_true",
@@ -9166,15 +9887,19 @@ def _main():
                     help="Force interactive menu")
     args = ap.parse_args()
 
-    cli_args_given = any([
+    # The flags that ask for an audit, apart from the ones that only mark a
+    # device (--label, --critical, --not-critical) and the monitor.
+    audit_flags = [
         args.subnet, getattr(args, "extra_subnet", None), args.upstream,
         args.full, args.no_vendors, args.no_names, args.compact,
         args.host_sections_brief, args.upstream_reference,
-        args.no_save_baseline, args.label,
+        args.no_save_baseline, args.unmonitored,
         args.no_discovery, args.no_speedtest, args.tplink_password,
         args.tplink_password_prompt, args.probe_creds, args.html_report,
-        args.seal_baseline, args.publish_to, args.monitor,
-    ])
+        args.seal_baseline, args.publish_to,
+    ]
+    cli_args_given = any(audit_flags + [args.label, args.critical, args.not_critical,
+                                        args.monitor])
 
     if args.monitor:
         run_monitor(interval=args.interval, alert_to=args.alert_to)
@@ -9209,6 +9934,29 @@ def _main():
         save_labels(labels)
         print(f"Labels saved ({len(labels)} total).\n")
 
+    if args.critical or args.not_critical:
+        critical = load_critical()
+        for mac in args.critical or []:
+            mac = mac.strip().lower()
+            if _MAC_SHAPE.match(mac):
+                critical.add(mac)
+                if is_randomized_mac(mac):
+                    print(f"Note: {mac} is a private (randomised) address. The weekly audit "
+                          "does not follow those across runs, so only the monitor can report "
+                          "it absent.")
+            else:
+                print(f"Not a MAC address, so not marked critical: {mac}")
+        for mac in args.not_critical or []:
+            critical.discard(mac.strip().lower())
+        save_critical(critical)
+        print(f"Critical devices saved ({len(critical)} total): "
+              f"{', '.join(sorted(critical)) or 'none'}\n")
+        # Marking a device is a bookkeeping edit, not a request for an audit:
+        # on its own it stops here rather than scanning the network it was
+        # typed on.
+        if not any(audit_flags) and not args.label:
+            return
+
     # One-line section headers whenever the report is compact: the boxed style
     # was a third of the emailed report. Interactive and plain runs keep the box.
     with header_style(HEADER_LINE if args.compact else HEADER_BOXED):
@@ -9225,7 +9973,8 @@ def _main():
             no_names=args.no_names,
             compact=args.compact,
             host_sections_brief=args.host_sections_brief,
-        upstream_reference=args.upstream_reference,
+            upstream_reference=args.upstream_reference,
+            unmonitored=args.unmonitored,
         )
 
     # Everything said about the save is kept for the HTML report as well: the
