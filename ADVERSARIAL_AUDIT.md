@@ -314,7 +314,7 @@ A review pass over the commit (four finders over the diff, two skeptics each; 24
 
 Deployment, by hand after merging and not in this repository: in `~/.home_net_audit/run_audit.sh` pass `--unmonitored` to `audit_here` for every network except the home one; mark the Arlo hub with `python3 home_net_audit.py --critical a4:11:62:2a:b9:0a`. The first Sunday prints one REVIEW "audit code changed" line per network, as every code change does, and one NEW flagged item for the reworded coverage line.
 
-# Round 5 — the monitor knows its network (2026-11-01)
+## Round 5 — the monitor's network and IPv6 identity (2026-11-01)
 `home_net_audit.py` @ `883364d` (the merge of PR #42) · the seven identity findings of the round-4 attack audit (twelve finders, three skeptics per finding; the full record with evidence and reproductions is kept outside the repository as `round4-attack-audit-2026-11-01.md`) · **all seven fixed in the following commit, 2179 tests passing (71 added in `tests/test_network_identity.py`).**
 
 Threat model (a) and (c) at once: every finding is the tool losing track of WHICH network it was describing, or of WHO was advertising on it — a false all-clear filed under one network's chain, a false alarm raised from another's reference.
