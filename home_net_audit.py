@@ -6076,6 +6076,33 @@ def action_wifi_security():
 # NEW FEATURE 2: Rogue DHCP detector
 # ---------------------------------------------------------------------------
 
+DHCP_OVERLOAD_FILE = 1      # RFC 2132 §9.3: the 'file' field holds options
+DHCP_OVERLOAD_SNAME = 2     # the 'sname' field holds options
+
+
+def _walk_dhcp_options(data, start, end, options):
+    """Read the option TLVs in data[start:end] into `options`, up to the end
+    marker. A code seen again has its data appended (RFC 3396), so an option
+    sent twice, or split across areas, keeps every byte visible — the
+    poisoned second router is listed beside the benign first, not under it."""
+    i = start
+    while i < end:
+        code = data[i]
+        if code == 255:                 # end
+            break
+        if code == 0:                   # pad
+            i += 1
+            continue
+        if i + 1 >= end:
+            break
+        length = data[i + 1]
+        value = data[i + 2:min(i + 2 + length, end)]
+        if len(value) < length:
+            break                       # truncated packet or field
+        options[code] = options[code] + value if code in options else value
+        i += 2 + length
+
+
 def parse_dhcp_options(data):
     """Split the option TLVs out of a DHCP packet into {code: bytes}.
 
@@ -6089,26 +6116,24 @@ def parse_dhcp_options(data):
     decoy cookie there followed by an 0xff terminator ended the option walk
     before it reached offset 236. The audit then reported the benign gateway
     from the decoy while the client applied the poisoned one that follows.
+
+    Those two fields are read on one condition only: option 52 (overload) in
+    the options area saying they hold options, which is when a client reads
+    them too. A server may put a router, resolver or static route there and
+    nowhere else — macOS configd and dhclient apply it — and this parser
+    never looked, so a poisoned gateway hidden in the file field described
+    as router=[] and the baseline comparison had nothing to compare.
     """
     if len(data) < 240 or data[236:240] != b"\x63\x82\x53\x63":
         return {}
     options = {}
-    i = 240
-    while i < len(data):
-        code = data[i]
-        if code == 255:                 # end
-            break
-        if code == 0:                   # pad
-            i += 1
-            continue
-        if i + 1 >= len(data):
-            break
-        length = data[i + 1]
-        value = data[i + 2:i + 2 + length]
-        if len(value) < length:
-            break                       # truncated packet
-        options[code] = value
-        i += 2 + length
+    _walk_dhcp_options(data, 240, len(data), options)
+    overload = options.get(52, b"")
+    flag = overload[0] if overload else 0
+    if flag & DHCP_OVERLOAD_FILE:
+        _walk_dhcp_options(data, 108, 236, options)
+    if flag & DHCP_OVERLOAD_SNAME:
+        _walk_dhcp_options(data, 44, 108, options)
     return options
 
 
@@ -6145,7 +6170,63 @@ def decode_classless_routes(value):
 
 def describe_dhcp_offer(data):
     """The parts of an OFFER that decide where this machine's traffic goes."""
-    options = parse_dhcp_options(data)
+    return describe_dhcp_options(parse_dhcp_options(data))
+
+
+def dhcp_server_identifier(options):
+    """Option 54, the address the server says it is, or None."""
+    addresses = _addresses(options.get(54, b""))
+    return addresses[0] if addresses else None
+
+
+def dhcp_offer_key(offer):
+    """What makes two OFFERs the same offer: the identity the server claims
+    (option 54, falling back to the datagram's source) and what it hands out.
+
+    De-duplicating on the UDP source alone keyed the whole check on the one
+    field a LAN host forges for free. A rogue stamping the genuine server's
+    address collapsed into the genuine server's entry; first datagram wins, so
+    the count stayed at one and whichever OFFER arrived first — the rogue's,
+    by design — was the one baselined as known-good."""
+    return (offer.get("server_id") or offer.get("ip"), offer.get("offered_ip"),
+            tuple(offer.get("router") or ()), tuple(offer.get("dns") or ()),
+            tuple(offer.get("static_routes") or ()))
+
+
+def summarise_dhcp_responders(responders):
+    """{"servers", "conflicts", "spoofed"} over a list of distinct offers.
+
+    `servers` are the identities that answered; `conflicts` the fields on
+    which offers under ONE identity disagree — two servers answering under
+    one Server Identifier, which is what a rogue forging the real server's
+    address produces; `spoofed` the offers whose source address is not the
+    identifier they claim (a relay agent, or a forged source)."""
+    by_server = {}
+    for r in responders or []:
+        if not isinstance(r, dict):
+            continue
+        ident = r.get("server_id") or r.get("ip")
+        by_server.setdefault(ident, []).append(r)
+    conflicts = []
+    for ident, offers in by_server.items():
+        for field, label in (("router", "router"), ("dns", "DNS servers"),
+                             ("static_routes", "static routes")):
+            values = []
+            for o in offers:
+                v = tuple(o.get(field) or ())
+                if v not in values:
+                    values.append(v)
+            if len(values) > 1:
+                conflicts.append({"server": ident, "field": label,
+                                  "values": [list(v) for v in values]})
+    spoofed = [{"ip": r.get("ip"), "server_id": r.get("server_id")}
+               for r in (responders or []) if isinstance(r, dict)
+               and r.get("server_id") and r.get("ip") and r.get("server_id") != r.get("ip")]
+    return {"servers": sorted(by_server, key=str), "conflicts": conflicts, "spoofed": spoofed}
+
+
+def describe_dhcp_options(options):
+    """The parts of an option set that decide where this machine's traffic goes."""
     described = {
         "router": _addresses(options.get(3, b"")),
         "dns": _addresses(options.get(6, b"")),
@@ -6224,6 +6305,7 @@ def check_rogue_dhcp(timeout=4):
     packet += options
 
     responders = []
+    seen = set()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -6244,10 +6326,16 @@ def check_rogue_dhcp(timeout=4):
                     offered_ip = socket.inet_ntoa(data[16:20])
                 else:
                     offered_ip = "unknown"
-                # Avoid duplicates
-                if not any(r["ip"] == server_ip for r in responders):
-                    responders.append({"ip": server_ip, "offered_ip": offered_ip,
-                                       **describe_dhcp_offer(data)})
+                options = parse_dhcp_options(data)
+                offer = {"ip": server_ip, "server_id": dhcp_server_identifier(options),
+                         "offered_ip": offered_ip, **describe_dhcp_options(options)}
+                # One entry per distinct offer: a server repeating its OFFER
+                # is one responder; a second OFFER under the same identity
+                # that hands out something else is kept, and is the finding.
+                key = dhcp_offer_key(offer)
+                if key not in seen:
+                    seen.add(key)
+                    responders.append(offer)
             except socket.timeout:
                 break
             except OSError:
@@ -6279,17 +6367,38 @@ def action_rogue_dhcp():
         print("  No DHCP responses received (normal if your router uses unicast).")
         return {"responders": []}
 
-    print(f"  {len(responders)} DHCP server(s) responded:")
+    summary = summarise_dhcp_responders(responders)
+    servers = summary["servers"]
+    print(f"  {len(responders)} distinct DHCP offer(s) from {len(servers)} server identit"
+          f"{'y' if len(servers) == 1 else 'ies'}:")
     for r in responders:
-        print(f"    {r['ip']}  →  offered IP: {r['offered_ip']}")
+        claim = (f" (Server Identifier {r['server_id']})"
+                 if r.get("server_id") and r["server_id"] != r["ip"] else "")
+        print(f"    {r['ip']}{claim}  →  offered IP: {r['offered_ip']}, router {r.get('router')}, "
+              f"DNS {r.get('dns')}" + (f", routes {r['static_routes']}" if r.get("static_routes") else ""))
 
-    if len(responders) > 1:
+    if len(servers) > 1:
         print("  [HIGH] Multiple DHCP servers detected! One may be a rogue server.")
         print("         A rogue DHCP server can redirect all your traffic. Investigate immediately.")
+    elif summary["conflicts"]:
+        # Counted by the identity the server claims, one identity made offers
+        # that disagree: two servers answering under one Server Identifier,
+        # which is what a rogue forging the real server's address produces.
+        # Counting the source addresses read this as "[OK] Only one".
+        disagreements = "; ".join(f"{c['field']} {' vs '.join(str(v) for v in c['values'])}"
+                                  for c in summary["conflicts"])
+        print(f"  [HIGH] One DHCP server identity ({summary['conflicts'][0]['server']}) made offers "
+              f"that disagree: {disagreements}.")
+        print("         Two servers are answering under one Server Identifier — a rogue forging the "
+              "real server's address.")
+        print("         Whichever offer a client takes first wins. Investigate immediately.")
     else:
-        print("  [OK] Only one DHCP server responded.")
+        print(f"  [OK] Only one DHCP server responded ({servers[0]}), and its offers agree.")
+    for s in summary["spoofed"]:
+        print(f"  [REVIEW] The offer from {s['ip']} names Server Identifier {s['server_id']}, a "
+              "different address: a relay agent, or a forged source.")
 
-    return {"responders": responders}
+    return {"responders": responders, "summary": summary}
 
 
 # ---------------------------------------------------------------------------
