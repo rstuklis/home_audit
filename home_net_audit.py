@@ -979,6 +979,19 @@ UNREACHABLE_ERRNOS = frozenset((
     errno.EHOSTDOWN,        # host down
 ))
 
+# A connect that got no answer at all before the timeout: no SYN-ACK, no RST.
+# A firewall dropping the probe, a host that is down or rebooting, and a
+# network that cannot deliver to it all look exactly like this, and none of
+# them is "the port is closed" — a closed port answers, with a reset.
+FILTERED_ERRNOS = frozenset((
+    errno.ETIMEDOUT,
+    errno.EAGAIN,           # what connect_ex returns when the socket timeout fires
+    errno.EWOULDBLOCK,
+    errno.EINPROGRESS,
+    errno.EALREADY,
+))
+PORT_FILTERED = "filtered"
+
 
 def local_network_denied_note(what):
     """The note for a check the OS refused to let off this machine.
@@ -1009,7 +1022,8 @@ def local_network_denied_note(what):
 
 
 def probe_port(host, port, timeout=0.6):
-    """Probe one TCP port. True = open, False = closed, None = unreachable.
+    """Probe one TCP port. True = open, False = closed, None = unreachable,
+    PORT_FILTERED = nothing answered before the timeout.
 
     The None case is the point of this function. macOS Local Network privacy
     denies a background/launchd process any connection to its own subnet, and
@@ -1017,8 +1031,16 @@ def probe_port(host, port, timeout=0.6):
     closed port if the result is collapsed to a boolean. That collapse is what
     let a blocked scheduled audit report "no open ports on your router" as
     fact, and write that empty list into the baseline as known-good. Keep the
-    three states apart so a caller can tell "nothing is listening" from "I was
+    states apart so a caller can tell "nothing is listening" from "I was
     never allowed to ask".
+
+    The filtered case is the same mistake one step on. A timed-out connect
+    (ETIMEDOUT, or the EAGAIN the socket timeout returns) also collapsed to
+    "closed", so a modem that drops probes from one network, or is rebooting
+    during the 0.6 s window, read as "no open ports" — a measurement — and
+    was saved as an empty port list. The next week's real reading then
+    flipped to "NEW open port(s) on upstream modem ... faces the internet". An
+    instant RST and a never-answering host are not the same verdict.
     """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1027,13 +1049,19 @@ def probe_port(host, port, timeout=0.6):
             rc = s.connect_ex((host, port))
         finally:
             s.close()
+    except socket.timeout:
+        return PORT_FILTERED
     except OSError as e:
         # socket() itself can raise (e.g. EMFILE "too many open files" under
         # high worker counts). Preserve the unreachable distinction here too.
-        return None if e.errno in UNREACHABLE_ERRNOS else False
+        if e.errno in UNREACHABLE_ERRNOS:
+            return None
+        return PORT_FILTERED if e.errno in FILTERED_ERRNOS else False
     if rc == 0:
         return True
-    return None if rc in UNREACHABLE_ERRNOS else False
+    if rc in UNREACHABLE_ERRNOS:
+        return None
+    return PORT_FILTERED if rc in FILTERED_ERRNOS else False
 
 
 def check_port(host, port, timeout=0.6):
@@ -1050,14 +1078,21 @@ def check_port(host, port, timeout=0.6):
 def scan_ports_detailed(host, ports, workers=100):
     """Scan `ports` and report whether the host could be reached at all.
 
-    Returns {"open": sorted list, "unreachable": int, "probed": int,
-             "blocked": bool}. `blocked` is True only when every probe came
-    back unreachable, which is the signature of a host that is off the network
-    or a scan the OS refused outright — as opposed to a few probes failing
-    while others got a real answer.
+    Returns {"open": sorted list, "unreachable": int, "filtered": int,
+             "answered": int, "probed": int, "blocked": bool, "unanswered": bool}.
+    `blocked` is True only when every probe came back unreachable, which is
+    the signature of a host that is off the network or a scan the OS refused
+    outright — as opposed to a few probes failing while others got a real
+    answer. `unanswered` is True when no probe got an answer of either kind
+    (open, or closed with a reset) and the scan was not blocked: every one
+    timed out or was unreachable. That is a host that could not be measured,
+    not a host with nothing listening, and callers must not save it as an
+    empty port list.
     """
     open_ports = []
     unreachable = 0
+    filtered = 0
+    answered = 0
     probed = 0
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = {pool.submit(probe_port, host, p): p for p in ports}
@@ -1070,13 +1105,22 @@ def scan_ports_detailed(host, ports, workers=100):
             probed += 1
             if result is True:
                 open_ports.append(results[fut])
+                answered += 1
             elif result is None:
                 unreachable += 1
+            elif result == PORT_FILTERED:
+                filtered += 1
+            else:
+                answered += 1
+    blocked = probed > 0 and unreachable == probed
     return {
         "open": sorted(open_ports),
         "unreachable": unreachable,
+        "filtered": filtered,
+        "answered": answered,
         "probed": probed,
-        "blocked": probed > 0 and unreachable == probed,
+        "blocked": blocked,
+        "unanswered": probed > 0 and answered == 0 and not blocked,
     }
 
 
@@ -4836,10 +4880,25 @@ def diff_baseline(old, new, labels=None, critical=None):
                          "device on the LAN that asks; turn it off unless something needs it.")
             notes.append(note)
 
-    for key, host in (("router_open_ports", "router"),
-                      ("upstream_open_ports", "upstream modem")):
+    for key, host, scan_key in (("router_open_ports", "router", "router_scan"),
+                                ("upstream_open_ports", "upstream modem", "upstream_scan")):
         old_ports = old.get(key)
         new_ports = new.get(key)
+        # The baseline's own scan of this host went unanswered: whatever port
+        # list it holds was carried from an earlier run, and this run's reading
+        # is the first since — "the host answered again", not ports opening.
+        # Diffing the carried list against the new one produced two
+        # CHANGES DETECTED emails describing a modem that rebooted during one
+        # 0.6 s window: "now closed" that week and "NEW open ... faces the
+        # internet" the week after.
+        old_scan = old.get(scan_key) if isinstance(old.get(scan_key), dict) else {}
+        if old_scan.get("result") == "filtered" and isinstance(new_ports, list):
+            notes.append(
+                f"The {host} became reachable from this network: open ports "
+                f"{sorted(set(new_ports))}. The baseline's scan of it was FILTERED (no probe "
+                "was answered), so this is the first reading since, not ports opening or "
+                "closing.")
+            continue
         if old_ports is None or new_ports is None:
             continue
         old_ports = set(old_ports)
@@ -7985,6 +8044,8 @@ RENDERED_STATE_KEYS = frozenset({
     "upnp", "dhcp", "listening", "router_hostname", "evil_twin", "ipv6",
     "ipv6_routers", "ipv6_router_details", "interception", "router_tls", "dsl",
     "upnp_listeners",
+    # How each port scan went (measured / blocked / filtered), beside its list.
+    "router_scan", "upstream_scan",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
     # Bookkeeping written by save_baseline: which devices this network has seen.
@@ -8391,7 +8452,13 @@ def generate_html_report(state, output_path=None):
     # Upstream modem ports
     if "upstream_open_ports" in state:
         ports = state["upstream_open_ports"]
-        if ports is None:
+        upstream_scan = state.get("upstream_scan") if isinstance(state.get("upstream_scan"), dict) else {}
+        if ports is None and upstream_scan.get("result") == "filtered":
+            body = (f"<p>{risk_badge('REVIEW')} No probe to the upstream modem was answered "
+                    "(FILTERED): not open, and not closed either, since a closed port "
+                    "answers with a reset. Nothing is known about which ports it exposes "
+                    "this run; the previous reading is carried forward.</p>")
+        elif ports is None:
             body = (f"<p>{risk_badge('REVIEW')} The upstream modem could not be "
                     "scanned, so nothing is known about which ports it exposes.</p>")
         elif ports:
@@ -8706,7 +8773,8 @@ def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
             "age_min": int((now - stamp).total_seconds() // 60)}
 
 
-def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None):
+def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None,
+               outcomes=None):
     """Port-scan one host, print a risk-annotated summary, and return open ports.
 
     Shared by action_port_scan and action_full_audit (previously duplicated).
@@ -8717,6 +8785,13 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
     machine (None = not known) and only tempers that verdict's wording. If
     `verdicts` is a dict, the verdict is stored in it under the host's address
     so the caller can keep it; the return value stays the list of ports.
+
+    If `outcomes` is a dict, how the scan went is stored in it under the host's
+    address: {"result": "measured" | "blocked" | "filtered", "probed",
+    "answered", "filtered", "unreachable"}. The return value is None for both
+    of the last two results — nothing is known about the ports — and the
+    outcome is what lets the saved baseline say which it was, so the next
+    comparison can tell "the modem answered again" from "ports opened".
 
     `reference` (see load_upstream_reference) is what an earlier network in the
     same report found on this host. When this scan agrees with it — the same
@@ -8731,11 +8806,17 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
     t0 = time.time()
     scan = scan_ports_detailed(host, port_set)
     open_ports = scan["open"]
+    outcome = {"result": "measured", "probed": scan["probed"],
+               "answered": scan.get("answered", 0), "filtered": scan.get("filtered", 0),
+               "unreachable": scan["unreachable"]}
+    if outcomes is not None:
+        outcomes[host] = outcome
     if scan["blocked"]:
         # Every probe returned "unreachable", so this is not a host with
         # nothing listening — it is a host we were never able to ask. Saying
         # "none found" here would be a fabrication, and saving it as [] would
         # tell the next run that the ports had closed.
+        outcome["result"] = "blocked"
         print(f"Done in {time.time()-t0:.1f}s. UNKNOWN — could not reach {host}.")
         print(f"  [REVIEW] All {scan['probed']} probes returned 'unreachable' "
               f"before any timeout, so the result is not 'no open ports'.")
@@ -8749,6 +8830,24 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
                   "scan this host, or start\n           the scheduled job through the "
                   "launcher app built by\n           tools/audit_launcher/build.sh, which "
                   "macOS can grant this access to.")
+        return None
+    if scan.get("unanswered"):
+        # No probe was answered: not open, and not closed either, since a
+        # closed port answers with a reset. This used to print "none found"
+        # and return [], a measurement, which the baseline kept and the next
+        # real reading contradicted as "NEW open port(s) ... faces the
+        # internet". The IoT network, cut off from the modem by design, held
+        # exactly that empty list as fact.
+        outcome["result"] = "filtered"
+        print(f"Done in {time.time()-t0:.1f}s. FILTERED: no probe was answered.")
+        print(f"  [REVIEW] None of the {scan['probed']} probes to {host} was answered "
+              f"({scan.get('filtered', 0)} timed out, {scan['unreachable']} unreachable), so "
+              "this is not 'no open ports':")
+        print("           a closed port answers with a reset. A firewall dropping probes from "
+              "this network, a host that is")
+        print("           down or rebooting, or a path that cannot reach it all look like this. "
+              "Nothing is recorded about its")
+        print("           ports this run; the previous reading is carried forward.")
         return None
     print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
     # Classified before anything is printed, because whether the section can be
@@ -9587,10 +9686,16 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     # What an open port 1900 turned out to be, per scanned host. Only present
     # when a scan found one, so a run with nothing to classify gains no key.
     upnp_listeners = {}
+    # How each scan went: measured, blocked by the OS, or filtered (no probe
+    # answered). Sealed beside the port lists, so a baseline whose port list
+    # was carried forward from an earlier run also says why.
+    scan_outcomes = {}
     if gateway:
         state["router_open_ports"] = audit_host(
             "default gateway", gateway, full_scan,
-            onlink=is_onlink(gateway, interfaces), verdicts=upnp_listeners)
+            onlink=is_onlink(gateway, interfaces), verdicts=upnp_listeners,
+            outcomes=scan_outcomes)
+        state["router_scan"] = scan_outcomes.get(gateway)
         state["router_tls"] = check_tls(gateway)
     if upstream_ip:
         hr("UPSTREAM MODEM")
@@ -9598,7 +9703,9 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
             "upstream modem", upstream_ip, full_scan,
             onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners,
             reference=(load_upstream_reference(upstream_reference, upstream_ip, _subnet)
-                       if upstream_reference else None))
+                       if upstream_reference else None),
+            outcomes=scan_outcomes)
+        state["upstream_scan"] = scan_outcomes.get(upstream_ip)
     if upnp_listeners:
         state["upnp_listeners"] = upnp_listeners
 

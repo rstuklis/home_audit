@@ -123,3 +123,52 @@ class TestScanScope:
     def test_the_default_scan_announces_the_common_port_count(self, mod, host, capsys):
         host(_scan(open_ports=[]))
         assert str(len(mod.COMMON_PORTS)) in capsys.readouterr().out
+
+
+def _filtered(probed=25, filtered=25, unreachable=0):
+    return {"open": [], "probed": probed, "unreachable": unreachable, "filtered": filtered,
+            "answered": 0, "blocked": False, "unanswered": True}
+
+
+class TestFilteredScan:
+    """No probe answered. Round 4, F34: this printed 'none found' and returned
+    [], a measurement the baseline kept."""
+
+    def test_returns_none_rather_than_an_empty_list(self, host, capsys):
+        assert host(_filtered()) is None
+
+    def test_says_filtered_and_never_none_found(self, host, capsys):
+        host(_filtered())
+        out = capsys.readouterr().out
+        assert "FILTERED: no probe was answered" in out
+        assert "none found" not in out and "Open ports:" not in out
+
+    def test_it_is_a_review_line_naming_the_counts(self, host, capsys):
+        host(_filtered(filtered=20, unreachable=5))
+        out = capsys.readouterr().out
+        assert "[REVIEW]" in out and "25 probes" in out and "20 timed out" in out and "5 unreachable" in out
+        assert "carried forward" in out
+
+    def test_the_outcome_is_recorded_for_the_caller(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "scan_ports_detailed", lambda h, ports, workers=100: _filtered())
+        monkeypatch.setattr(mod, "check_tls", lambda h, port=443: {"present": False})
+        outcomes = {}
+        assert mod.audit_host("upstream modem", "192.168.1.1", outcomes=outcomes) is None
+        assert outcomes["192.168.1.1"]["result"] == "filtered"
+        assert outcomes["192.168.1.1"]["probed"] == 25
+
+    @pytest.mark.parametrize("scan,result", [
+        (_scan(open_ports=[80]), "measured"),
+        (_scan(open_ports=[]), "measured"),
+        (_scan(blocked=True), "blocked"),
+    ], ids=["ports", "empty", "blocked"])
+    def test_the_other_outcomes_are_recorded_too(self, mod, monkeypatch, scan, result):
+        monkeypatch.setattr(mod, "scan_ports_detailed", lambda h, ports, workers=100: scan)
+        monkeypatch.setattr(mod, "check_tls", lambda h, port=443: {"present": False})
+        outcomes = {}
+        mod.audit_host("default gateway", "192.168.87.1", outcomes=outcomes)
+        assert outcomes["192.168.87.1"]["result"] == result
+
+    def test_a_scan_result_without_the_new_keys_is_still_a_measurement(self, host):
+        # scan_ports_detailed results from before `unanswered` existed.
+        assert host(_scan(open_ports=[22])) == [22]
