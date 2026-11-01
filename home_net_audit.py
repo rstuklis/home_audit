@@ -1191,6 +1191,19 @@ UNREACHABLE_ERRNOS = frozenset((
     errno.EHOSTDOWN,        # host down
 ))
 
+# A connect that got no answer at all before the timeout: no SYN-ACK, no RST.
+# A firewall dropping the probe, a host that is down or rebooting, and a
+# network that cannot deliver to it all look exactly like this, and none of
+# them is "the port is closed" — a closed port answers, with a reset.
+FILTERED_ERRNOS = frozenset((
+    errno.ETIMEDOUT,
+    errno.EAGAIN,           # what connect_ex returns when the socket timeout fires
+    errno.EWOULDBLOCK,
+    errno.EINPROGRESS,
+    errno.EALREADY,
+))
+PORT_FILTERED = "filtered"
+
 
 def local_network_denied_note(what):
     """The note for a check the OS refused to let off this machine.
@@ -1221,7 +1234,8 @@ def local_network_denied_note(what):
 
 
 def probe_port(host, port, timeout=0.6):
-    """Probe one TCP port. True = open, False = closed, None = unreachable.
+    """Probe one TCP port. True = open, False = closed, None = unreachable,
+    PORT_FILTERED = nothing answered before the timeout.
 
     The None case is the point of this function. macOS Local Network privacy
     denies a background/launchd process any connection to its own subnet, and
@@ -1229,8 +1243,16 @@ def probe_port(host, port, timeout=0.6):
     closed port if the result is collapsed to a boolean. That collapse is what
     let a blocked scheduled audit report "no open ports on your router" as
     fact, and write that empty list into the baseline as known-good. Keep the
-    three states apart so a caller can tell "nothing is listening" from "I was
+    states apart so a caller can tell "nothing is listening" from "I was
     never allowed to ask".
+
+    The filtered case is the same mistake one step on. A timed-out connect
+    (ETIMEDOUT, or the EAGAIN the socket timeout returns) also collapsed to
+    "closed", so a modem that drops probes from one network, or is rebooting
+    during the 0.6 s window, read as "no open ports" — a measurement — and
+    was saved as an empty port list. The next week's real reading then
+    flipped to "NEW open port(s) on upstream modem ... faces the internet". An
+    instant RST and a never-answering host are not the same verdict.
     """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1239,13 +1261,19 @@ def probe_port(host, port, timeout=0.6):
             rc = s.connect_ex((host, port))
         finally:
             s.close()
+    except socket.timeout:
+        return PORT_FILTERED
     except OSError as e:
         # socket() itself can raise (e.g. EMFILE "too many open files" under
         # high worker counts). Preserve the unreachable distinction here too.
-        return None if e.errno in UNREACHABLE_ERRNOS else False
+        if e.errno in UNREACHABLE_ERRNOS:
+            return None
+        return PORT_FILTERED if e.errno in FILTERED_ERRNOS else False
     if rc == 0:
         return True
-    return None if rc in UNREACHABLE_ERRNOS else False
+    if rc in UNREACHABLE_ERRNOS:
+        return None
+    return PORT_FILTERED if rc in FILTERED_ERRNOS else False
 
 
 def check_port(host, port, timeout=0.6):
@@ -1262,14 +1290,21 @@ def check_port(host, port, timeout=0.6):
 def scan_ports_detailed(host, ports, workers=100):
     """Scan `ports` and report whether the host could be reached at all.
 
-    Returns {"open": sorted list, "unreachable": int, "probed": int,
-             "blocked": bool}. `blocked` is True only when every probe came
-    back unreachable, which is the signature of a host that is off the network
-    or a scan the OS refused outright — as opposed to a few probes failing
-    while others got a real answer.
+    Returns {"open": sorted list, "unreachable": int, "filtered": int,
+             "answered": int, "probed": int, "blocked": bool, "unanswered": bool}.
+    `blocked` is True only when every probe came back unreachable, which is
+    the signature of a host that is off the network or a scan the OS refused
+    outright — as opposed to a few probes failing while others got a real
+    answer. `unanswered` is True when no probe got an answer of either kind
+    (open, or closed with a reset) and the scan was not blocked: every one
+    timed out or was unreachable. That is a host that could not be measured,
+    not a host with nothing listening, and callers must not save it as an
+    empty port list.
     """
     open_ports = []
     unreachable = 0
+    filtered = 0
+    answered = 0
     probed = 0
     with futures.ThreadPoolExecutor(max_workers=workers) as pool:
         results = {pool.submit(probe_port, host, p): p for p in ports}
@@ -1282,13 +1317,22 @@ def scan_ports_detailed(host, ports, workers=100):
             probed += 1
             if result is True:
                 open_ports.append(results[fut])
+                answered += 1
             elif result is None:
                 unreachable += 1
+            elif result == PORT_FILTERED:
+                filtered += 1
+            else:
+                answered += 1
+    blocked = probed > 0 and unreachable == probed
     return {
         "open": sorted(open_ports),
         "unreachable": unreachable,
+        "filtered": filtered,
+        "answered": answered,
         "probed": probed,
-        "blocked": probed > 0 and unreachable == probed,
+        "blocked": blocked,
+        "unanswered": probed > 0 and answered == 0 and not blocked,
     }
 
 
@@ -1492,41 +1536,179 @@ def check_tls(host, port=443):
         return {"present": False, "sha256": None}
 
 
+def read_ssh_banner(host, port=22, timeout=3):
+    """The identification string an SSH server sends first, or "".
+
+    RFC 4253 has the server speak first: one line, "SSH-2.0-<software>", before
+    any key exchange. Nothing is sent; the line is read and the connection
+    closed. Cleaned through _banner_text like every other string a device
+    chooses, and kept only when it has that shape.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            data = sock.recv(256)
+    except (OSError, ValueError):
+        return ""
+    line = data.split(b"\n", 1)[0].decode("utf-8", "ignore").strip()
+    return _banner_text(line, 80) if line.startswith("SSH-") else ""
+
+
+IDENTITY_FIELDS = (
+    ("tls_443", "certificate"),
+    ("tls_8443", "certificate on port 8443"),
+    ("ssh_banner", "SSH banner"),
+    ("upnp_server", "UPnP server banner"),
+)
+
+
+def host_identity(host, open_ports, verdict=None, tls=None):
+    """What a host presents on the ports that carry an identity: the
+    certificate digests on 443 and 8443, the SSH banner, the UPnP server
+    banner. Only measured fields are present; an absent field means the port
+    was closed or nothing was read, never that the value is empty.
+
+    The modem's certificate was measured every week, printed as a 16-hex
+    prefix and dropped: router_tls records the gateway's, and every gateway
+    here is a Nest with no 443, so certificate-change detection was dead on
+    the one device in the house that has a certificate. It changed on
+    2026-09-20 and no line said so.
+    """
+    identity = {}
+    tls = tls if isinstance(tls, dict) else check_tls(host)
+    if tls.get("sha256"):
+        identity["tls_443"] = tls["sha256"]
+    ports = set(open_ports or ())
+    if 8443 in ports:
+        alt = check_tls(host, 8443)
+        if alt.get("sha256"):
+            identity["tls_8443"] = alt["sha256"]
+    if 22 in ports:
+        banner = read_ssh_banner(host)
+        if banner:
+            identity["ssh_banner"] = banner
+    server = verdict.get("server") if isinstance(verdict, dict) else None
+    if isinstance(server, str) and server.strip():
+        identity["upnp_server"] = _banner_text(server, 80)
+    return identity
+
+
+def describe_identity_field(field, value):
+    """One field of an identity, as the report prints it."""
+    text = str(value or "")
+    return f"{text[:16]}…" if field.startswith("tls_") and len(text) > 16 else _banner_text(text, 80)
+
+
 # ---------------------------------------------------------------------------
 # Interception detection
 # ---------------------------------------------------------------------------
 
-def check_trust_store():
-    """List admin-added trust settings on macOS.
+TRUST_ROOT_RESULTS = ("kSecTrustSettingsResultTrustRoot", "kSecTrustSettingsResultTrustAsRoot")
+TRUST_DOMAINS = ("admin", "user")
 
-    A clean Mac has none: `security dump-trust-settings -d` prints a "No Trust
-    Settings" line and nothing else. Installing a root CA is how TLS
-    interception is set up in practice, so anything here is worth reading —
-    this is one of very few endpoint signals that is both cheap and unambiguous.
+
+def parse_trust_settings(out):
+    """[{name, results}] from `security dump-trust-settings` output.
+
+    None when nothing readable came back (the command failed or printed
+    nothing); [] when it said there are no trust settings. Each entry is one
+    "Cert N:" block with the result types its trust settings carry, in the
+    form the command prints them (kSecTrustSettingsResultTrustRoot, ...).
+    Older output spelled the result "Result = ..."; current output "Result
+    Type : ..."; both are read.
+    """
+    text = out or ""
+    if not text.strip():
+        return None
+    if "no trust settings" in text.lower():
+        return []
+    entries = []
+    current = None
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"(?i)^cert\s+\d+\s*:\s*(.*)$", s)
+        if m:
+            current = {"name": _banner_text(m.group(1), 80) or "(unnamed)", "results": []}
+            entries.append(current)
+            continue
+        m = re.match(r"(?i)^result(?:\s+type)?\s*[:=]\s*(\S+)", s)
+        if m and current is not None and m.group(1) not in current["results"]:
+            current["results"].append(m.group(1))
+    return entries
+
+
+def _trust_result_names(results):
+    return "/".join(r.replace("kSecTrustSettingsResult", "") for r in results) or "no result type"
+
+
+def check_trust_store():
+    """List added trust settings on macOS, in BOTH trust domains.
+
+    A clean Mac has none: `security dump-trust-settings` prints a "No Trust
+    Settings" line and nothing else, for the admin domain (-d) and for the
+    user domain alike. Installing a root CA is how TLS interception is set up
+    in practice, so anything here is worth reading — this is one of very few
+    endpoint signals that is both cheap and unambiguous.
+
+    The user domain is the one that matters most and the one this check used
+    to skip. -d selects the admin domain, which needs sudo to change and is
+    empty on most Macs. Overrides added by a non-root process — Keychain
+    Access "Always Trust", `security add-trusted-cert` into login.keychain,
+    Safari's trust-anyway, a mkcert or mitmproxy install for one user — live
+    in the user domain, and CFNetwork, Safari, Chrome and curl honour a
+    TrustRoot override there for that user. So a root planted without a
+    password read as "the expected state" every week; on the Mac this was
+    written on, the user domain already held 21 overrides the audit could not
+    see. Every entry is labelled with its domain; any entry granting root
+    trust (TrustRoot or TrustAsRoot) in either domain is HIGH; the structured
+    list (`overrides`) is what diff_baseline compares, so a newly added
+    setting is a change.
 
     Host-posture, so it is macOS-only by the same rule as the firewall and
     sharing checks: on an observer it would describe the wrong machine.
     """
     if sys.platform != "darwin":
-        return {"supported": False, "entries": [], "risk": "INFO",
-                "note": "Trust-store inspection is macOS-only; skipped here."}
+        return {"supported": False, "entries": [], "overrides": [], "domains": {},
+                "risk": "INFO", "note": "Trust-store inspection is macOS-only; skipped here."}
 
-    out = run(["security", "dump-trust-settings", "-d"], timeout=10,
-              merge_stderr=True)
-    if not out.strip():
-        return {"supported": True, "entries": [], "risk": "REVIEW",
-                "note": "Could not read the admin trust settings."}
-    if "no trust settings" in out.lower():
-        return {"supported": True, "entries": [], "risk": "OK",
-                "note": "No admin-added trust settings — the expected state."}
+    parsed = {
+        "admin": parse_trust_settings(run(["security", "dump-trust-settings", "-d"],
+                                          timeout=10, merge_stderr=True)),
+        "user": parse_trust_settings(run(["security", "dump-trust-settings"],
+                                         timeout=10, merge_stderr=True)),
+    }
+    domains = {d: parsed[d] is not None for d in TRUST_DOMAINS}
+    overrides = [{"domain": d, "name": e["name"], "results": list(e["results"])}
+                 for d in TRUST_DOMAINS for e in (parsed[d] or [])]
+    entries = [f"{o['domain']} domain, {_trust_result_names(o['results'])}: {o['name']}"
+               for o in overrides]
+    result = {"supported": True, "entries": entries, "overrides": overrides, "domains": domains}
 
-    entries = [ln.strip() for ln in out.splitlines()
-               if ln.strip().lower().startswith("cert ")]
-    return {"supported": True, "entries": entries, "risk": "HIGH",
-            "note": f"{len(entries) or 'Some'} admin-added trust setting(s) present. "
-                    "A root certificate installed here lets whoever holds its key "
-                    "read TLS traffic from this machine without a warning. Confirm "
-                    "every one of these is yours."}
+    unreadable = [d for d in TRUST_DOMAINS if not domains[d]]
+    root = [o for o in overrides if any(r in TRUST_ROOT_RESULTS for r in o["results"])]
+    if unreadable:
+        which = " and ".join(f"{d} domain" for d in unreadable)
+        extra = (f" The {' and '.join(d for d in TRUST_DOMAINS if domains[d])} domain was read and holds "
+                 f"{len(overrides)} setting(s){', ' + str(len(root)) + ' granting root trust' if root else ''}."
+                 if any(domains.values()) else "")
+        result.update(risk="REVIEW",
+                      note=f"Could not read the {which} trust settings.{extra}")
+    elif root:
+        by_domain = {d: sum(1 for o in root if o["domain"] == d) for d in TRUST_DOMAINS}
+        result.update(risk="HIGH",
+                      note=f"{len(root)} trust setting(s) grant root trust: {by_domain['admin']} in the "
+                           f"admin domain, {by_domain['user']} in the user domain (which needs no "
+                           "password to add to). A root certificate trusted here lets whoever holds "
+                           "its key read TLS traffic from this machine without a warning. Confirm "
+                           "every one of these is yours.")
+    elif overrides:
+        result.update(risk="REVIEW",
+                      note=f"{len(overrides)} trust setting(s) present, none of them granting root "
+                           "trust. Confirm they are yours.")
+    else:
+        result.update(risk="OK",
+                      note="No added trust settings in the admin or the user domain — the expected state.")
+    return result
 
 
 def build_dns_query(name="example.com", qid=0x4a4a):
@@ -1758,7 +1940,7 @@ def resolve_passphrase(prompt=False):
 # changed during the outage was never reported: not on that run, and not after
 # the next successful one re-established a baseline from the new cert.
 CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports",
-                      "devices", "scanned_subnets", "router_tls")
+                      "devices", "scanned_subnets", "router_tls", "upstream_identity")
 
 # The two keys that record one measurement between them: what was found, and
 # where it was possible to find anything. They are measured together or not at
@@ -1775,6 +1957,17 @@ def tls_measured(state):
     measurement, so its absence is what "not measured" means here.
     """
     return (state.get("router_tls") or {}).get("sha256") is not None
+
+
+def identity_measured(state):
+    """Whether `state` holds any reading of the upstream modem's identity.
+
+    host_identity records only the fields it could measure, so an empty dict
+    is a run in which nothing was read — the scan was filtered or blocked, or
+    no port carrying an identity was open — and must not overwrite a reading.
+    """
+    identity = state.get("upstream_identity")
+    return isinstance(identity, dict) and bool(identity)
 
 
 def swept_anywhere(state):
@@ -1894,6 +2087,8 @@ def carry_forward_unmeasured(state, previous=None):
             measured = devices_identified(state)
         elif key == "router_tls":
             measured = tls_measured(state)
+        elif key == "upstream_identity":
+            measured = identity_measured(state)
         else:
             measured = state.get(key) is not None
         if measured:
@@ -1903,6 +2098,7 @@ def carry_forward_unmeasured(state, previous=None):
             # scanned_subnets. Leaving the key absent is right: carrying the
             # previous run's coverage would attach it to this run's devices.
         elif (tls_measured(previous) if key == "router_tls"
+              else identity_measured(previous) if key == "upstream_identity"
               else previous.get(key) is not None):
             carried.append(key)
             # The origin of the reading, not the run that inherited it. Falling
@@ -1942,7 +2138,18 @@ def save_baseline(state, passphrase=None):
     # render them and stripped here so the baseline holds only measurements.
     given = state
     state = {k: v for k, v in state.items() if not str(k).startswith("_")}
-    memory = update_device_memory(load_baseline() or {}, state)
+    # With the owner's labels: a labelled address is a device whatever its
+    # locally-administered bit says, and is remembered like any other.
+    previous = load_baseline() or {}
+    labels = load_labels()
+    memory = update_device_memory(previous, state, labels)
+    # Which departures this run's comparison reported, so the next run can
+    # call their return a change. Only when both sides were compared: a run
+    # that did not sweep reported nothing gone.
+    if devices_identified(previous) and devices_identified(state):
+        state["departed"] = sorted(device_departures(previous, state, labels))
+    else:
+        state.pop("departed", None)
     state = carry_forward_unmeasured(state)
     state = carry_forward_unconfirmed_listeners(state)
     # Only when there is something to remember: a state that says nothing about
@@ -1954,6 +2161,26 @@ def save_baseline(state, passphrase=None):
         state.pop("device_memory", None)
         given.pop("device_memory", None)
     history = read_history()
+    # A record one step ahead of its chain is a save that was interrupted
+    # between the record and its history line (see the write order below).
+    # Re-issuing its sequence number would put two different seals under one
+    # seq in the receipt log — the "seal_conflict" HIGH, about nothing. Only a
+    # record that verifies is repaired: a forged record placed at N+1 reads
+    # rolled_back, not history_behind, and never gets a chain line.
+    on_disk = load_baseline_record()
+    if history and _history_lags_record(on_disk, history[-1]) \
+            and verify_baseline(passphrase).get("status") == "history_behind":
+        _append_history({
+            "seq": on_disk["seq"],
+            "seal": on_disk["seal"],
+            "keyed": bool(on_disk.get("keyed")),
+            "ts": ((on_disk.get("state") or {}).get("timestamp")
+                   or datetime.now(timezone.utc).isoformat()),
+        })
+        # The receipt it may never have had. A duplicate of the same seal is
+        # not a conflict; a missing one would read as an unpublished run.
+        publish_receipt(on_disk)
+        history = read_history()
     prev = history[-1]["seal"] if history else None
     seq = (history[-1]["seq"] + 1) if history else 1
 
@@ -1979,14 +2206,25 @@ def save_baseline(state, passphrase=None):
     # Anything added after this line is runtime status, not sealed content, and
     # must never be written to disk or it would break its own seal.
 
+    # Record, history line, receipt — in that order. The receipt used to go
+    # out before the history line, so one OSError in the last write (a full
+    # disk, a sleep during the iCloud fsync) left a record and a receipt for
+    # seq N+1 beside a chain stopping at N: "rolled_back" HIGH the next week,
+    # then a second save of seq N+1 with a different seal, then
+    # "seal_conflict" HIGH ("treat the local baseline as untrusted") the week
+    # after, for a transient fault. With the local chain written before the
+    # off-host line, an interruption leaves at worst a run the sink never saw
+    # (unpublished_runs, REVIEW), or a record one step ahead of its chain
+    # (history_behind, REVIEW), which the next save repairs above.
     _write_json_atomic(BASELINE_FILE, record)
-    record["_receipt"] = publish_receipt(record)
+    _RUN_PROGRESS["baseline_saved"] = True
     _append_history({
         "seq": seq,
         "seal": record["seal"],
         "keyed": record["keyed"],
         "ts": state.get("timestamp") or datetime.now(timezone.utc).isoformat(),
     })
+    record["_receipt"] = publish_receipt(record)
     return record
 
 
@@ -2031,9 +2269,11 @@ def describe_modified_save_refusal():
     """
     return ("\n  [HIGH  ] Baseline NOT saved: the sealed baseline does not verify with "
             "the passphrase given. Either the passphrase is wrong, or the baseline was "
-            "altered since it was sealed. Re-seal from a state you trust with "
-            "seal_baseline.py, or fix the passphrase; until then the record is left as "
-            "it is and this line repeats.")
+            "altered since it was sealed. Fix the passphrase, or review the record line "
+            "by line — every device, every remembered device, every port — and only then "
+            "re-seal it with seal_baseline.py --force-reviewed (it verifies first and "
+            "refuses a modified record otherwise); until then the record is left as it "
+            "is and this line repeats.")
 
 
 def load_baseline_record():
@@ -2110,6 +2350,9 @@ def verify_baseline(passphrase=None):
       unverifiable   sealed with a passphrase that was not supplied
       modified       the seal does not match the contents
       rolled_back    valid record, but older than the chain has already recorded
+      history_behind valid record one step ahead of the chain and linked to it:
+                     a save interrupted before its history line (repaired by
+                     the next save)
       chain_missing  the record claims history that is not there
 
     The chain is read *first*, and that ordering is the point. Both cheap
@@ -2221,9 +2464,33 @@ def verify_baseline(passphrase=None):
 # overwrite remote history, an attacker on that host holds them too.
 # ---------------------------------------------------------------------------
 
+def _history_lags_record(record, last):
+    """Whether `record` is the chain's next link that never got its history line:
+    one past `last` in sequence, chained to `last`'s seal, and not a downgrade.
+
+    A keyed chain followed by an unkeyed record is never a lag, whatever the
+    seq and prev say: an unkeyed record is one anyone can write, and treating
+    it as the interrupted save would append it to the chain.
+    """
+    if not (isinstance(record, dict) and isinstance(last, dict)):
+        return False
+    seq, last_seq = record.get("seq"), last.get("seq")
+    for value in (seq, last_seq):
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+    if seq != last_seq + 1:
+        return False
+    if not record.get("prev") or record.get("prev") != last.get("seal"):
+        return False
+    if last.get("keyed") and not record.get("keyed"):
+        return False
+    return True
+
+
 def _chain_position_problem(record, keyed):
-    """rolled_back or chain_missing for a record that does not sit at the chain's
-    head, else None. Needs no key: seq and seal are compared, not recomputed."""
+    """rolled_back, chain_missing or history_behind for a record that does not
+    sit at the chain's head, else None. Needs no key: seq and seal are
+    compared, not recomputed."""
     history = read_history()
     if not history:
         seq = record.get("seq", 1)
@@ -2233,6 +2500,16 @@ def _chain_position_problem(record, keyed):
                               "file is gone. It may have been removed to hide a change."}
         return None
     last = history[-1]
+    if _history_lags_record(record, last):
+        # Newer than the chain, and linked to it: a save that was interrupted
+        # after the record was written. Calling this a rollback said an older
+        # baseline had been put back, which is the opposite of what happened.
+        return {"status": "history_behind", "keyed": keyed,
+                "detail": f"The baseline is at run {record.get('seq')}, one ahead of the "
+                          f"chain's run {last.get('seq')}, and links to it: a save was "
+                          "interrupted after the record was written and before its "
+                          "history line. Nothing older was put back; the next save "
+                          "repairs the chain."}
     if record.get("seq") != last.get("seq") or record.get("seal") != last.get("seal"):
         return {"status": "rolled_back", "keyed": keyed,
                 "detail": f"The baseline is at run {record.get('seq')} but the chain "
@@ -4175,6 +4452,7 @@ def describe_baseline_integrity(report):
         "unverifiable": "REVIEW",
         "modified": "HIGH",
         "rolled_back": "HIGH",
+        "history_behind": "REVIEW",
         "chain_missing": "HIGH",
         # Both are the same claim as chain_missing seen from the other side —
         # the chain and the record disagree about whether this machine has ever
@@ -4190,6 +4468,8 @@ _CARRIED_LABELS = {
     "scanned_subnets": "scan coverage",
     "router_open_ports": "router ports",
     "upstream_open_ports": "upstream modem ports",
+    "router_tls": "router certificate",
+    "upstream_identity": "upstream modem identity",
 }
 
 
@@ -4363,6 +4643,7 @@ EVIDENCE = {
     "router_open_ports":   (MEASURED, "TCP connections this tool opened to the gateway", "Router port scan"),
     "upstream_open_ports": (MEASURED, "TCP connections this tool opened to the modem", "Upstream port scan"),
     "router_tls":          (MEASURED, "the certificate the gateway presented", "Router TLS"),
+    "upstream_identity":   (MEASURED, "the certificates and banners the modem presented", "Upstream modem identity"),
     # Measured, because the tool asked and watched what came back. The DORMANT
     # verdict in particular is a measurement of silence, and says so itself.
     "upnp_listeners":      (MEASURED, "how port 1900 answered UPnP discovery and description requests", "UPnP listener probe"),
@@ -4479,6 +4760,85 @@ def describe_evidence_basis(state, compact=False):
                      "compromised HOST can —")
         lines.append("  that is what running this from a second machine is for.")
     return "\n".join(lines)
+
+
+def all_network_baselines():
+    """The saved state of every baseline in BASELINE_DIR — one per network,
+    plus a legacy shared one if it is still there — read defensively.
+    Unreadable or malformed files are skipped, not raised."""
+    states = []
+    try:
+        names = sorted(os.listdir(BASELINE_DIR))
+    except OSError:
+        return states
+    for name in names:
+        if not re.fullmatch(r"baseline(-[0-9A-Za-z-]+)?\.json", name):
+            continue
+        try:
+            with open(os.path.join(BASELINE_DIR, name)) as f:
+                record = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            continue
+        state = (record.get("state") if isinstance(record, dict)
+                 and record.get("format") == BASELINE_FORMAT else record)
+        if isinstance(state, dict):
+            states.append(state)
+    return states
+
+
+def label_sightings(labels, states):
+    """{mac: latest last_seen} over every labelled address seen in any of
+    `states` — their device lists and device memories."""
+    latest = {}
+    for state in states or []:
+        for mac, entry in remembered_devices(state, labels).items():
+            if mac not in labelled_macs(labels):
+                continue
+            seen = _parse_stamp(entry.get("last_seen"))
+            if seen is None:
+                continue
+            if mac not in latest or seen > latest[mac][0]:
+                latest[mac] = (seen, entry.get("last_seen"))
+    return {mac: stamp for mac, (_seen, stamp) in latest.items()}
+
+
+def stale_labels(labels, states, now=None, days=None):
+    """[(mac, name, last_seen)] for labels whose address no network has seen
+    for `days` (DEVICE_MEMORY_DAYS). A label never seen anywhere is not listed:
+    its age is unknown.
+
+    Listed, never removed. labels.json was only ever added to, so a retired
+    device kept its name for good, and a stranger reusing the address — the
+    nine Tuya, Arlo and Apple TV addresses retired this week are on the air
+    for anyone nearby to copy — would have printed as the owner's labelled
+    device. Pruning is the owner's call (--unlabel); this names the candidates.
+    """
+    now = now or datetime.now(timezone.utc)
+    days = DEVICE_MEMORY_DAYS if days is None else days
+    latest = label_sightings(labels, states)
+    out = []
+    for mac in sorted(labelled_macs(labels)):
+        stamp = latest.get(mac)
+        seen = _parse_stamp(stamp)
+        if seen is None or now - seen <= timedelta(days=days):
+            continue
+        name = next((v for k, v in labels.items() if isinstance(k, str) and k.lower() == mac), "")
+        out.append((mac, _banner_text(name, 60), stamp))
+    return out
+
+
+def describe_stale_labels(labels, states, now=None, days=None):
+    """A REVIEW line listing labels whose address no network has seen for
+    `days` (DEVICE_MEMORY_DAYS), with the way to remove them, or None."""
+    days = DEVICE_MEMORY_DAYS if days is None else days
+    stale = stale_labels(labels, states, now, days)
+    if not stale:
+        return None
+    named = "; ".join(f"{mac} [{name}] (last seen {(stamp or '')[:10]})" for mac, name, stamp in stale)
+    return (f"  [REVIEW] Label(s) on addresses no network has seen for {days} days: {named}. "
+            "A label left on a retired address would present a stranger reusing it as your "
+            "own device; when the device is gone for good, remove the label with "
+            "`python3 home_net_audit.py --unlabel MAC`. Nothing is removed by itself.")
 
 
 def load_labels():
@@ -5045,7 +5405,30 @@ def _parse_stamp(value):
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def remembered_devices(state):
+def labelled_macs(labels):
+    """The addresses the owner has named, lowercased: the one proof this tool
+    accepts that an address with the locally-administered bit is a fixed
+    device and not a phone's rotating private address."""
+    return {k.lower() for k, v in (labels or {}).items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()}
+
+
+def is_rotating_mac(mac, labels=None):
+    """Whether `mac` is treated as a rotating private address: the
+    locally-administered bit set AND no label from the owner.
+
+    The bit alone decided this, and the household's fixed devices with that
+    bit — the LinkTap irrigation gateways, the IoT network's gateway, "This
+    Mac" on each network — were handled as phones: never reported gone or
+    replaced, never remembered, only counted, and padding the rotating count
+    so a stranger arriving while one of them was off read as no change. A
+    label is a statement by the owner that the address is a device; it is
+    honoured here and nowhere else.
+    """
+    return is_randomized_mac(mac) and str(mac).lower() not in labelled_macs(labels)
+
+
+def remembered_devices(state, labels=None):
     """{mac: {"first_seen", "last_seen"}} for a saved state, read defensively.
 
     A baseline written before the memory existed still remembers one thing: the
@@ -5053,6 +5436,7 @@ def remembered_devices(state):
     the first run after the upgrade behave, instead of starting from nothing.
     """
     state = state or {}
+    fixed = labelled_macs(labels)
     memory = {}
     saved = state.get("device_memory")
     if isinstance(saved, dict):
@@ -5061,7 +5445,8 @@ def remembered_devices(state):
                 continue
             mac = mac.lower()
             last = entry.get("last_seen")
-            if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac) or _parse_stamp(last) is None:
+            if (not _MAC_SHAPE.match(mac) or (is_randomized_mac(mac) and mac not in fixed)
+                    or _parse_stamp(last) is None):
                 continue
             first = entry.get("first_seen")
             memory[mac] = {"first_seen": first if _parse_stamp(first) else last, "last_seen": last}
@@ -5072,18 +5457,20 @@ def remembered_devices(state):
             if not isinstance(mac, str):
                 continue
             mac = mac.lower()
-            if _MAC_SHAPE.match(mac) and not is_randomized_mac(mac) and mac not in memory:
+            if (_MAC_SHAPE.match(mac) and not (is_randomized_mac(mac) and mac not in fixed)
+                    and mac not in memory):
                 memory[mac] = {"first_seen": stamp, "last_seen": stamp}
     return memory
 
 
-def update_device_memory(previous, state):
+def update_device_memory(previous, state, labels=None):
     """The memory to save with `state`: what was remembered, plus what was seen now.
 
     A run that did not sweep learns nothing about devices and so changes nothing
     — not even expiry, since "not looked for" is not "not seen".
     """
-    memory = remembered_devices(previous)
+    fixed = labelled_macs(labels)
+    memory = remembered_devices(previous, labels)
     if not devices_identified(state):
         return memory
     stamp = state.get("timestamp")
@@ -5095,7 +5482,7 @@ def update_device_memory(previous, state):
         if not isinstance(mac, str):
             continue
         mac = mac.lower()
-        if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac):
+        if not _MAC_SHAPE.match(mac) or (is_randomized_mac(mac) and mac not in fixed):
             continue
         entry = memory.setdefault(mac, {"first_seen": stamp, "last_seen": stamp})
         entry["last_seen"] = stamp
@@ -5107,22 +5494,25 @@ def update_device_memory(previous, state):
     return memory
 
 
-def returning_devices(old, new):
+def returning_devices(old, new, labels=None):
     """{mac: last_seen} for devices present now, absent from the last run, but
     seen on this network within the memory window."""
     if not (devices_identified(old) and devices_identified(new)):
         return {}
+    fixed = labelled_macs(labels)
+
     def stable(entry):
         out = set()
         for d in entry.get("devices") or []:
             mac = d.get("mac") if isinstance(d, dict) else None
-            if isinstance(mac, str) and mac != "unknown" and not is_randomized_mac(mac.lower()):
+            if (isinstance(mac, str) and mac != "unknown"
+                    and not (is_randomized_mac(mac.lower()) and mac.lower() not in fixed)):
                 out.add(mac.lower())
         return out
     arrived = stable(new) - stable(old)
     if not arrived:
         return {}
-    memory = remembered_devices(old)
+    memory = remembered_devices(old, labels)
     now = _parse_stamp(new.get("timestamp"))
     back = {}
     for mac in arrived:
@@ -5137,9 +5527,57 @@ def returning_devices(old, new):
     return back
 
 
+def device_departures(old, new, labels=None):
+    """The stable addresses in `old` that `new` looked for and did not find.
+
+    The set the change line "Device(s) gone since baseline" names, factored
+    out so save_baseline can record it: a baseline that remembers which
+    departures its own run reported is what lets the next run tell "back
+    after the gone line named it" from an ordinary return.
+    """
+    if not (devices_identified(old) and devices_identified(new)):
+        return set()
+    fixed = labelled_macs(labels)
+
+    def stable(entry):
+        macs, subnets = set(), {}
+        for d in entry.get("devices") or []:
+            if not isinstance(d, dict):
+                continue
+            mac = d.get("mac")
+            if not isinstance(mac, str) or mac == "unknown":
+                continue
+            mac = mac.lower()
+            if is_randomized_mac(mac) and mac not in fixed:
+                continue
+            macs.add(mac)
+            subnet = d.get("subnet")
+            if isinstance(subnet, str) and subnet:
+                subnets.setdefault(mac, set()).add(subnet)
+        return macs, subnets
+
+    old_macs, old_subnets = stable(old)
+    new_macs, _ = stable(new)
+    vanished = old_macs - new_macs
+    new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
+    if new_cov:
+        vanished = {m for m in vanished if old_subnets.get(m, set()) <= new_cov}
+    return vanished
+
+
+def reported_departures(state):
+    """The addresses the run that saved `state` reported as gone, lowercased."""
+    return {m.lower() for m in ((state or {}).get("departed") or []) if isinstance(m, str)}
+
+
 def describe_returning_devices(old, new, labels=None):
-    """The lines naming devices that came back, or None. Never a change, always said."""
-    back = returning_devices(old, new)
+    """The lines naming devices that came back, or None. Never a change, always said.
+
+    A device the previous run's own "gone" line named is left out here: its
+    return is a change line in diff_baseline, which the digest carries.
+    """
+    back = {m: when for m, when in returning_devices(old, new, labels).items()
+            if m not in reported_departures(old)}
     if not back:
         return None
     labels = labels or {}
@@ -5209,7 +5647,7 @@ def describe_critical_absences(old, new, critical, labels=None):
         mac = d.get("mac") if isinstance(d, dict) else None
         if isinstance(mac, str):
             present.add(mac.lower())
-    memory = remembered_devices(old)
+    memory = remembered_devices(old, labels)
     missing = []
     for mac in sorted(critical - present):
         entry = memory.get(mac)
@@ -5335,6 +5773,86 @@ def describe_unconfirmed_listeners(old, new):
     return "\n".join(lines) if lines else None
 
 
+def _trust_overrides(state):
+    trust = ((state or {}).get("interception") or {}).get("trust_store")
+    return trust if isinstance(trust, dict) else None
+
+
+def diff_trust_store(old, new):
+    """Change notes for trust settings added or removed between two runs."""
+    old_t, new_t = _trust_overrides(old), _trust_overrides(new)
+    if not (old_t and new_t and isinstance(old_t.get("overrides"), list)
+            and isinstance(new_t.get("overrides"), list)):
+        return []
+    readable = {d for d in TRUST_DOMAINS
+                if (old_t.get("domains") or {}).get(d) and (new_t.get("domains") or {}).get(d)}
+
+    def keyed(entries):
+        out = set()
+        for o in entries:
+            if isinstance(o, dict) and o.get("domain") in readable:
+                results = tuple(r for r in (o.get("results") or []) if isinstance(r, str))
+                out.add((str(o.get("domain")), _banner_text(o.get("name"), 80), results))
+        return out
+
+    def describe(key):
+        domain, name, results = key
+        return f"{name} ({domain} domain, {_trust_result_names(results)})"
+
+    was, now = keyed(old_t["overrides"]), keyed(new_t["overrides"])
+    notes = []
+    added, removed = sorted(now - was), sorted(was - now)
+    if added:
+        notes.append("NEW trust-store override(s) on this Mac since baseline: "
+                     + "; ".join(describe(k) for k in added)
+                     + ". A root trusted here lets whoever holds its key read this machine's "
+                     "TLS traffic without a warning; the user domain needs no password to add to.")
+    if removed:
+        notes.append("Trust-store override(s) removed on this Mac since baseline: "
+                     + "; ".join(describe(k) for k in removed))
+    return notes
+
+
+def diff_upstream_identity(old, new):
+    """Change notes for identity fields of the upstream modem that differ."""
+    old_id, new_id = (old or {}).get("upstream_identity"), (new or {}).get("upstream_identity")
+    if not (isinstance(old_id, dict) and isinstance(new_id, dict)):
+        return []
+    notes = []
+    for field, what in IDENTITY_FIELDS:
+        was, now = old_id.get(field), new_id.get(field)
+        if not (isinstance(was, str) and isinstance(now, str) and was and now) or was == now:
+            continue
+        note = (f"Upstream modem {what} CHANGED: {describe_identity_field(field, was)} -> "
+                f"{describe_identity_field(field, now)}. ")
+        if field.startswith("tls_"):
+            note += ("The modem's certificate is self-signed and stable, so it was re-issued, the "
+                     "modem was replaced, or something is answering in its place.")
+        else:
+            note += "A firmware change, or a different device answering at the modem's address."
+        notes.append(note)
+    return notes
+
+
+def diff_listeners(old, new):
+    """Change notes for fixed-port listeners that appeared on or left this Mac."""
+    old_l, new_l = (old or {}).get("listening"), (new or {}).get("listening")
+    if not (isinstance(old_l, list) and old_l and isinstance(new_l, list) and new_l):
+        return []
+    was = {fp for fp in listener_fingerprint(old_l) if fp[2] != "dynamic"}
+    now = {fp for fp in listener_fingerprint(new_l) if fp[2] != "dynamic"}
+    notes = []
+    if now - was:
+        notes.append("NEW listener(s) on this Mac since baseline: "
+                     + ", ".join(_describe_fingerprint(fp) for fp in sorted(now - was, key=str))
+                     + ". A fixed port is a choice somebody made; a new one accepting "
+                     "connections on this Mac is what a backdoor looks like.")
+    if was - now:
+        notes.append("Listener(s) on this Mac gone since baseline: "
+                     + ", ".join(_describe_fingerprint(fp) for fp in sorted(was - now, key=str)))
+    return notes
+
+
 def diff_baseline(old, new, labels=None, critical=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
@@ -5384,8 +5902,13 @@ def diff_baseline(old, new, labels=None, critical=None):
             subnet = d.get("subnet")
             if isinstance(subnet, str) and subnet:
                 subnets.setdefault(mac, set()).add(subnet)
-        stable = {m for m in macs if not is_randomized_mac(m)}
+        # A labelled address is a device, whatever its locally-administered
+        # bit says (is_rotating_mac): compared by name, reported gone, and
+        # kept out of the rotating count it used to pad.
+        stable = {m for m in macs if not (is_randomized_mac(m) and m not in fixed)}
         return stable, macs - stable, subnets
+
+    fixed = labelled_macs(labels)
 
     # A run that did not sweep has no "devices" key at all, and that is not the
     # same as a sweep that found nothing. Read as an empty set, every device in
@@ -5430,7 +5953,23 @@ def diff_baseline(old, new, labels=None, critical=None):
     # A device remembered from an earlier run on this network is back, not new.
     # It is reported by describe_returning_devices — every time, by name — but
     # it is not a change. See "Remembering devices for longer than one run".
-    appeared -= set(returning_devices(old, new))
+    #
+    # With one exception, which is a change: a device the previous run's own
+    # "gone" line named. The INFO line the return used to get is dropped by
+    # the email digest, so a MAC retired last week and back this week — the
+    # owner's hardware, or a clone of it, since 802.11 headers are cleartext
+    # and the address was on the air for months — printed as the owner's own
+    # labelled device under "No changes since baseline".
+    back = returning_devices(old, new, labels)
+    appeared -= set(back)
+    returned = sorted(m for m in back if m in reported_departures(old))
+    if returned:
+        notes.append(
+            "Device(s) back after an absence the previous run reported as gone: "
+            + ", ".join(f"{describe_mac(m, labels, new, old)} (last seen "
+                        f"{(back[m] or '')[:16].replace('T', ' ')} UTC)" for m in returned)
+            + ". The same hardware address as the device that left — or a clone of it, "
+            "since a MAC seen on the air can be reused by anyone with the Wi-Fi key.")
     # An arrival is described from this run, where it was seen; a departure from
     # the baseline, the only place it still exists.
     # A device the owner marked critical (--critical) leaving is said first and
@@ -5548,10 +6087,25 @@ def diff_baseline(old, new, labels=None, critical=None):
                          "device on the LAN that asks; turn it off unless something needs it.")
             notes.append(note)
 
-    for key, host in (("router_open_ports", "router"),
-                      ("upstream_open_ports", "upstream modem")):
+    for key, host, scan_key in (("router_open_ports", "router", "router_scan"),
+                                ("upstream_open_ports", "upstream modem", "upstream_scan")):
         old_ports = old.get(key)
         new_ports = new.get(key)
+        # The baseline's own scan of this host went unanswered: whatever port
+        # list it holds was carried from an earlier run, and this run's reading
+        # is the first since — "the host answered again", not ports opening.
+        # Diffing the carried list against the new one produced two
+        # CHANGES DETECTED emails describing a modem that rebooted during one
+        # 0.6 s window: "now closed" that week and "NEW open ... faces the
+        # internet" the week after.
+        old_scan = old.get(scan_key) if isinstance(old.get(scan_key), dict) else {}
+        if old_scan.get("result") == "filtered" and isinstance(new_ports, list):
+            notes.append(
+                f"The {host} became reachable from this network: open ports "
+                f"{sorted(set(new_ports))}. The baseline's scan of it was FILTERED (no probe "
+                "was answered), so this is the first reading since, not ports opening or "
+                "closing.")
+            continue
         if old_ports is None or new_ports is None:
             continue
         old_ports = set(old_ports)
@@ -5607,6 +6161,32 @@ def diff_baseline(old, new, labels=None, critical=None):
             f"{old_cert[:16]}… -> {new_cert[:16]}…. The admin certificate is "
             "self-signed and stable, so this means it was re-issued or something "
             "is answering in the router's place.")
+
+    # The modem's identity, field by field, where both runs measured the
+    # field. Each gateway here is a Nest with no 443, so router_tls above has
+    # never compared anything on this deployment while the modem's certificate
+    # — the only one in the house — was printed and dropped every week.
+    notes.extend(diff_upstream_identity(old, new))
+
+    # This Mac's listeners, by the same fingerprint the section prints them
+    # under. The section always said "not in the baseline"; the diff never
+    # did, so a backdoor's port was never a change line and never reached the
+    # TL;DR or the email subject. Fixed ports only: a named process on a
+    # dynamic port is compared by name and comes and goes with the apps that
+    # are open, which is the section's business and not a change in the
+    # network's posture. An empty list on either side is a failed enumeration
+    # (lsof and netstat returned nothing), not a quiet machine, and is not
+    # compared.
+    notes.extend(diff_listeners(old, new))
+
+    # The trust store is this Mac's, not the network's, but a root added to it
+    # is how TLS interception of this Mac is set up, and the section's own
+    # rating repeats every week once an entry is there: only a comparison
+    # says WHEN one arrived. Compared by (domain, name, result types) over the
+    # domains both runs could read; a baseline written before the structured
+    # list existed is not compared, so the first run after the upgrade
+    # establishes it rather than reporting every entry as new.
+    notes.extend(diff_trust_store(old, new))
 
     # Routers are compared by MAC where both sides recorded one. A router at a
     # new link-local address with a MAC the baseline knows is the same router,
@@ -6554,6 +7134,33 @@ def action_wifi_security():
 # NEW FEATURE 2: Rogue DHCP detector
 # ---------------------------------------------------------------------------
 
+DHCP_OVERLOAD_FILE = 1      # RFC 2132 §9.3: the 'file' field holds options
+DHCP_OVERLOAD_SNAME = 2     # the 'sname' field holds options
+
+
+def _walk_dhcp_options(data, start, end, options):
+    """Read the option TLVs in data[start:end] into `options`, up to the end
+    marker. A code seen again has its data appended (RFC 3396), so an option
+    sent twice, or split across areas, keeps every byte visible — the
+    poisoned second router is listed beside the benign first, not under it."""
+    i = start
+    while i < end:
+        code = data[i]
+        if code == 255:                 # end
+            break
+        if code == 0:                   # pad
+            i += 1
+            continue
+        if i + 1 >= end:
+            break
+        length = data[i + 1]
+        value = data[i + 2:min(i + 2 + length, end)]
+        if len(value) < length:
+            break                       # truncated packet or field
+        options[code] = options[code] + value if code in options else value
+        i += 2 + length
+
+
 def parse_dhcp_options(data):
     """Split the option TLVs out of a DHCP packet into {code: bytes}.
 
@@ -6567,26 +7174,24 @@ def parse_dhcp_options(data):
     decoy cookie there followed by an 0xff terminator ended the option walk
     before it reached offset 236. The audit then reported the benign gateway
     from the decoy while the client applied the poisoned one that follows.
+
+    Those two fields are read on one condition only: option 52 (overload) in
+    the options area saying they hold options, which is when a client reads
+    them too. A server may put a router, resolver or static route there and
+    nowhere else — macOS configd and dhclient apply it — and this parser
+    never looked, so a poisoned gateway hidden in the file field described
+    as router=[] and the baseline comparison had nothing to compare.
     """
     if len(data) < 240 or data[236:240] != b"\x63\x82\x53\x63":
         return {}
     options = {}
-    i = 240
-    while i < len(data):
-        code = data[i]
-        if code == 255:                 # end
-            break
-        if code == 0:                   # pad
-            i += 1
-            continue
-        if i + 1 >= len(data):
-            break
-        length = data[i + 1]
-        value = data[i + 2:i + 2 + length]
-        if len(value) < length:
-            break                       # truncated packet
-        options[code] = value
-        i += 2 + length
+    _walk_dhcp_options(data, 240, len(data), options)
+    overload = options.get(52, b"")
+    flag = overload[0] if overload else 0
+    if flag & DHCP_OVERLOAD_FILE:
+        _walk_dhcp_options(data, 108, 236, options)
+    if flag & DHCP_OVERLOAD_SNAME:
+        _walk_dhcp_options(data, 44, 108, options)
     return options
 
 
@@ -6623,7 +7228,63 @@ def decode_classless_routes(value):
 
 def describe_dhcp_offer(data):
     """The parts of an OFFER that decide where this machine's traffic goes."""
-    options = parse_dhcp_options(data)
+    return describe_dhcp_options(parse_dhcp_options(data))
+
+
+def dhcp_server_identifier(options):
+    """Option 54, the address the server says it is, or None."""
+    addresses = _addresses(options.get(54, b""))
+    return addresses[0] if addresses else None
+
+
+def dhcp_offer_key(offer):
+    """What makes two OFFERs the same offer: the identity the server claims
+    (option 54, falling back to the datagram's source) and what it hands out.
+
+    De-duplicating on the UDP source alone keyed the whole check on the one
+    field a LAN host forges for free. A rogue stamping the genuine server's
+    address collapsed into the genuine server's entry; first datagram wins, so
+    the count stayed at one and whichever OFFER arrived first — the rogue's,
+    by design — was the one baselined as known-good."""
+    return (offer.get("server_id") or offer.get("ip"), offer.get("offered_ip"),
+            tuple(offer.get("router") or ()), tuple(offer.get("dns") or ()),
+            tuple(offer.get("static_routes") or ()))
+
+
+def summarise_dhcp_responders(responders):
+    """{"servers", "conflicts", "spoofed"} over a list of distinct offers.
+
+    `servers` are the identities that answered; `conflicts` the fields on
+    which offers under ONE identity disagree — two servers answering under
+    one Server Identifier, which is what a rogue forging the real server's
+    address produces; `spoofed` the offers whose source address is not the
+    identifier they claim (a relay agent, or a forged source)."""
+    by_server = {}
+    for r in responders or []:
+        if not isinstance(r, dict):
+            continue
+        ident = r.get("server_id") or r.get("ip")
+        by_server.setdefault(ident, []).append(r)
+    conflicts = []
+    for ident, offers in by_server.items():
+        for field, label in (("router", "router"), ("dns", "DNS servers"),
+                             ("static_routes", "static routes")):
+            values = []
+            for o in offers:
+                v = tuple(o.get(field) or ())
+                if v not in values:
+                    values.append(v)
+            if len(values) > 1:
+                conflicts.append({"server": ident, "field": label,
+                                  "values": [list(v) for v in values]})
+    spoofed = [{"ip": r.get("ip"), "server_id": r.get("server_id")}
+               for r in (responders or []) if isinstance(r, dict)
+               and r.get("server_id") and r.get("ip") and r.get("server_id") != r.get("ip")]
+    return {"servers": sorted(by_server, key=str), "conflicts": conflicts, "spoofed": spoofed}
+
+
+def describe_dhcp_options(options):
+    """The parts of an option set that decide where this machine's traffic goes."""
     described = {
         "router": _addresses(options.get(3, b"")),
         "dns": _addresses(options.get(6, b"")),
@@ -6702,6 +7363,7 @@ def check_rogue_dhcp(timeout=4):
     packet += options
 
     responders = []
+    seen = set()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -6722,10 +7384,16 @@ def check_rogue_dhcp(timeout=4):
                     offered_ip = socket.inet_ntoa(data[16:20])
                 else:
                     offered_ip = "unknown"
-                # Avoid duplicates
-                if not any(r["ip"] == server_ip for r in responders):
-                    responders.append({"ip": server_ip, "offered_ip": offered_ip,
-                                       **describe_dhcp_offer(data)})
+                options = parse_dhcp_options(data)
+                offer = {"ip": server_ip, "server_id": dhcp_server_identifier(options),
+                         "offered_ip": offered_ip, **describe_dhcp_options(options)}
+                # One entry per distinct offer: a server repeating its OFFER
+                # is one responder; a second OFFER under the same identity
+                # that hands out something else is kept, and is the finding.
+                key = dhcp_offer_key(offer)
+                if key not in seen:
+                    seen.add(key)
+                    responders.append(offer)
             except socket.timeout:
                 break
             except OSError:
@@ -6757,17 +7425,38 @@ def action_rogue_dhcp():
         print("  No DHCP responses received (normal if your router uses unicast).")
         return {"responders": []}
 
-    print(f"  {len(responders)} DHCP server(s) responded:")
+    summary = summarise_dhcp_responders(responders)
+    servers = summary["servers"]
+    print(f"  {len(responders)} distinct DHCP offer(s) from {len(servers)} server identit"
+          f"{'y' if len(servers) == 1 else 'ies'}:")
     for r in responders:
-        print(f"    {r['ip']}  →  offered IP: {r['offered_ip']}")
+        claim = (f" (Server Identifier {r['server_id']})"
+                 if r.get("server_id") and r["server_id"] != r["ip"] else "")
+        print(f"    {r['ip']}{claim}  →  offered IP: {r['offered_ip']}, router {r.get('router')}, "
+              f"DNS {r.get('dns')}" + (f", routes {r['static_routes']}" if r.get("static_routes") else ""))
 
-    if len(responders) > 1:
+    if len(servers) > 1:
         print("  [HIGH] Multiple DHCP servers detected! One may be a rogue server.")
         print("         A rogue DHCP server can redirect all your traffic. Investigate immediately.")
+    elif summary["conflicts"]:
+        # Counted by the identity the server claims, one identity made offers
+        # that disagree: two servers answering under one Server Identifier,
+        # which is what a rogue forging the real server's address produces.
+        # Counting the source addresses read this as "[OK] Only one".
+        disagreements = "; ".join(f"{c['field']} {' vs '.join(str(v) for v in c['values'])}"
+                                  for c in summary["conflicts"])
+        print(f"  [HIGH] One DHCP server identity ({summary['conflicts'][0]['server']}) made offers "
+              f"that disagree: {disagreements}.")
+        print("         Two servers are answering under one Server Identifier — a rogue forging the "
+              "real server's address.")
+        print("         Whichever offer a client takes first wins. Investigate immediately.")
     else:
-        print("  [OK] Only one DHCP server responded.")
+        print(f"  [OK] Only one DHCP server responded ({servers[0]}), and its offers agree.")
+    for s in summary["spoofed"]:
+        print(f"  [REVIEW] The offer from {s['ip']} names Server Identifier {s['server_id']}, a "
+              "different address: a relay agent, or a forged source.")
 
-    return {"responders": responders}
+    return {"responders": responders, "summary": summary}
 
 
 # ---------------------------------------------------------------------------
@@ -6796,12 +7485,30 @@ def _upnp_url_points_at(url, gateway):
     return parts.scheme in ("http", "https") and parts.hostname == gateway
 
 
+# The budget for the whole exchange after discovery: one description fetch and
+# up to a hundred SOAP calls. Each call is bounded on its own by _http_plain;
+# this bounds their sum, so a gateway that answers each one slowly cannot hold
+# the audit for a hundred times the per-call budget.
+UPNP_MAPPINGS_TOTAL_SECONDS = 40.0
+
+
 def get_upnp_port_mappings(gateway):
     """
     Discover the UPnP (Universal Plug and Play) control URL via SSDP
     (Simple Service Discovery Protocol), then query all port mappings.
-    Returns (mappings_list, error_string).
+    Returns (mappings_list, note). The note is an error when the list is
+    empty, and a caveat (the list was cut short) when it is not.
     Each mapping: {ext_port, protocol, int_ip, int_port, description, enabled}
+
+    The description and every SOAP reply are fetched with _http_get_plain and
+    _http_post_plain — a byte cap, a wall-clock budget per exchange, no
+    redirects, no proxy — and the loop as a whole runs under one deadline.
+    This path used raw urllib with a per-operation timeout and an unbounded
+    read, the slow-loris exposure its two siblings were rebuilt without: a
+    device answering the audit's own M-SEARCH as the gateway could serve the
+    description a byte every few seconds, or as a multi-gigabyte body, and
+    hold the audit here, before the baseline, the report and the email, with
+    no abort line and no next run. Only plain http on the gateway is followed.
     """
     # Step 1: SSDP M-SEARCH to find the UPnP root device
     SSDP_ADDR = "239.255.255.250"
@@ -6858,13 +7565,35 @@ def get_upnp_port_mappings(gateway):
                     "not an http(s) address on the gateway itself. Not followed, so "
                     "port mappings were not read.")
 
+    def _plain_http_target(url):
+        """(port, path) for a plain-http URL on the gateway, else None."""
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "http":
+            return None
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        return parts.port or 80, path
+
+    target = _plain_http_target(location)
+    if target is None:
+        return [], (f"The UPnP reply from {gateway} pointed at {_banner_text(location, 120)}; only "
+                    "plain http on the gateway is fetched. Not followed, so port mappings "
+                    "were not read.")
+    deadline = time.monotonic() + UPNP_MAPPINGS_TOTAL_SECONDS
+
+    def _budget():
+        return min(HTTP_GET_TOTAL_SECONDS, deadline - time.monotonic())
+
     # Step 2: Fetch the device description XML to find the control URL
-    try:
-        req = urllib.request.Request(location, headers={"User-Agent": "home_net_audit"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            xml = r.read().decode("utf-8", "ignore")
-    except Exception as e:
-        return [], f"Could not fetch UPnP device description: {_banner_text(str(e), 160)}"
+    desc_port, desc_path = target
+    got = _http_get_plain(gateway, desc_port, desc_path, total=_budget())
+    if got is None:
+        return [], (f"Could not fetch UPnP device description: no HTTP answer from "
+                    f"{gateway}:{desc_port}{_banner_text(desc_path, 80)} within the time allowed")
+    status, _server, xml = got
+    if status != 200:
+        return [], f"Could not fetch UPnP device description: HTTP {status}"
 
     # Extract base URL and control URL
     base_url_m = re.match(r"(https?://[^/]+)", location)
@@ -6881,9 +7610,16 @@ def get_upnp_port_mappings(gateway):
     if not _upnp_url_points_at(ctrl_url, gateway):
         return [], (f"The UPnP description named a control URL at {_banner_text(ctrl_url, 120)}, which is "
                     "not on the gateway. Not followed, so port mappings were not read.")
+    ctrl_target = _plain_http_target(ctrl_url)
+    if ctrl_target is None:
+        return [], (f"The UPnP description named a control URL at {_banner_text(ctrl_url, 120)}; only "
+                    "plain http on the gateway is fetched. Not followed, so port mappings "
+                    "were not read.")
+    ctrl_port, ctrl_path = ctrl_target
 
     # Step 3: GetGenericPortMappingEntry in a loop
     mappings = []
+    truncated = False
     soap_tpl = """<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -6895,24 +7631,19 @@ def get_upnp_port_mappings(gateway):
 </s:Envelope>"""
 
     for i in range(100):  # cap at 100 mappings
-        body = soap_tpl.format(index=i).encode()
-        req = urllib.request.Request(
-            ctrl_url, data=body,
-            headers={
-                "Content-Type": "text/xml; charset=utf-8",
-                "SOAPAction": '"urn:schemas-upnp-org:service:WANIPConnection:1#GetGenericPortMappingEntry"',
-                "User-Agent": "home_net_audit",
-            }
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                resp = r.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as e:
-            if e.code in (500, 501):
-                break  # no more entries
+        if _budget() <= 0:
+            truncated = True
             break
-        except Exception:
+        got = _http_post_plain(
+            gateway, ctrl_port, ctrl_path, soap_tpl.format(index=i),
+            {"Content-Type": "text/xml; charset=utf-8",
+             "SOAPAction": '"urn:schemas-upnp-org:service:WANIPConnection:1#GetGenericPortMappingEntry"'},
+            total=_budget())
+        if got is None:
             break
+        status, _server, resp = got
+        if status >= 400:
+            break  # 500 is how most stacks say "no more entries"; anything else ends it too
 
         if "SpecifiedArrayIndexInvalid" in resp or "InvalidIndex" in resp:
             break
@@ -6937,6 +7668,9 @@ def get_upnp_port_mappings(gateway):
             "enabled":     xtag("NewEnabled", resp),
         })
 
+    if truncated:
+        return mappings, (f"Stopped after {len(mappings)} mapping(s): the gateway took longer than "
+                          f"{UPNP_MAPPINGS_TOTAL_SECONDS:.0f}s to answer, so the list may be incomplete.")
     return mappings, None
 
 
@@ -7475,7 +8209,7 @@ def action_upnp_dump():
     print(f"  Querying UPnP on gateway {gateway} via SSDP...")
     mappings, err = get_upnp_port_mappings(gateway)
 
-    if err:
+    if err and not mappings:
         print(f"  [INFO] {err}")
         return {"mappings": [], "note": err}
 
@@ -7503,6 +8237,11 @@ def action_upnp_dump():
 
     print("\n  Note: Each mapping above is a hole punched through your router to an")
     print("  internal device. Review any you don't recognise — malware can add these.")
+    if err:
+        # Some mappings were read before the budget ran out: they are kept,
+        # and the reader is told the list may not be the whole table.
+        print(f"  [REVIEW] {err}")
+        return {"mappings": mappings, "note": err}
     return {"mappings": mappings}
 
 
@@ -8300,7 +9039,7 @@ def action_listening_services(compact=False, known=None):
             print("  process name and no fixed port there is nothing to tell one from "
                   "another. sudo names them.")
         for fp in sorted(before - now, key=str):
-            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
+            print(f"  [INFO  ] Listening: in the baseline, gone now: {_describe_fingerprint(fp)}")
         return services
 
     print(f"\n  {'Port':<7} {'Proto':<6} {'Process':<22} Note")
@@ -8332,11 +9071,21 @@ def action_listening_services(compact=False, known=None):
     # is in the baseline at all, and the default run printed the table with a
     # generic "verify you recognise them" while a new fixed-port daemon sat in
     # it unnamed as new.
+    #
+    # Risk-tagged, so the email digest carries them. These lines were printed
+    # as "  + not in the baseline: ..." — a form nothing downstream reads: the
+    # TL;DR counts flagged lines and change lines, so a week whose only event
+    # was a new TCP 4444 listener was mailed as "no changes" with the one line
+    # that said otherwise buried under the table. A fixed port is REVIEW (a
+    # fixed port is a choice somebody made, and a new one is what this section
+    # exists to catch); a named process on a dynamic port is INFO, since those
+    # are compared by name alone and come and go with the apps that are open.
     if before and now != before:
         for fp in sorted(now - before, key=str):
-            print(f"  + not in the baseline: {_describe_fingerprint(fp)}")
+            tag = "INFO  " if fp[2] == "dynamic" else "REVIEW"
+            print(f"  [{tag}] Listening: not in the baseline: {_describe_fingerprint(fp)}")
         for fp in sorted(before - now, key=str):
-            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
+            print(f"  [INFO  ] Listening: in the baseline, gone now: {_describe_fingerprint(fp)}")
 
     return services
 
@@ -8638,13 +9387,18 @@ RENDERED_STATE_KEYS = frozenset({
     "upnp", "dhcp", "listening", "router_hostname", "evil_twin", "ipv6",
     "ipv6_routers", "ipv6_router_details", "interception", "router_tls", "dsl",
     "upnp_listeners",
+    # How each port scan went (measured / blocked / filtered), beside its list.
+    "router_scan", "upstream_scan",
+    # The modem's certificates and banners (host_identity).
+    "upstream_identity",
     # The gateway's hardware address and the IPv6 neighbour table's MACs: what
     # binds a baseline to its network and keeps a host off the "gone" line.
     "gateway_mac", "ipv6_neighbour_macs",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
-    # Bookkeeping written by save_baseline: which devices this network has seen.
-    "device_memory",
+    # Bookkeeping written by save_baseline: which devices this network has seen,
+    # and which departures the saving run reported.
+    "device_memory", "departed",
     # This run's change-detection text, rendered first; never saved.
     "_comparison",
 })
@@ -9047,7 +9801,13 @@ def generate_html_report(state, output_path=None):
     # Upstream modem ports
     if "upstream_open_ports" in state:
         ports = state["upstream_open_ports"]
-        if ports is None:
+        upstream_scan = state.get("upstream_scan") if isinstance(state.get("upstream_scan"), dict) else {}
+        if ports is None and upstream_scan.get("result") == "filtered":
+            body = (f"<p>{risk_badge('REVIEW')} No probe to the upstream modem was answered "
+                    "(FILTERED): not open, and not closed either, since a closed port "
+                    "answers with a reset. Nothing is known about which ports it exposes "
+                    "this run; the previous reading is carried forward.</p>")
+        elif ports is None:
             body = (f"<p>{risk_badge('REVIEW')} The upstream modem could not be "
                     "scanned, so nothing is known about which ports it exposes.</p>")
         elif ports:
@@ -9075,6 +9835,23 @@ def generate_html_report(state, output_path=None):
         else:
             body = f"<p>{risk_badge('OK')} No open ports found on the upstream modem.</p>"
         sections_html += section("Upstream Modem Ports", body)
+
+    # The modem's identity: certificates and banners, recorded so a change
+    # between runs is a change line.
+    if "upstream_identity" in state:
+        identity = state["upstream_identity"] if isinstance(state["upstream_identity"], dict) else {}
+        rows = [[what[0].upper() + what[1:], _esc(describe_identity_field(field, identity[field]))]
+                for field, what in IDENTITY_FIELDS if isinstance(identity.get(field), str) and identity[field]]
+        if rows:
+            body = (table(["What the modem presented", "Value"], rows)
+                    + "<p>Recorded so a change between runs is visible: a different certificate "
+                    "or banner means the modem was re-issued, replaced, or something is "
+                    "answering in its place.</p>")
+        else:
+            body = (f"<p>{risk_badge('REVIEW')} Nothing identifying the upstream modem could "
+                    "be read this run (no certificate, SSH banner or UPnP banner), so there is "
+                    "nothing to compare against next run.</p>")
+        sections_html += section("Upstream Modem Identity", body)
 
     # What an open port 1900 turned out to be
     listeners = state.get("upnp_listeners")
@@ -9321,9 +10098,11 @@ def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
     was classified as — so that a later network can say "same as from there"
     instead of repeating the section.
 
-    Returns {"ports", "upnp_state", "network", "age_min"} or None. None whenever
-    the reference cannot honestly be called the same report: unreadable, no
-    modem scan in it, about this very network, or older than an hour.
+    Returns {"ports", "upnp_state", "identity", "network", "age_min"} or None.
+    None whenever the reference cannot honestly be called the same report:
+    unreadable, no modem scan in it, about this very network, or older than an
+    hour. `identity` is what that network read of the modem's certificates
+    and banners (host_identity), or None when it read nothing or carried it.
 
     The file is NOT trusted for anything the reader will see. The ports printed
     are always the ones this run measured; the reference can only make the
@@ -9356,13 +10135,21 @@ def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
     verdict = listeners.get(upstream_ip) if isinstance(listeners, dict) else None
     upnp_state = verdict.get("state") if isinstance(verdict, dict) else None
     name = network_name_for_subnet(subnet, load_networks()) if subnet else ""
+    identity = state.get("upstream_identity")
+    if not (isinstance(identity, dict) and identity) \
+            or "upstream_identity" in (state.get("carried_forward") or []):
+        identity = None
+    else:
+        identity = {k: v for k, v in identity.items() if isinstance(k, str) and isinstance(v, str)}
     return {"ports": sorted(ports),
             "upnp_state": upnp_state if isinstance(upnp_state, str) else None,
+            "identity": identity,
             "network": _device_name_text(name or subnet or "an earlier network", 40),
             "age_min": int((now - stamp).total_seconds() // 60)}
 
 
-def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None):
+def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None,
+               outcomes=None, identities=None):
     """Port-scan one host, print a risk-annotated summary, and return open ports.
 
     Shared by action_port_scan and action_full_audit (previously duplicated).
@@ -9374,12 +10161,25 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
     `verdicts` is a dict, the verdict is stored in it under the host's address
     so the caller can keep it; the return value stays the list of ports.
 
+    If `outcomes` is a dict, how the scan went is stored in it under the host's
+    address: {"result": "measured" | "blocked" | "filtered", "probed",
+    "answered", "filtered", "unreachable"}. The return value is None for both
+    of the last two results — nothing is known about the ports — and the
+    outcome is what lets the saved baseline say which it was, so the next
+    comparison can tell "the modem answered again" from "ports opened".
+
     `reference` (see load_upstream_reference) is what an earlier network in the
     same report found on this host. When this scan agrees with it — the same
-    open ports and the same verdict on port 1900 — the section is printed in
-    brief: the measured ports, every line rated above INFO, the certificate, and
-    a pointer to the full section. Everything is still measured and returned;
-    any disagreement at all prints the section in full, with a note saying so.
+    open ports, the same verdict on port 1900 and the same identity — the
+    section is printed in brief: the measured ports, every line rated above
+    INFO, the certificate, and a pointer to the full section. Everything is
+    still measured and returned; any disagreement at all prints the section in
+    full, with a note saying so.
+
+    If `identities` is a dict, the host's identity (host_identity: certificate
+    digests on 443 and 8443, the SSH banner, the UPnP server banner) is stored
+    in it under the host's address, so the caller can seal it beside the ports
+    and the next run can compare it.
     """
     port_set = range(1, 65536) if full_scan else COMMON_PORTS
     n = "all 65535" if full_scan else str(len(COMMON_PORTS))
@@ -9387,11 +10187,17 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
     t0 = time.time()
     scan = scan_ports_detailed(host, port_set)
     open_ports = scan["open"]
+    outcome = {"result": "measured", "probed": scan["probed"],
+               "answered": scan.get("answered", 0), "filtered": scan.get("filtered", 0),
+               "unreachable": scan["unreachable"]}
+    if outcomes is not None:
+        outcomes[host] = outcome
     if scan["blocked"]:
         # Every probe returned "unreachable", so this is not a host with
         # nothing listening — it is a host we were never able to ask. Saying
         # "none found" here would be a fabrication, and saving it as [] would
         # tell the next run that the ports had closed.
+        outcome["result"] = "blocked"
         print(f"Done in {time.time()-t0:.1f}s. UNKNOWN — could not reach {host}.")
         print(f"  [REVIEW] All {scan['probed']} probes returned 'unreachable' "
               f"before any timeout, so the result is not 'no open ports'.")
@@ -9406,6 +10212,24 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
                   "launcher app built by\n           tools/audit_launcher/build.sh, which "
                   "macOS can grant this access to.")
         return None
+    if scan.get("unanswered"):
+        # No probe was answered: not open, and not closed either, since a
+        # closed port answers with a reset. This used to print "none found"
+        # and return [], a measurement, which the baseline kept and the next
+        # real reading contradicted as "NEW open port(s) ... faces the
+        # internet". The IoT network, cut off from the modem by design, held
+        # exactly that empty list as fact.
+        outcome["result"] = "filtered"
+        print(f"Done in {time.time()-t0:.1f}s. FILTERED: no probe was answered.")
+        print(f"  [REVIEW] None of the {scan['probed']} probes to {host} was answered "
+              f"({scan.get('filtered', 0)} timed out, {scan['unreachable']} unreachable), so "
+              "this is not 'no open ports':")
+        print("           a closed port answers with a reset. A firewall dropping probes from "
+              "this network, a host that is")
+        print("           down or rebooting, or a path that cannot reach it all look like this. "
+              "Nothing is recorded about its")
+        print("           ports this run; the previous reading is carried forward.")
+        return None
     print(f"Done in {time.time()-t0:.1f}s. Open ports: {open_ports or 'none found'}")
     # Classified before anything is printed, because whether the section can be
     # brief depends on the verdict as much as on the port list.
@@ -9415,14 +10239,25 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
         if verdicts is not None:
             verdicts[host] = verdict
 
+    # The host's identity, measured before the brief decision because it is
+    # part of it: a modem that answers one network with a different
+    # certificate than another is the finding, not the repetition.
+    tls = check_tls(host)
+    identity = host_identity(host, open_ports, verdict, tls)
+    if identities is not None:
+        identities[host] = identity
+
     brief = False
     if isinstance(reference, dict):
         same_ports = sorted(open_ports) == reference.get("ports")
         same_upnp = (verdict or {}).get("state") == reference.get("upnp_state")
-        brief = same_ports and same_upnp
+        ref_identity = reference.get("identity")
+        same_identity = not isinstance(ref_identity, dict) or ref_identity == identity
+        brief = same_ports and same_upnp and same_identity
         if brief:
             print(f"  The same open ports"
                   + (f", and the same verdict on port 1900 ({verdict['state']})," if verdict else "")
+                  + (", and the same certificate and banners," if isinstance(ref_identity, dict) else "")
                   + f" as seen from {reference['network']} "
                   f"{reference['age_min']} min ago. The full section is under that network;")
             print("  below are only the lines rated above INFO, measured again from here.")
@@ -9432,13 +10267,23 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
             # sees nothing, every week — so rating the difference would mint a
             # permanent false flag. What is worth an alarm is this network's view
             # CHANGING, and its own baseline comparison already watches for that.
-            what = "open ports" if not same_ports else "verdict on port 1900"
+            what = ("open ports" if not same_ports else "verdict on port 1900" if not same_upnp
+                    else "identity (certificates and banners)")
             print(f"  Note: the {what} seen from here differ from what {reference['network']} "
                   f"saw {reference['age_min']} min ago")
             print(f"  ({reference['ports']}"
                   + (f", port 1900 {reference['upnp_state']}" if reference.get("upnp_state") else "")
                   + "), so this section is printed in full. A guest network that is")
             print("  isolated from the modem is expected to differ.")
+            if not same_identity:
+                # Printed in full, both sides: the same modem presenting two
+                # certificates to two networks is interception's signature.
+                for field, what in IDENTITY_FIELDS:
+                    was, now = ref_identity.get(field), identity.get(field)
+                    if was != now:
+                        print(f"  {what} from {reference['network']}: "
+                              f"{describe_identity_field(field, was) if was else '(not read)'}; "
+                              f"from here: {describe_identity_field(field, now) if now else '(not read)'}")
 
     for p in open_ports:
         svc, risk, note = PORTS_OF_INTEREST.get(
@@ -9454,11 +10299,16 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
         if brief and risk == "INFO":
             continue
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
-    tls = check_tls(host)
     if tls.get("sha256"):
         print(f"  HTTPS (TLS) certificate: present, sha256 {tls['sha256'][:16]}…")
     else:
         print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
+    if not brief:
+        # The rest of the identity, recorded so a change between runs is a
+        # change line rather than two prefixes forty lines apart in the log.
+        for field, what in IDENTITY_FIELDS[1:]:
+            if identity.get(field):
+                print(f"  {what[0].upper() + what[1:]}: {describe_identity_field(field, identity[field])}")
     if open_ports and 80 in open_ports and 443 not in open_ports:
         print("  Note: port 80 open without 443. App-managed mesh systems")
         print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
@@ -9507,6 +10357,7 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             display_order.append(key)
 
     unlabelled = []
+    vendor_only = []
     total = 0
     for subnet_str in display_order:
         group = by_subnet.get(subnet_str, [])
@@ -9521,13 +10372,17 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             name = labels.get(mac.lower(), "")
             vend = d.get("vendor", "")
             # "(randomized/private MAC)" is what lookup_vendor returns when it
-            # declines to look one up. It reads as a vendor here and suppressed
-            # the "unlabelled" flag, so a device the tool explicitly could not
-            # identify was presented as identified — and left out of the count
-            # that tells the reader how many they still have to account for.
-            identified = name or (vend if vend != PRIVATE_MAC_VENDOR else "")
-            display_name = name or vend
-            tag = f"  {display_name}" if display_name else ""
+            # declines to look one up; it is not a vendor.
+            vend = "" if vend == PRIVATE_MAC_VENDOR else vend
+            # Only a label the owner typed identifies a device. A vendor name
+            # is a registry lookup of a prefix the device itself chose, fetched
+            # from a third party over the network being audited; it used to
+            # count as identification, so any registered OUI escaped the
+            # "unlabelled" flag and the count below, and seven unlabelled Tuya
+            # plugs read as "0 unidentified" while a private-address phone was
+            # flagged every week. It is shown as what it is: a hint.
+            identified = bool(name)
+            tag = f"  {name}" if name else (f"  vendor says {vend}" if vend else "")
             flag = "" if identified else "  <-- unlabelled"
             # What the device calls itself. Shown, quoted and attributed — and
             # deliberately not part of `identified`: a name is free to claim,
@@ -9540,13 +10395,58 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             addr = d.get("ip") or d.get("ip6") or "-"
             print(f"    {addr:<15} {mac}{tag}{claim}{flag}")
             if not identified:
-                unlabelled.append(mac)
+                (vendor_only if vend else unlabelled).append(mac)
             total += 1
 
     print(f"\n  Total: {total} device(s) across {len(display_order)} subnet(s) scanned.")
+    duplicates = describe_duplicate_addresses(all_devices, labels)
+    if duplicates:
+        print(duplicates)
+    if vendor_only:
+        # Its own line, which the email digest carries: these are not
+        # identified, and they are not the same as a device nothing is known
+        # about either.
+        print(f"  {len(vendor_only)} device(s) known only by vendor name, which is a hint from "
+              "the address the device chose, not an identification.")
     if unlabelled:
-        print(f"  {len(unlabelled)} unidentified device(s). Tag them with:")
+        print(f"  {len(unlabelled)} unidentified device(s).")
+    if unlabelled or vendor_only:
+        print(f"  Tag them with:")
         print(f"    python3 home_net_audit.py --label MAC='Device Name' ...")
+
+
+def describe_duplicate_addresses(devices, labels=None):
+    """A REVIEW line naming every hardware address answering at more than one
+    IP on one subnet, or None.
+
+    The device list is indexed by MAC everywhere it is compared, so a MAC at
+    two addresses collapsed to one row and was never said. One device holding
+    two leases happens (a Mac with two interfaces on one network, a printer
+    that renewed under a new address while the old entry lingers); so does
+    two devices sharing a hardware address, which is what ARP spoofing of a
+    host looks like from the neighbour table. Either way the reader should
+    know, and the comparison cannot say it.
+    """
+    by_mac = {}
+    for d in devices or []:
+        if not isinstance(d, dict):
+            continue
+        mac, ip = d.get("mac"), d.get("ip")
+        if not (isinstance(mac, str) and isinstance(ip, str)) or mac == "unknown":
+            continue
+        mac = mac.lower()
+        if not _MAC_SHAPE.match(mac) or is_rotating_mac(mac, labels):
+            continue
+        by_mac.setdefault((mac, d.get("subnet")), set()).add(ip)
+    doubled = {key: ips for key, ips in by_mac.items() if len(ips) > 1}
+    if not doubled:
+        return None
+    parts = [f"{describe_mac(mac, labels, {'devices': devices})} at "
+             f"{', '.join(sorted(ips, key=lambda a: [int(x) if x.isdigit() else x for x in a.split('.')]))}"
+             for (mac, _subnet), ips in sorted(doubled.items())]
+    return ("  [REVIEW] Hardware address answering at more than one IP: " + "; ".join(parts)
+            + ". One device holding two leases, or two devices sharing one address — "
+            "which is what ARP spoofing of a host looks like. The comparison counts it once.")
 
 
 def onlink_coverage(subnets_to_sweep, interfaces):
@@ -10134,6 +11034,14 @@ def action_compare_baseline(state, unmonitored=False):
     _freshness = describe_baseline_freshness(old)
     if _freshness:
         print(_freshness)
+    # Across every network's baseline, not only this one's: a label is for
+    # the household, and a device seen last week on another network is not
+    # a label to prune. Said before the baseline check below, since the
+    # labels exist whether or not this network has a baseline yet.
+    _stale = describe_stale_labels(load_labels(), all_network_baselines(),
+                                   now=_parse_stamp((state or {}).get("timestamp")))
+    if _stale:
+        print(_stale)
     if not old:
         print("No baseline saved yet.")
         print("Run option 5 (Save baseline) after a full audit to enable this.")
@@ -10185,7 +11093,9 @@ def action_compare_baseline(state, unmonitored=False):
 # in the printing only: check, record, and say in a few lines what was found.
 
 _BRIEF_KEEP = re.compile(r"^\s*\[(REVIEW|UNKNOWN)\s*\]")
-_BRIEF_FORCES_FULL = re.compile(r"^\s*\[(HIGH|MEDIUM)\s*\]|^\s*\+ not in the baseline", re.M)
+_BRIEF_FORCES_FULL = re.compile(r"^\s*\[(HIGH|MEDIUM)\s*\]"
+                                r"|^\s*\[REVIEW\s*\] Listening: not in the baseline"
+                                r"|^\s*\+ not in the baseline", re.M)
 
 
 def capture_section(fn, *args, **kwargs):
@@ -10271,10 +11181,18 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     # What an open port 1900 turned out to be, per scanned host. Only present
     # when a scan found one, so a run with nothing to classify gains no key.
     upnp_listeners = {}
+    # How each scan went: measured, blocked by the OS, or filtered (no probe
+    # answered). Sealed beside the port lists, so a baseline whose port list
+    # was carried forward from an earlier run also says why.
+    scan_outcomes = {}
+    # What the modem presented: certificates and banners (host_identity).
+    identities = {}
     if gateway:
         state["router_open_ports"] = audit_host(
             "default gateway", gateway, full_scan,
-            onlink=is_onlink(gateway, interfaces), verdicts=upnp_listeners)
+            onlink=is_onlink(gateway, interfaces), verdicts=upnp_listeners,
+            outcomes=scan_outcomes)
+        state["router_scan"] = scan_outcomes.get(gateway)
         state["router_tls"] = check_tls(gateway)
     if upstream_ip:
         hr("UPSTREAM MODEM")
@@ -10282,7 +11200,13 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
             "upstream modem", upstream_ip, full_scan,
             onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners,
             reference=(load_upstream_reference(upstream_reference, upstream_ip, _subnet)
-                       if upstream_reference else None))
+                       if upstream_reference else None),
+            outcomes=scan_outcomes, identities=identities)
+        state["upstream_scan"] = scan_outcomes.get(upstream_ip)
+        # Empty when nothing was read (a filtered or blocked scan, or no port
+        # carrying an identity open): carry_forward_unmeasured keeps the last
+        # reading then, as it does for the port list.
+        state["upstream_identity"] = identities.get(upstream_ip) or {}
     if upnp_listeners:
         state["upnp_listeners"] = upnp_listeners
 
@@ -10486,6 +11410,13 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     _freshness = describe_baseline_freshness(old)
     if _freshness:
         tell(_freshness)
+    # Across every network's baseline, not only this one's: a label is for
+    # the household, and a device seen last week on another network is not
+    # a label to prune.
+    _stale = describe_stale_labels(load_labels(), all_network_baselines(),
+                                   now=_parse_stamp(state.get("timestamp")))
+    if _stale:
+        tell(_stale)
     if baseline_refused():
         tell(f"  [REVIEW] {baseline_refused()}")
         tell("Nothing was compared this run, and the baseline will not be saved.")
@@ -10759,6 +11690,11 @@ def _main():
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
                     help="Tag a device MAC with a friendly name")
+    ap.add_argument("--unlabel", nargs="+", metavar="MAC",
+                    help="Remove the label from device(s) that are gone for good. The "
+                         "report lists labels no network has seen for "
+                         f"{DEVICE_MEMORY_DAYS} days; nothing is removed by itself. Given "
+                         "on its own, saves and exits.")
     ap.add_argument("--critical", nargs="+", metavar="MAC",
                     help="Mark device(s) whose silence matters — a camera hub, an alarm. "
                          "Gone from a network it was seen on, a critical device is HIGH "
@@ -10817,8 +11753,8 @@ def _main():
         args.tplink_password_prompt, args.probe_creds, args.html_report,
         args.seal_baseline, args.publish_to,
     ]
-    cli_args_given = any(audit_flags + [args.label, args.critical, args.not_critical,
-                                        args.monitor])
+    cli_args_given = any(audit_flags + [args.label, args.unlabel, args.critical,
+                                        args.not_critical, args.monitor])
 
     if args.monitor:
         run_monitor(interval=args.interval, alert_to=args.alert_to)
@@ -10852,6 +11788,21 @@ def _main():
                 labels[mac.strip().lower()] = name.strip()
         save_labels(labels)
         print(f"Labels saved ({len(labels)} total).\n")
+
+    if args.unlabel:
+        labels = load_labels()
+        for mac in args.unlabel:
+            mac = mac.strip().lower()
+            removed = next((k for k in labels if isinstance(k, str) and k.lower() == mac), None)
+            if removed is None:
+                print(f"No label for {mac}; nothing removed.")
+            else:
+                print(f"Label removed: {mac} [{_banner_text(labels.pop(removed), 60)}]")
+        save_labels(labels)
+        print(f"Labels saved ({len(labels)} total).\n")
+        # Bookkeeping, like --critical: on its own it is not a request for an audit.
+        if not any(audit_flags) and not args.label and not (args.critical or args.not_critical):
+            return
 
     if args.critical or args.not_critical:
         critical = load_critical()

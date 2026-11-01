@@ -136,6 +136,11 @@ logic run:
   `read()` / `getcode()` / context-manager methods the code calls, or raise
   `urllib.error.HTTPError` / `URLError` to drive an error branch. `test_receipts.py`
   and `test_vendor_lookup.py` show the shape.
+- **`mod._http_get_plain` / `mod._http_post_plain`** — every UPnP fetch
+  (`classify_upnp_listener`, `upnp_device_names`, `get_upnp_port_mappings`) goes
+  through these bounded raw-socket helpers rather than urllib, so patch them to
+  return `(status, server_header, body)` or `None` for no answer. `test_upnp.py`'s
+  `_wire` records each exchange with the budget the code passed.
 - **`urllib.request.build_opener`** — `probe_default_credentials` fetches through an
   opener, not `urlopen`, so patch `build_opener` to return a fake whose `.open(req)`
   dispatches on `req.get_method()` and `req.get_header("Authorization")`. See

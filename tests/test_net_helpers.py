@@ -673,12 +673,16 @@ class TestProbePortTriState:
                             self._socket_returning(errno.ECONNREFUSED))
         assert mod.probe_port("192.168.87.1", 80) is False
 
-    def test_timeout_is_closed_not_unreachable(self, mod, monkeypatch):
-        # A filtered port that never answers is "closed" for our purposes; only
-        # an unreachable-class errno means the probe never left the machine.
+    def test_timeout_is_filtered_neither_closed_nor_unreachable(self, mod, monkeypatch):
+        # This pinned the opposite — "a filtered port that never answers is
+        # closed for our purposes" — and that purpose turned out to be saving
+        # a modem that dropped every probe as a measured empty port list
+        # (round 4, F34). Only an unreachable-class errno means the probe never
+        # left the machine; a timeout means it left and nothing came back.
         monkeypatch.setattr(mod.socket, "socket",
                             self._socket_returning(errno.ETIMEDOUT))
-        assert mod.probe_port("192.168.87.1", 80) is False
+        assert mod.probe_port("192.168.87.1", 80) == mod.PORT_FILTERED
+        assert mod.probe_port("192.168.87.1", 80) is not False
 
     @pytest.mark.parametrize("code", [errno.EHOSTUNREACH, errno.ENETUNREACH,
                                       errno.ENETDOWN, errno.EHOSTDOWN])
@@ -990,3 +994,56 @@ class TestLocalNetworkDeniedNoteNamesTheFix:
     def test_it_still_rules_out_sudo_and_offers_the_interactive_run(self, mod):
         note = mod.local_network_denied_note("The scan")
         assert "sudo does not help" in note and "interactively" in note
+
+
+class TestFilteredProbes:
+    """Round 4, F34. A timed-out connect collapsed to "closed", so a host that
+    answered nothing — a firewall dropping the probe, a modem rebooting inside
+    the 0.6 s window, a network that cannot reach it — scanned as "no open
+    ports": a measurement, saved as an empty list, contradicted the next week
+    as "NEW open port(s) ... faces the internet". A closed port answers, with a
+    reset; silence is a fourth state and is kept apart."""
+
+    @pytest.mark.parametrize("errno_value", [errno.ETIMEDOUT, errno.EAGAIN, errno.EWOULDBLOCK],
+                             ids=["ETIMEDOUT", "EAGAIN", "EWOULDBLOCK"])
+    def test_a_timed_out_connect_is_filtered_not_closed(self, mod, monkeypatch, errno_value):
+        install_fake_socket(monkeypatch, FakeSocket(connect_ex_result=errno_value))
+        assert mod.probe_port("192.168.1.1", 443) == mod.PORT_FILTERED
+
+    def test_a_socket_timeout_exception_is_filtered_too(self, mod, monkeypatch):
+        install_fake_socket(monkeypatch, FakeSocket(connect_ex_error=socket.timeout("timed out")))
+        assert mod.probe_port("192.168.1.1", 443) == mod.PORT_FILTERED
+
+    def test_a_reset_is_still_closed_and_no_route_is_still_unreachable(self, mod, monkeypatch):
+        install_fake_socket(monkeypatch, FakeSocket(connect_ex_result=errno.ECONNREFUSED))
+        assert mod.probe_port("192.168.1.1", 443) is False
+        install_fake_socket(monkeypatch, FakeSocket(connect_ex_result=errno.EHOSTUNREACH))
+        assert mod.probe_port("192.168.1.1", 443) is None
+
+    def test_check_port_still_reads_filtered_as_not_open(self, mod, monkeypatch):
+        install_fake_socket(monkeypatch, FakeSocket(connect_ex_result=errno.ETIMEDOUT))
+        assert mod.check_port("192.168.1.1", 443) is False
+
+    def _scan(self, mod, monkeypatch, answers):
+        results = iter(answers)
+        monkeypatch.setattr(mod, "probe_port", lambda host, port, timeout=0.6: next(results))
+        return mod.scan_ports_detailed("192.168.1.1", list(range(len(answers))), workers=1)
+
+    def test_a_scan_nobody_answered_is_unanswered_not_empty(self, mod, monkeypatch):
+        scan = self._scan(mod, monkeypatch, [mod.PORT_FILTERED] * 5 + [None] * 2)
+        assert scan["open"] == [] and scan["unanswered"] is True and scan["blocked"] is False
+        assert (scan["filtered"], scan["unreachable"], scan["answered"], scan["probed"]) == (5, 2, 0, 7)
+
+    def test_one_reset_makes_it_a_measurement(self, mod, monkeypatch):
+        # A single closed-with-reset answer proves the host was reached; the
+        # rest being dropped is then that host's filtering, and [] is real.
+        scan = self._scan(mod, monkeypatch, [mod.PORT_FILTERED] * 5 + [False])
+        assert scan["unanswered"] is False and scan["answered"] == 1 and scan["open"] == []
+
+    def test_every_probe_unreachable_is_still_blocked_not_unanswered(self, mod, monkeypatch):
+        scan = self._scan(mod, monkeypatch, [None] * 4)
+        assert scan["blocked"] is True and scan["unanswered"] is False
+
+    def test_an_open_port_counts_as_answered(self, mod, monkeypatch):
+        scan = self._scan(mod, monkeypatch, [mod.PORT_FILTERED, True, mod.PORT_FILTERED])
+        assert scan["open"] == [1] and scan["unanswered"] is False

@@ -19,7 +19,7 @@ NET = "192.168.86.0/24"
 HUB = "a4:11:62:2a:b9:0a"
 TV = "8c:79:f5:8c:48:a7"
 STRANGER = "00:1b:63:84:45:e6"          # globally administered, so compared by name
-PRIVATE = "02:4b:43:1d:eb:b5"      # locally administered: a rotating address
+PRIVATE = "0a:1b:2c:3d:4e:5f"           # locally administered and unlabelled: a rotating address
 
 T0 = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
 
