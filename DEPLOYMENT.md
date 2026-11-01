@@ -91,6 +91,31 @@ is the compromise for unattended runs — it is readable by anything sharing tha
 process environment, which is worse than a prompt and much better than leaving
 the baseline unauthenticated.
 
+### Re-sealing a baseline the report has called modified
+
+`seal_baseline.py` seals the baseline already on disk, without a scan — and it
+verifies it first. It is the remedy every tamper warning prescribes, and it
+used to seal whatever it found: a record the report had just called
+"modified" came out reading "Seal verified", with the modification inside as
+the new reference. Run it with the passphrase the scheduled job uses, so the
+check is made with the right key:
+
+```sh
+HOME_NET_AUDIT_PASSPHRASE="$(security find-generic-password -s homenetaudit-baseline -a rgs_work -w)" \
+    python3 ~/src/home_audit/seal_baseline.py
+```
+
+It prints the integrity verdict and, with `HOME_NET_AUDIT_SINK` set, the
+receipt comparison, then refuses to seal a record that reads modified, rolled
+back, missing, downgraded or unverifiable, or that the off-host receipts
+dispute. If you have reviewed the record yourself — every device, every
+remembered device, every port — run it again with `--force-reviewed`: it
+prints that list once more and asks you to type `SEAL`. Press Enter at the
+passphrase prompt to keep the existing one; typing a different one re-keys
+the chain, and the script warns twice, because the Keychain item the wrapper
+reads then has to change to match or every run will report the baseline as
+modified.
+
 ---
 
 ## Continuous monitoring
@@ -283,6 +308,29 @@ knows it on that network, and — on the network the monitor watches — pinged
 every poll and alerted HIGH after ten silent polls, with a REVIEW when it is
 back. The marks live in `critical.json` beside `labels.json`.
 
+### What a label means, and when to remove one
+
+Only a label from you identifies a device. A vendor name is a lookup of a
+prefix the device itself chose, fetched from a third party over the network
+being audited, so it is shown as "vendor says …" and devices known only by
+vendor are flagged and counted on their own line of the report and the
+TL;DR. A label also settles the one question the audit cannot: an address
+with the locally-administered bit set is a phone's rotating private address
+unless you have labelled it, in which case it is a device — compared by
+name, reported gone, remembered — whatever the bit says. Label the LinkTap
+gateways, the IoT gateway and each Mac's own address for exactly that
+reason.
+
+A label outlives the device it named, and an address seen on the air for
+months can be reused by anyone with the Wi-Fi key: a clone would print as
+your own labelled device. So a remembered device coming back after a run
+reported it gone is a change line, and labels no network has seen for 30
+days are listed in the report. Nothing is removed by itself:
+
+```sh
+python3 home_net_audit.py --unlabel 70:89:76:78:6d:c6      # saves and exits
+```
+
 ---
 
 ## What the observer does and does not audit
@@ -291,10 +339,22 @@ The network readers speak both dialects, so a Linux observer sees the same
 gateway, interfaces, neighbour table and resolvers as the Mac, in the same
 format — which matters, because both diff against one shared baseline.
 
-The **host-posture** checks (firewall, sharing services, Wi-Fi security) are
-deliberately not ported. They describe whichever machine is running the audit,
-and on an observer that is not the machine anyone cares about. Run those on the
-Mac itself.
+The **host-posture** checks (firewall, sharing services, Wi-Fi security, the
+trust store) are deliberately not ported. They describe whichever machine is
+running the audit, and on an observer that is not the machine anyone cares
+about. Run those on the Mac itself.
+
+On the Mac, the trust store check reads both trust domains. The admin domain
+(`security dump-trust-settings -d`) needs sudo to change and is empty on most
+Macs; the user domain is where a Keychain Access "Always Trust", a
+`security add-trusted-cert` into the login keychain or a mkcert install
+lands, with no password, and Safari, Chrome and curl honour it. Any root
+trusted in either domain is HIGH until you remove it (Keychain Access →
+login → Certificates → Trust → "Use System Defaults"), and a setting arriving
+is a change line. A modem scan in which no probe is answered — a firewall
+dropping them, a modem rebooting, a guest network cut off from it — is
+reported as filtered at REVIEW and the previous reading carried forward,
+never as "no open ports".
 
 ---
 
