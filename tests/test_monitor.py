@@ -762,7 +762,7 @@ class TestNeighboursAreDevicesNotGroups:
 
     def test_broadcast_and_multicast_rows_are_not_neighbours(self, mod, monkeypatch):
         monkeypatch.setattr(mod, "get_default_gateway", lambda: GW)
-        monkeypatch.setattr(mod, "get_ipv6_routers", lambda: [])
+        monkeypatch.setattr(mod, "get_ipv6_router_entries", lambda: [])
         monkeypatch.setattr(mod, "get_dns_servers", lambda: [GW])
         monkeypatch.setattr(mod, "read_arp_table", lambda: {
             GW: ROUTER_MAC,

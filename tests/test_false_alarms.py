@@ -137,6 +137,56 @@ class TestRoutersAreKnownByMac:
         assert result["risk"] == "HIGH"
         assert "HAS installed" in result["note"] and HUB_NEW in result["note"]
 
+    def test_a_cloned_mac_that_carries_the_default_route_is_high(self, mod, monkeypatch):
+        """The hub's MAC is on the LAN for anyone to copy. Copying it buys a
+        rogue nothing once this machine routes through it."""
+        monkeypatch.setattr(mod, "run", readers(NDP_R_HUB_INSTALLED))
+        result = mod.check_ipv6_routers(
+            known=[HUB_OLD], known_details={HUB_OLD: {"mac": HUB_MAC, "installed": False}},
+            labels=LABELS)
+        assert result["risk"] == "HIGH"
+        assert result["unexpected"] == [HUB_NEW] and result["renumbered"] == []
+        assert "HAS installed" in result["note"]
+
+    def test_a_cloned_gateway_mac_beside_the_real_gateway_is_high(self, mod, monkeypatch):
+        """The real gateway was installed in the baseline and is still
+        advertising; the newcomer with its MAC now holds the default route."""
+        monkeypatch.setattr(mod, "run", readers(
+            f"{GW_V6} if=en0, flags=, pref=medium, expire=29m30s\n"
+            f"{ROGUE} if=en0, flags=I, pref=high, expire=29m\n",
+            neighbours_out=NDP_A.replace(ROGUE_MAC, GW_MAC)))
+        result = mod.check_ipv6_routers(
+            known=[GW_V6], known_details={GW_V6: {"mac": GW_MAC, "installed": True}}, labels=LABELS)
+        assert result["risk"] == "HIGH" and result["unexpected"] == [ROGUE]
+
+    def test_an_installed_router_that_genuinely_renumbered_is_info(self, mod, monkeypatch):
+        # The old address is gone — retired, as a reboot retires it.
+        monkeypatch.setattr(mod, "run", readers(
+            f"{ROGUE} if=en0, flags=I, pref=medium, expire=29m\n",
+            neighbours_out=NDP_A.replace(ROGUE_MAC, GW_MAC)))
+        result = mod.check_ipv6_routers(
+            known=[GW_V6], known_details={GW_V6: {"mac": GW_MAC, "installed": True}}, labels=LABELS)
+        assert result["risk"] == "INFO" and result["unexpected"] == []
+
+    def test_a_known_router_taken_as_the_default_route_is_high(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "run", readers(NDP_R_HUB_INSTALLED))
+        result = mod.check_ipv6_routers(
+            known=[HUB_NEW], known_details={HUB_NEW: {"mac": HUB_MAC, "installed": False}},
+            labels=LABELS)
+        assert result["risk"] == "HIGH" and result["promoted"] == [HUB_NEW]
+        assert "now installed it as one" in result["note"]
+
+    def test_a_baseline_that_never_recorded_installation_cannot_promote(self, mod, monkeypatch):
+        # A baseline from before the flag was kept, or from a platform that
+        # cannot read it: nothing to compare, so no alarm from the upgrade alone.
+        monkeypatch.setattr(mod, "run", readers(NDP_R_HUB_INSTALLED))
+        result = mod.check_ipv6_routers(known=[HUB_NEW], known_details={HUB_NEW: {"mac": HUB_MAC}})
+        assert result["risk"] == "OK" and result["promoted"] == []
+
+    def test_a_router_handing_out_nothing_records_an_empty_list(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "run", readers(NDP_R_HUB))
+        assert mod.check_ipv6_routers(known=[HUB_NEW])["details"][HUB_NEW]["prefixes"] == []
+
     def test_a_new_mac_nobody_named_is_high(self, mod, monkeypatch):
         monkeypatch.setattr(mod, "run", readers(NDP_R_GW_AND_ROGUE))
         result = mod.check_ipv6_routers(
@@ -198,18 +248,48 @@ class TestTheBaselineDiffAgrees:
         assert len(notes) == 1 and "NEW IPv6 router" in notes[0] and ROGUE in notes[0]
 
     def test_a_known_router_becoming_the_default_route_is_a_change(self, mod):
+        # Judged by address: the same address, now carrying the default route.
+        old = self._old(**{HUB_NEW: {"mac": HUB_MAC, "installed": False,
+                                     "prefixes": ["fdca:7af7:13bd:4743::/64"]}})
         new = self._new(**{HUB_NEW: {"mac": HUB_MAC, "installed": True,
                                      "prefixes": ["fdca:7af7:13bd:4743::/64"]}})
-        notes = mod.diff_baseline(self._old(), new, LABELS)
+        notes = mod.diff_baseline(old, new, LABELS)
         assert len(notes) == 1
         assert "default route" in notes[0] and "Apple TV - Play Room" in notes[0]
         assert "NEW IPv6 router" not in notes[0]
+        # A baseline that recorded nothing about installation cannot promote.
+        old = self._old(**{HUB_NEW: {"mac": HUB_MAC, "prefixes": ["fdca:7af7:13bd:4743::/64"]}})
+        assert mod.diff_baseline(old, new, LABELS) == []
 
     def test_a_known_router_with_a_new_prefix_is_a_change(self, mod):
         new = self._new(**{HUB_NEW: {"mac": HUB_MAC, "installed": False,
                                      "prefixes": ["fdca:7af7:13bd:4743::/64", "fd00:dead::/64"]}})
         notes = mod.diff_baseline(self._old(), new, LABELS)
         assert len(notes) == 1 and "fd00:dead::/64" in notes[0] and "prefix" in notes[0]
+
+    def test_a_cloned_mac_carrying_the_default_route_is_a_new_router(self, mod):
+        new = self._new(**{HUB_NEW: {"mac": HUB_MAC, "installed": True,
+                                     "prefixes": ["fdca:7af7:13bd:4743::/64"]}})
+        notes = mod.diff_baseline(self._old(), new, LABELS)
+        assert any("NEW IPv6 router" in n and HUB_NEW in n for n in notes)
+        assert mod.describe_ipv6_renumbering(self._old(), new, LABELS) is None
+
+    def test_a_cloned_gateway_mac_beside_the_real_gateway_is_a_new_router(self, mod):
+        old = {"ipv6_routers": [GW_V6], "ipv6_router_details": {GW_V6: {"mac": GW_MAC, "installed": True}}}
+        new = {"ipv6_routers": [GW_V6, ROGUE],
+               "ipv6_router_details": {GW_V6: {"mac": GW_MAC, "installed": False},
+                                       ROGUE: {"mac": GW_MAC, "installed": True}}}
+        notes = mod.diff_baseline(old, new, LABELS)
+        assert any("NEW IPv6 router" in n and ROGUE in n for n in notes)
+
+    def test_a_prefix_appearing_where_none_was_recorded_is_a_change(self, mod):
+        old = self._old(**{HUB_OLD: {"mac": HUB_MAC, "installed": False, "prefixes": []}})
+        new = self._new(**{HUB_NEW: {"mac": HUB_MAC, "installed": False, "prefixes": ["fd00:dead::/64"]}})
+        notes = mod.diff_baseline(old, new, LABELS)
+        assert len(notes) == 1 and "fd00:dead::/64" in notes[0]
+        # No record at all says nothing.
+        old = self._old(**{HUB_OLD: {"mac": HUB_MAC, "installed": False}})
+        assert mod.diff_baseline(old, new, LABELS) == []
 
     def test_a_baseline_without_details_compares_by_address(self, mod):
         # Saved before MACs were kept: nothing to match the new address against.
@@ -233,6 +313,30 @@ class TestTheMonitorAgrees:
         assert [e["kind"] for e in events] == ["ipv6_router_appeared"]
         assert events[0]["severity"] == "HIGH"
 
+    def test_a_cloned_mac_carrying_the_default_route_is_high_in_the_monitor(self, mod):
+        old = snap(ipv6_routers=[HUB_OLD], ipv6_router_macs={HUB_OLD: HUB_MAC},
+                   ipv6_router_installed={HUB_OLD: False})
+        new = snap(ipv6_routers=[HUB_NEW], ipv6_router_macs={HUB_NEW: HUB_MAC},
+                   ipv6_router_installed={HUB_NEW: True})
+        events = mod.diff_snapshots(old, new, labels=LABELS)
+        assert [e["kind"] for e in events] == ["ipv6_router_appeared"]
+        assert events[0]["severity"] == "HIGH"
+
+    def test_a_cloned_gateway_mac_beside_the_real_gateway_is_high_in_the_monitor(self, mod):
+        old = snap(ipv6_router_installed={GW_V6: True})
+        new = snap(ipv6_routers=[GW_V6, ROGUE], ipv6_router_macs={GW_V6: GW_MAC, ROGUE: GW_MAC},
+                   ipv6_router_installed={GW_V6: False, ROGUE: True})
+        assert [e["kind"] for e in mod.diff_snapshots(old, new)] == ["ipv6_router_appeared"]
+
+    def test_a_known_router_taken_as_the_default_route_is_high_in_the_monitor(self, mod):
+        old = snap(ipv6_routers=[HUB_NEW], ipv6_router_macs={HUB_NEW: HUB_MAC},
+                   ipv6_router_installed={HUB_NEW: False})
+        new = snap(ipv6_routers=[HUB_NEW], ipv6_router_macs={HUB_NEW: HUB_MAC},
+                   ipv6_router_installed={HUB_NEW: True})
+        events = mod.diff_snapshots(old, new, labels=LABELS)
+        assert [e["kind"] for e in events] == ["ipv6_router_installed"]
+        assert events[0]["severity"] == "HIGH" and "Apple TV - Play Room" in events[0]["detail"]
+
     def test_a_reference_without_router_macs_is_compared_by_address(self, mod):
         old = snap(ipv6_routers=[HUB_OLD], ipv6_router_macs={})
         new = snap(ipv6_routers=[HUB_NEW], ipv6_router_macs={HUB_NEW: HUB_MAC})
@@ -248,6 +352,7 @@ class TestTheMonitorAgrees:
         }))
         result = mod.monitor_snapshot()
         assert result["ipv6_router_macs"] == {HUB_NEW: HUB_MAC}
+        assert result["ipv6_router_installed"] == {HUB_NEW: False}
         assert result["neighbour_macs"] == {GW: GW_MAC, PRINTER: PRINTER_MAC}
         assert result["neighbours"] == [GW, PRINTER]
 
@@ -398,6 +503,7 @@ class TestTheMonitorRemembersDevices:
     def test_a_poll_with_no_mac_table_teaches_and_expires_nothing(self, mod):
         stale = {ROGUE_MAC: {"ip": "x", "first_seen": at(0, -40).isoformat(),
                              "last_seen": at(0, -31).isoformat()}}
+        assert mod.update_monitor_memory(stale, {"neighbours": [], "neighbour_macs": {}}, at(0)) == stale
         assert mod.update_monitor_memory(stale, {"neighbours": [GW]}, at(0)) == stale
 
     def test_the_state_file_survives_a_hand_edit(self, mod, tmp_path):
@@ -462,8 +568,14 @@ class TestCriticalDevices:
     def test_the_monitor_alerts_after_ten_silent_polls_and_once(self, mod):
         memory = {ARLO_MAC: {"ip": HUB_IP, "first_seen": at(-1).isoformat(), "last_seen": at(0).isoformat()}}
         gone = snap(neighbour_macs={GW: GW_MAC})
+        assert mod.CRITICAL_ABSENT_POLLS == 10
         raised = []
-        for _ in range(12):
+        for _ in range(mod.CRITICAL_ABSENT_POLLS - 1):
+            raised += mod.critical_device_events({ARLO_MAC}, gone, memory, LABELS)
+        assert raised == []
+        raised += mod.critical_device_events({ARLO_MAC}, gone, memory, LABELS)
+        assert [e["kind"] for e in raised] == ["critical_device_absent"]
+        for _ in range(2):
             raised += mod.critical_device_events({ARLO_MAC}, gone, memory, LABELS)
         assert [e["kind"] for e in raised] == ["critical_device_absent"]
         assert raised[0]["severity"] == "HIGH"
@@ -475,8 +587,35 @@ class TestCriticalDevices:
 
     def test_a_poll_that_could_not_read_the_table_does_not_count(self, mod):
         memory = {ARLO_MAC: {"ip": HUB_IP, "last_seen": at(0).isoformat()}}
-        unreadable = {"gateway": GW, "neighbours": []}
+        unreadable = snap(neighbours=[], neighbour_macs={})
         assert mod.critical_device_events({ARLO_MAC}, unreadable, memory, polls=1) == []
+        assert mod.critical_device_events({ARLO_MAC}, {"gateway": GW, "neighbours": []}, memory, polls=1) == []
+
+    def test_a_blank_poll_in_the_loop_neither_counts_nor_teaches(self, mod, monkeypatch):
+        """carry_forward_blank_fields fills the table from the previous poll so
+        the comparison does not alarm; the counters and the memory must see
+        the raw reading, not the carried one."""
+        mod.save_critical({ARLO_MAC})
+        mod.save_monitor_state(snap(neighbours=[GW, HUB_IP], neighbour_macs={GW: GW_MAC, HUB_IP: ARLO_MAC}),
+                               at(0), memory={
+            ARLO_MAC: {"ip": HUB_IP, "first_seen": at(-1).isoformat(),
+                       "last_seen": at(0).isoformat(), "absent_polls": 1},
+            GW_MAC: {"ip": GW, "first_seen": at(-1).isoformat(), "last_seen": at(0).isoformat()}})
+        monkeypatch.setattr(mod, "CRITICAL_ABSENT_POLLS", 2)
+        monkeypatch.setattr(mod, "monitor_snapshot",
+                            lambda critical_ips=(): snap(neighbours=[], neighbour_macs={}, gateway_mac=None))
+        events = mod.run_monitor(interval=0, iterations=1, sleeper=lambda _: None,
+                                 printer=lambda *a: None, clock=lambda: at(0, 0) + timedelta(minutes=1))
+        assert "critical_device_absent" not in [e["kind"] for e in events]
+        memory = mod.load_monitor_memory()
+        assert memory[ARLO_MAC]["absent_polls"] == 1
+        assert memory[GW_MAC]["last_seen"] == at(0).isoformat()
+
+    def test_a_counter_from_a_hand_edited_file_is_read_as_a_number_or_nothing(self, mod):
+        memory = {ARLO_MAC: {"ip": HUB_IP, "last_seen": at(0).isoformat(), "absent_polls": "9 polls"}}
+        gone = snap(neighbour_macs={GW: GW_MAC})
+        assert mod.critical_device_events({ARLO_MAC}, gone, memory, polls=2) == []
+        assert memory[ARLO_MAC]["absent_polls"] == 1
 
     def test_a_device_never_seen_on_this_network_is_not_missed(self, mod):
         assert mod.critical_device_events({ARLO_MAC}, snap(), {}, polls=1) == []
@@ -501,6 +640,23 @@ class TestCriticalDevices:
         monkeypatch.setattr(mod, "run", make_run({"route -n get default": f"   gateway: {GW}\n"}))
         mod.monitor_snapshot([HUB_IP, GW])
         assert pinged == [GW, HUB_IP]
+
+    def test_a_private_address_is_marked_with_a_note(self, mod, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "action_full_audit", lambda **k: {"gateway": None})
+        monkeypatch.setattr(sys, "argv", ["home_net_audit.py", "--critical", "1a:cd:58:93:00:04"])
+        mod._main()
+        assert mod.load_critical() == {"1a:cd:58:93:00:04"}
+        assert "private (randomised) address" in capsys.readouterr().out
+
+    def test_the_labels_file_cannot_take_the_monitor_down(self, mod, tmp_path):
+        import os
+        os.makedirs(os.path.dirname(mod.LABELS_FILE), exist_ok=True)
+        with open(mod.LABELS_FILE, "w") as f:
+            json.dump(["not", "a", "dict"], f)
+        assert mod.load_labels() == {}
+        os.remove(mod.LABELS_FILE)
+        os.mkdir(mod.LABELS_FILE)                      # an OSError that is not ENOENT
+        assert mod.load_labels() == {}
 
     def test_the_command_line_marks_and_exits(self, mod, monkeypatch, capsys):
         def never(**kwargs):
