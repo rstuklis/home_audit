@@ -1175,7 +1175,7 @@ class TestAWithheldComparisonSaysSoRatherThanReadingAsClean:
         # End-to-end through the real print path: the reader must not be able to
         # see "No changes since baseline." without seeing what was not compared.
         monkeypatch.setattr(mod, "load_baseline", lambda: self.SWEPT)
-        monkeypatch.setattr(mod, "use_current_network_baseline", lambda: (None, None))
+        monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (None, None))
         monkeypatch.setattr(mod, "describe_current_network", lambda s: None)
         monkeypatch.setattr(mod, "verify_baseline", lambda p: {"status": "ok"})
         monkeypatch.setattr(mod, "resolve_passphrase", lambda: None)

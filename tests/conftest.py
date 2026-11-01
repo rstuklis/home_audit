@@ -136,6 +136,11 @@ def sandbox(monkeypatch, tmp_path):
             basename = os.path.basename(getattr(hna, attr))
             monkeypatch.setattr(hna, attr, str(data_dir / basename))
 
+    # A baseline refused as another network's (select_network_baseline, round 5)
+    # is remembered in a module global so every later reader declines it. Reset
+    # per test, or one refusing test would blind every load_baseline() after it.
+    monkeypatch.setattr(hna, "BASELINE_REFUSED", None)
+
     # Anything that still resolves ~ lands in the tmp dir rather than $HOME.
     monkeypatch.setenv("HOME", str(tmp_path))
 

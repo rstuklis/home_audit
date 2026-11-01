@@ -169,6 +169,7 @@ class TestHeartbeatWindows:
         sink = tmp_path / "receipts.jsonl"
         monkeypatch.setenv(mod.SINK_ENV, str(sink))
         monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (None, None))
+        monkeypatch.setattr(mod, "identify_monitor_network", lambda snapshot: (None, None))
         monkeypatch.setattr(mod, "ping", lambda ip: None)
         monkeypatch.setattr(mod, "run", make_run({}))
         mod.run_monitor(interval=60, iterations=1, sleeper=lambda s: None,
@@ -404,6 +405,7 @@ class TestMonitorResilience:
 
     def test_undelivered_alerts_are_persisted_and_reloaded(self, mod, monkeypatch):
         monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (None, None))
+        monkeypatch.setattr(mod, "identify_monitor_network", lambda snapshot: (None, None))
         monkeypatch.setattr(mod, "ping", lambda ip: None)
         monkeypatch.setattr(mod, "run", make_run({"route -n get default": f"   gateway: {GW}\n"}))
         monkeypatch.setattr(mod, "send_alert", lambda *a, **k: {"published": False, "detail": "sink down"})
@@ -545,6 +547,7 @@ class TestMonitorEdges:
 
     def test_a_stop_during_the_first_poll_keeps_the_old_stamp(self, mod, monkeypatch):
         monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (None, None))
+        monkeypatch.setattr(mod, "identify_monitor_network", lambda snapshot: (None, None))
         old = T0 - timedelta(days=3)
         mod.save_monitor_state({"gateway": GW, "gateway_mac": "aa", "dns": [GW], "neighbours": [GW],
                                 "ipv6_routers": []}, at=old, undelivered=[{"kind": "x"}])
