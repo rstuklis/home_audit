@@ -294,12 +294,13 @@ class TestMain:
         rep = tmp_path / "last_run-pearl.txt"
         rep.write_text(NOISY)
         state = tmp_path / "digest_state.json"
-        assert dg.main(["--state", str(state), str(rep)]) == 0
+        # --commit moves the memory on at once, as a run with no email step wants.
+        assert dg.main(["--state", str(state), "--commit", str(rep)]) == 0
         saved = state.read_text()
         assert "first digest" in capsys.readouterr().out
-        dg.main(["--state", str(state), "--skipped", "pearl: out of range"])
+        dg.main(["--state", str(state), "--commit", "--skipped", "pearl: out of range"])
         assert state.read_text() == saved
-        dg.main(["--state", str(state), str(rep)])
+        dg.main(["--state", str(state), "--commit", str(rep)])
         assert "0 new since" in capsys.readouterr().out
 
     def test_a_corrupt_state_file_reads_as_a_first_digest(self, dg, tmp_path, capsys):
@@ -311,3 +312,380 @@ class TestMain:
     def test_an_unreadable_report_is_reported_not_fatal(self, dg, tmp_path, capsys):
         dg.main([str(tmp_path / "missing.txt")])
         assert "NOT AUDITED" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Round 5. The fingerprint keeps an address (F30): for the HIGHs whose identity
+# IS an address, a different offender with the same digit skeleton filed as
+# standing, and the attacker chose which.
+# ---------------------------------------------------------------------------
+
+def one_high(text, section="IPv6 ROUTER ADVERTISEMENTS", net="loveshack"):
+    return report(net, [(section, [f"  [HIGH  ] {text}"])], ["No changes since baseline."])
+
+
+ROGUE_RA = ("IPv6 router(s) not in the baseline: {addr}%en0. A rogue router advertisement makes the sender "
+            "your default gateway for IPv6, and macOS prefers IPv6 — traffic would reroute.")
+
+
+class TestFingerprintKeepsAddresses:
+    def test_a_different_rogue_ipv6_router_is_new_not_standing(self, dg):
+        # Round 4 F30: fe80::87e:f5b1:f821:c252 and fe80::11e:f1b1:f111:c111 shared one skeleton.
+        _, before = dg.build_facts([dg.parse_report(one_high(ROGUE_RA.format(addr="fe80::87e:f5b1:f821:c252")))])
+        text, _ = dg.build_facts([dg.parse_report(one_high(ROGUE_RA.format(addr="fe80::11e:f1b1:f111:c111")))], previous=before)
+        assert "1 new since the previous report, 1 cleared" in text
+
+    def test_the_same_address_is_still_standing(self, dg):
+        rep = dg.parse_report(one_high(ROGUE_RA.format(addr="fe80::87e:f5b1:f821:c252")))
+        _, before = dg.build_facts([rep])
+        text, _ = dg.build_facts([rep], previous=before)
+        assert "0 new since" in text and "cleared" not in text
+
+    def test_a_different_evil_twin_bssid_is_new(self, dg):
+        twin = "pearl is being advertised by {mac}, which was not in the baseline."
+        _, before = dg.build_facts([dg.parse_report(one_high(twin.format(mac="de:ad:be:ef:00:01"), "EVIL TWIN CHECK", "pearl"))])
+        text, _ = dg.build_facts([dg.parse_report(one_high(twin.format(mac="de:ad:be:ef:00:02"), "EVIL TWIN CHECK", "pearl"))], previous=before)
+        assert "1 new since" in text
+
+    def test_a_clock_time_is_still_a_number(self, dg):
+        fp = lambda t: dg.fingerprint("n", {"risk": "REVIEW", "section": "C", "text": t})
+        assert fp("seen at 04:25:06 today") == fp("seen at 11:59:59 today")
+        assert fp("digest changed at 2026-09-20T04:25:06 (3bc98784b5c6… → 917fd7db760f…), 2 time(s)") == \
+            fp("digest changed at 2026-09-20T11:59:59 (3bc98784b5c6… → 0123456789ab…), 3 time(s)")
+
+    def test_lines_without_an_address_keep_the_fingerprint_on_disk(self, dg):
+        # The owner's digest_state.json holds exactly this string. A change to it
+        # would file every standing item as new once; only address-bearing lines may move.
+        item = {"risk": "MEDIUM", "section": "ROUTER / GATEWAY PORT SCAN",
+                "text": "80 HTTP admin Unencrypted web admin page. Prefer HTTPS for the admin UI."}
+        assert dg.fingerprint("pearl", item) == \
+            "pearl|ROUTER / GATEWAY PORT SCAN|MEDIUM|# http admin unencrypted web admin page. prefer https for the admin ui."
+
+    def test_an_ipv4_address_still_rotates_in_a_report_line_but_not_in_an_alert(self, dg):
+        rep = lambda ip: dg.fingerprint("n", {"risk": "HIGH", "section": "S", "text": f"gateway now {ip}"})
+        assert rep("192.168.87.1") == rep("192.168.86.1")
+        alert = lambda ip: dg.fingerprint("monitor", {"risk": "HIGH", "section": dg.ALERT_SECTION,
+                                                      "text": f"dns_changed: DNS resolvers changed from ['192.168.87.1'] to ['{ip}']."})
+        assert alert("10.9.9.9") != alert("10.8.8.8")
+        assert alert("10.9.9.9") == alert("10.9.9.9")
+
+
+# ---------------------------------------------------------------------------
+# Round 5. An aborted audit is not an audit (F29): its network used to count as
+# audited, its standing items as cleared, and they all came back as new.
+# ---------------------------------------------------------------------------
+
+ABORT_LINE = ("  [HIGH  ] AUDIT ABORTED by an unexpected error before it completed. No baseline was saved and no "
+              "report was written for this run.")
+
+
+def aborted(name="pearl", before_abort=()):
+    out = ["", "#" * 64, f"# NETWORK: {name} — 09:00:01   ip 10.0.0.2", "#" * 64]
+    for title, lines in before_abort:
+        out += ["", RULE, title, RULE] + lines
+    out += ["", ABORT_LINE, "Traceback (most recent call last):", '  File "home_net_audit.py", line 1, in <module>']
+    return "\n".join(out)
+
+
+class TestAbortedReport:
+    def test_an_abort_line_means_the_audit_did_not_complete(self, dg):
+        r = dg.parse_report(aborted())
+        assert r["verdict"] == "AUDIT DID NOT COMPLETE" and r["abort"].startswith("AUDIT ABORTED")
+
+    def test_the_abort_is_filed_under_its_own_section_not_the_one_left_open(self, dg):
+        r = dg.parse_report(aborted(before_abort=[("ROUTER / GATEWAY PORT SCAN", ["  [MEDIUM]    80  HTTP admin     Unencrypted web admin page."])]))
+        assert [f["section"] for f in r["flagged"]] == ["ROUTER / GATEWAY PORT SCAN", "AUDIT ABORTED"]
+
+    def test_a_run_that_stopped_after_its_verdict_did_not_complete_either(self, dg):
+        assert dg.parse_report(QUIET + "\n" + ABORT_LINE)["verdict"] == "AUDIT DID NOT COMPLETE"
+
+    def test_it_is_listed_under_not_audited_with_the_abort_line(self, dg):
+        text, _ = dg.build_facts([dg.parse_report(QUIET), dg.parse_report(aborted())])
+        assert "Networks audited : 1 of 2   (loveshack)" in text
+        assert "pearl      NOT AUDITED — AUDIT ABORTED by an unexpected error" in text
+
+    def test_its_items_are_carried_not_cleared_and_not_new_when_it_completes(self, dg):
+        both = [dg.parse_report(QUIET), dg.parse_report(NOISY)]
+        _, week1 = dg.build_facts(both)
+        text2, week2 = dg.build_facts([dg.parse_report(QUIET), dg.parse_report(aborted())], previous=week1)
+        assert "cleared" not in text2 and "1 new since the previous report" in text2        # the abort itself
+        assert any(k.startswith("pearl|EVIL TWIN CHECK|") for k in week2)                  # carried, not dropped
+        text3, _ = dg.build_facts(both, previous=week2)
+        assert "0 new since the previous report, 1 cleared" in text3                       # only the abort cleared
+
+    def test_what_it_printed_before_stopping_still_counts(self, dg):
+        r = dg.parse_report(aborted(before_abort=[("ROUTER / GATEWAY PORT SCAN", ["  [MEDIUM]    80  HTTP admin     Unencrypted web admin page."])]))
+        text, fps = dg.build_facts([r])
+        assert "Flagged items    : 2 (1 HIGH, 1 MEDIUM)" in text
+        assert any(k.startswith("pearl|ROUTER / GATEWAY PORT SCAN|MEDIUM|") for k in fps)
+
+    def test_a_banner_only_report_is_not_audited(self, dg):
+        text, _ = dg.build_facts([dg.parse_report("\n".join(["#" * 64, "# NETWORK: pearl — 09:00:01   ip 10.0.0.2", "#" * 64]))])
+        assert "0 of 1" in text and "pearl  NOT AUDITED — the audit did not complete" in text
+
+    def test_the_run_number_is_read_and_shown(self, dg):
+        text_ = QUIET + "\nBaseline saved to /x/baseline-10-0-0-0-24.json  (run 18)\n"
+        r = dg.parse_report(text_)
+        assert r["run"] == 18 and dg.parse_report(QUIET)["run"] is None
+        text, _ = dg.build_facts([r])
+        assert "    loveshack  no changes   12 devices, 3 unidentified   run 18" in text
+
+
+# ---------------------------------------------------------------------------
+# Round 5. The monitor's alerts reach the report (F1): they went to a file
+# nothing read, and four HIGHs sat in it for eleven days.
+# ---------------------------------------------------------------------------
+
+import datetime as dt
+import json
+
+ALERTS = [
+    {"at": "2026-10-21T05:43:28.176086+00:00", "severity": "REVIEW", "kind": "observation_gap",
+     "detail": "Monitoring resumed after 10m with nothing watching."},
+    {"at": "2026-10-21T11:54:44.137886+00:00", "severity": "REVIEW", "kind": "neighbour_appeared",
+     "detail": "New device(s) on the LAN: 192.168.85.41."},
+    {"at": "2026-10-24T22:30:41.739028+00:00", "severity": "HIGH", "kind": "gateway_mac_changed",
+     "detail": "The gateway's MAC changed from 1a:4b:9f:2b:a2:ab to 38:8b:59:e0:f1:70 while its IP stayed the same."},
+    {"at": "2026-10-27T00:18:39.741646+00:00", "severity": "HIGH", "kind": "ipv6_router_appeared",
+     "detail": "New IPv6 router advertising: fe80::87e:f5b1:f821:c252%en0. A rogue Router Advertisement reroutes traffic."},
+    {"at": "2026-11-01T03:33:45.896942+00:00", "severity": "REVIEW", "kind": "neighbour_appeared",
+     "detail": "New device(s) on the LAN: 192.168.87.21 (1a:cd:58:93:00:04 (randomized/private MAC))."},
+    {"at": "2026-11-01T03:40:00+00:00", "severity": "INFO", "kind": "ipv6_router_renumbered",
+     "detail": "IPv6 router renumbered: c4:f7:c1:10:53:b8 [Apple TV] now advertises from fe80::1."},
+]
+
+
+def write_alerts(path, entries=ALERTS, extra_lines=()):
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries) + "".join(l + "\n" for l in extra_lines))
+    return str(path)
+
+
+@pytest.fixture
+def alerts(tmp_path):
+    return write_alerts(tmp_path / "alerts.jsonl")
+
+
+@pytest.fixture
+def report_file(tmp_path):
+    rep = tmp_path / "last_run-loveshack.txt"
+    rep.write_text(QUIET)
+    return str(rep)
+
+
+class TestMonitorAlerts:
+    def test_the_block_counts_by_severity_and_lists_every_high(self, dg, alerts, report_file):
+        text = dg.digest([report_file], alerts=[alerts])
+        assert "MONITOR ALERTS SINCE THE PREVIOUS REPORT: 2 HIGH, 3 REVIEW, 1 INFO" in text
+        assert "alerts.jsonl: 6 alert(s)," in text and "read for the first time, so everything in it counts" in text
+        assert "gateway_mac_changed · The gateway's MAC changed from 1a:4b:9f:2b:a2:ab to 38:8b:59:e0:f1:70" in text
+        assert "ipv6_router_appeared · New IPv6 router advertising: fe80::87e:f5b1:f821:c252%en0" in text
+        assert "[REVIEW] neighbour_appeared ×2, observation_gap ×1" in text and "[INFO] ipv6_router_renumbered ×1" in text
+
+    def test_the_block_sits_under_the_facts_before_the_flagged_lists(self, dg, alerts, report_file):
+        text = dg.digest([report_file], alerts=[alerts])
+        assert text.index("CHANGES AGAINST EACH BASELINE") < text.index("MONITOR ALERTS SINCE") < text.index("FLAGGED ITEMS: ")
+
+    def test_highs_are_flagged_items_and_reviews_one_item_per_kind(self, dg, alerts, report_file, tmp_path):
+        state = tmp_path / "s.json"
+        text = dg.digest([report_file], state=str(state), alerts=[alerts])
+        assert "Flagged items    : 5 (2 HIGH, 1 MEDIUM, 2 REVIEW)" in text
+        assert "[HIGH] MONITOR ALERTS · gateway_mac_changed: The gateway's MAC changed" in text
+        assert "[REVIEW] MONITOR ALERTS · neighbour_appeared: 2 alert(s)   (monitor)" in text
+        kept = json.loads((tmp_path / "s.json.pending").read_text())
+        assert [k for k in kept["flagged"] if "neighbour_appeared" in k] == ["monitor|MONITOR ALERTS|REVIEW|neighbour_appeared: # alert(s)"]
+        assert "INFO" not in " ".join(kept["flagged"])
+
+    def test_times_are_shown_on_the_owners_clock(self, dg, alerts, report_file, monkeypatch):
+        monkeypatch.setattr(dg, "LOCAL_TZ", dt.timezone(dt.timedelta(hours=10, minutes=30)))
+        text = dg.digest([report_file], alerts=[alerts])
+        assert "[HIGH] 2026-10-25 09:00  gateway_mac_changed" in text        # 2026-10-24T22:30Z in Adelaide
+
+    def _week(self, dg, state, report_file, alerts_path):
+        text = dg.digest([report_file], state=str(state), alerts=[alerts_path])
+        dg.commit_state(str(state))
+        return text
+
+    def test_the_marker_moves_with_the_commit_and_old_alerts_are_not_repeated(self, dg, alerts, report_file, tmp_path):
+        state = tmp_path / "s.json"
+        self._week(dg, state, report_file, alerts)
+        assert json.loads(state.read_text())["alerts_until"] == {"alerts.jsonl": "2026-11-01T03:40:00+00:00"}
+        text = self._week(dg, state, report_file, alerts)
+        assert "MONITOR ALERTS SINCE THE PREVIOUS REPORT: none" in text
+        assert "alerts.jsonl: nothing since" in text and "first time" not in text
+
+    def test_an_alert_not_raised_again_is_dropped_without_being_called_cleared(self, dg, alerts, report_file, tmp_path):
+        state = tmp_path / "s.json"
+        self._week(dg, state, report_file, alerts)
+        text = self._week(dg, state, report_file, alerts)
+        assert "0 new since the previous report" in text and "cleared" not in text
+        assert not any(k.startswith("monitor|") for k in json.loads(state.read_text())["flagged"])
+
+    def test_the_same_alert_raised_again_is_standing_and_a_different_address_is_new(self, dg, alerts, report_file, tmp_path):
+        state = tmp_path / "s.json"
+        self._week(dg, state, report_file, alerts)
+        again = dict(ALERTS[2], at="2026-11-04T01:00:00+00:00")
+        other = dict(ALERTS[2], at="2026-11-04T02:00:00+00:00",
+                     detail=ALERTS[2]["detail"].replace("38:8b:59:e0:f1:70", "02:42:ac:11:00:02"))
+        write_alerts(tmp_path / "alerts.jsonl", ALERTS + [again, other])
+        text = self._week(dg, state, report_file, alerts)
+        assert "1 new since the previous report" in text
+        assert "[HIGH] monitor · MONITOR ALERTS · gateway_mac_changed: The gateway's MAC changed from 1a:4b:9f:2b:a2:ab to 02:42:ac:11:00:02" in text
+        assert "STANDING FLAGGED ITEMS (also in the previous report): 2" in text
+
+    def test_the_marker_does_not_move_without_the_commit(self, dg, alerts, report_file, tmp_path):
+        state = tmp_path / "s.json"
+        dg.digest([report_file], state=str(state), alerts=[alerts])
+        assert not state.exists() and (tmp_path / "s.json.pending").exists()
+        assert "read for the first time" in dg.digest([report_file], state=str(state), alerts=[alerts])
+
+    def test_unreadable_and_undated_lines_are_counted_not_fatal(self, dg, tmp_path, report_file):
+        path = write_alerts(tmp_path / "alerts.jsonl", ALERTS[:3] + [{"severity": "HIGH", "kind": "dns_changed", "detail": "no time"}],
+                            extra_lines=["not json", "null", "[1, 2]", ""])
+        text = dg.digest([report_file], alerts=[path])
+        assert "MONITOR ALERTS SINCE THE PREVIOUS REPORT: 1 HIGH, 2 REVIEW" in text
+        assert "(3 unreadable line(s) and 1 without a time were left out)" in text
+
+    def test_fields_of_the_wrong_type_are_read_as_text_not_trusted(self, dg, tmp_path, report_file):
+        odd = [{"at": "2026-10-30T00:00:00+00:00", "severity": "high", "kind": "gateway changed; rm -rf", "detail": "x\x1b[2K\x07y"},
+               {"at": "2026-10-30T01:00:00+00:00", "severity": 7, "kind": None, "detail": ["a"]}]
+        text = dg.digest([report_file], alerts=[write_alerts(tmp_path / "alerts.jsonl", odd)])
+        assert "1 HIGH, 1 UNKNOWN" in text and "gateway_changed_rm_-rf · x [2K y" in text and "\x1b" not in text
+        assert "[UNKNOWN] unknown ×1" in text
+
+    def test_an_unreadable_alert_file_is_said_and_clears_nothing(self, dg, alerts, report_file, tmp_path):
+        state = tmp_path / "s.json"
+        self._week(dg, state, report_file, alerts)
+        text = self._week(dg, state, report_file, str(tmp_path / "gone" / "alerts.jsonl"))
+        assert "MONITOR ALERTS SINCE THE PREVIOUS REPORT: could not be read" in text
+        assert "alerts.jsonl: could not be read (no such file or directory); nothing of its is cleared" in text
+        assert any(k.startswith("monitor|MONITOR ALERTS|HIGH|") for k in json.loads(state.read_text())["flagged"])
+
+    def test_an_evicted_icloud_file_is_not_an_empty_one(self, dg, tmp_path, report_file):
+        (tmp_path / ".alerts.jsonl.icloud").write_bytes(b"")
+        text = dg.digest([report_file], alerts=[str(tmp_path / "alerts.jsonl")])
+        assert "could not be read (evicted from iCloud Drive" in text
+
+    def test_an_https_alert_destination_is_write_only_from_here(self, dg, report_file):
+        text = dg.digest([report_file], alerts=["https://alerts.example/hook"])
+        assert "could not be read (an https alert destination is write-only from here)" in text
+
+    def test_no_alert_file_configured_is_said_not_hidden(self, dg, report_file):
+        text = dg.digest([report_file])
+        assert "MONITOR ALERTS SINCE THE PREVIOUS REPORT: not read — no alert file is configured" in text
+
+    def test_no_alerts_leaves_the_monitor_out_and_says_so(self, dg, report_file):
+        assert "not read — left out (--no-alerts)" in dg.digest([report_file], alerts=[])
+
+    def test_the_beach_file_is_a_second_monitor(self, dg, tmp_path, report_file):
+        beach = write_alerts(tmp_path / "alerts-beach.jsonl", [dict(ALERTS[2], at="2026-10-30T09:00:00+00:00")])
+        text = dg.digest([report_file], alerts=[write_alerts(tmp_path / "alerts.jsonl", ALERTS[:2]), beach])
+        assert "alerts-beach.jsonl: 1 alert(s)" in text
+        assert "[HIGH] monitor-beach · MONITOR ALERTS · gateway_mac_changed" not in text      # first digest: no NEW list
+        assert "gateway_mac_changed: The gateway's MAC changed from 1a:4b:9f:2b:a2:ab to 38:8b:59:e0:f1:70 while its IP stayed the same.   (monitor-beach)" in text
+
+    def test_many_highs_are_capped_in_the_listing_but_all_counted(self, dg, tmp_path, report_file, monkeypatch):
+        monkeypatch.setattr(dg, "ALERT_LIST_LIMIT", 3)
+        many = [dict(ALERTS[2], at=f"2026-10-30T0{i}:00:00+00:00", detail=f"gateway MAC now 02:00:00:00:00:0{i}") for i in range(6)]
+        text = dg.digest([report_file], alerts=[write_alerts(tmp_path / "alerts.jsonl", many)])
+        assert "6 HIGH" in text and text.count("  gateway_mac_changed · ") == 3 and "… and 3 more, all counted above" in text
+        assert "Flagged items    : 7 (6 HIGH, 1 MEDIUM)" in text
+
+
+class TestAlertSources:
+    def test_the_default_is_the_file_beside_the_receipts_and_the_beach_one_when_present(self, dg, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME_NET_AUDIT_SINK", str(tmp_path))
+        assert dg.alert_sources() == ([str(tmp_path / "alerts.jsonl")], None)
+        (tmp_path / "alerts-beach.jsonl").write_text("")
+        assert dg.alert_sources() == ([str(tmp_path / "alerts.jsonl"), str(tmp_path / "alerts-beach.jsonl")], None)
+
+    def test_a_sink_that_names_the_receipt_file_means_its_folder(self, dg, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME_NET_AUDIT_SINK", str(tmp_path / "receipts.jsonl"))
+        assert dg.alert_sources()[0] == [str(tmp_path / "alerts.jsonl")]
+
+    def test_the_alert_variable_wins_and_is_not_read_twice(self, dg, tmp_path, monkeypatch):
+        (tmp_path / "alerts-beach.jsonl").write_text("")
+        monkeypatch.setenv("HOME_NET_AUDIT_SINK", str(tmp_path))
+        monkeypatch.setenv("HOME_NET_AUDIT_ALERT", str(tmp_path / "alerts-beach.jsonl"))
+        assert dg.alert_sources()[0] == [str(tmp_path / "alerts-beach.jsonl")]
+        monkeypatch.setenv("HOME_NET_AUDIT_ALERT", "/elsewhere/alerts.jsonl")
+        assert dg.alert_sources()[0] == ["/elsewhere/alerts.jsonl", str(tmp_path / "alerts-beach.jsonl")]
+
+    def test_an_https_sink_names_no_folder(self, dg, monkeypatch):
+        monkeypatch.setenv("HOME_NET_AUDIT_SINK", "https://collector.example/receipts")
+        paths, note = dg.alert_sources()
+        assert paths == [] and "no alert file is configured" in note
+
+    def test_labels(self, dg):
+        assert dg.alert_label("alerts.jsonl") == "monitor"
+        assert dg.alert_label("alerts-beach.jsonl") == "monitor-beach"
+        assert dg.alert_label("odd.jsonl") == "monitor-odd"
+
+
+class TestAlertsAndTheModel:
+    def test_the_model_never_sees_what_the_monitor_saw_only_what_kind(self, dg, alerts, report_file):
+        facts = dg.digest([report_file], alerts=[alerts])
+        red = dg.redact_for_model(facts)
+        assert "38:8b:59:e0:f1:70" not in red and "fe80::87e" not in red
+        assert "gateway_mac_changed · (detail withheld)" in red
+        assert "MONITOR ALERTS · gateway_mac_changed: (detail withheld)" in red
+        assert "2 HIGH, 3 REVIEW" in red                       # the counts and kinds stay
+
+    def test_the_facts_go_to_the_model_redacted(self, dg, alerts, report_file):
+        facts = dg.digest([report_file], alerts=[alerts])
+        seen = {}
+
+        def runner(cmd, **kw):
+            seen.update(kw)
+            return _Done(TestAcceptParagraph.GOOD)
+        dg.claude_paragraph(QUIET, facts, runner=runner, claude="/x/claude")
+        assert "38:8b:59:e0:f1:70" not in seen["input"] and "gateway_mac_changed" in seen["input"]
+
+    def test_the_claude_child_inherits_none_of_the_audits_secrets(self, dg, monkeypatch):
+        # Round 4 F24: the wrapper exports the passphrase and tokens for the whole process tree.
+        for var in ("HOME_NET_AUDIT_PASSPHRASE", "HOME_NET_AUDIT_SINK_TOKEN", "HOME_NET_AUDIT_ALERT_TOKEN", "TPLINK_PASSWORD"):
+            monkeypatch.setenv(var, "DEMO-NOT-A-REAL-SECRET")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        seen = {}
+
+        def runner(cmd, **kw):
+            seen.update(kw)
+            return _Done(TestAcceptParagraph.GOOD)
+        dg.claude_paragraph("r", "f", runner=runner, claude="/x/claude")
+        assert "env" in seen and "DEMO-NOT-A-REAL-SECRET" not in " ".join(seen["env"].values())
+        assert not any(k.startswith("HOME_NET_AUDIT_") for k in seen["env"]) and seen["env"]["PATH"] == "/usr/bin:/bin"
+
+
+# ---------------------------------------------------------------------------
+# Round 5. The memory moves on only when the email has gone (F3).
+# ---------------------------------------------------------------------------
+
+class TestPendingState:
+    def test_the_memory_is_written_as_pending_and_moved_by_commit(self, dg, tmp_path, report_file):
+        state = tmp_path / "digest_state.json"
+        assert dg.main(["--state", str(state), report_file]) == 0
+        assert not state.exists() and (tmp_path / "digest_state.json.pending").exists()
+        assert dg.commit_state(str(state)) is True
+        assert state.exists() and not (tmp_path / "digest_state.json.pending").exists()
+        assert dg.commit_state(str(state)) is False                     # nothing waiting now
+        assert "flagged" in json.loads(state.read_text())
+
+    def test_a_run_that_audited_nothing_and_read_no_alerts_remembers_nothing(self, dg, tmp_path):
+        state = tmp_path / "digest_state.json"
+        assert dg.main(["--state", str(state), "--skipped", "pearl: out of range"]) == 0
+        assert not state.exists() and not (tmp_path / "digest_state.json.pending").exists()
+
+    def test_a_run_that_only_read_alerts_still_moves_their_marker(self, dg, tmp_path, alerts):
+        state = tmp_path / "digest_state.json"
+        dg.digest([], state=str(state), skipped=["pearl: out of range"], alerts=[alerts], commit=True)
+        assert json.loads(state.read_text())["alerts_until"]["alerts.jsonl"] == "2026-11-01T03:40:00+00:00"
+
+    def test_an_unwritable_pending_file_keeps_the_facts(self, dg, tmp_path, report_file):
+        text = dg.digest([report_file], state=str(tmp_path / "nodir" / "state.json"))
+        assert "Networks audited : 1 of 1   (loveshack)" in text
+        assert "could not be kept at" in text and "nodir/state.json.pending" in text
+
+    def test_the_old_state_format_is_still_read(self, dg, tmp_path, report_file):
+        state = tmp_path / "digest_state.json"
+        _, before = dg.build_facts([dg.parse_report(QUIET)])
+        state.write_text(json.dumps({"flagged": before}))
+        assert "0 new since" in dg.digest([report_file], state=str(state))
