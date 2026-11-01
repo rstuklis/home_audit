@@ -4611,6 +4611,25 @@ def diff_trust_store(old, new):
     return notes
 
 
+def diff_listeners(old, new):
+    """Change notes for fixed-port listeners that appeared on or left this Mac."""
+    old_l, new_l = (old or {}).get("listening"), (new or {}).get("listening")
+    if not (isinstance(old_l, list) and old_l and isinstance(new_l, list) and new_l):
+        return []
+    was = {fp for fp in listener_fingerprint(old_l) if fp[2] != "dynamic"}
+    now = {fp for fp in listener_fingerprint(new_l) if fp[2] != "dynamic"}
+    notes = []
+    if now - was:
+        notes.append("NEW listener(s) on this Mac since baseline: "
+                     + ", ".join(_describe_fingerprint(fp) for fp in sorted(now - was, key=str))
+                     + ". A fixed port is a choice somebody made; a new one accepting "
+                     "connections on this Mac is what a backdoor looks like.")
+    if was - now:
+        notes.append("Listener(s) on this Mac gone since baseline: "
+                     + ", ".join(_describe_fingerprint(fp) for fp in sorted(was - now, key=str)))
+    return notes
+
+
 def diff_baseline(old, new, labels=None, critical=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
@@ -4876,6 +4895,17 @@ def diff_baseline(old, new, labels=None, critical=None):
             f"{old_cert[:16]}… -> {new_cert[:16]}…. The admin certificate is "
             "self-signed and stable, so this means it was re-issued or something "
             "is answering in the router's place.")
+
+    # This Mac's listeners, by the same fingerprint the section prints them
+    # under. The section always said "not in the baseline"; the diff never
+    # did, so a backdoor's port was never a change line and never reached the
+    # TL;DR or the email subject. Fixed ports only: a named process on a
+    # dynamic port is compared by name and comes and goes with the apps that
+    # are open, which is the section's business and not a change in the
+    # network's posture. An empty list on either side is a failed enumeration
+    # (lsof and netstat returned nothing), not a quiet machine, and is not
+    # compared.
+    notes.extend(diff_listeners(old, new))
 
     # The trust store is this Mac's, not the network's, but a root added to it
     # is how TLS interception of this Mac is set up, and the section's own
@@ -7607,7 +7637,7 @@ def action_listening_services(compact=False, known=None):
             print("  process name and no fixed port there is nothing to tell one from "
                   "another. sudo names them.")
         for fp in sorted(before - now, key=str):
-            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
+            print(f"  [INFO  ] Listening: in the baseline, gone now: {_describe_fingerprint(fp)}")
         return services
 
     print(f"\n  {'Port':<7} {'Proto':<6} {'Process':<22} Note")
@@ -7639,11 +7669,21 @@ def action_listening_services(compact=False, known=None):
     # is in the baseline at all, and the default run printed the table with a
     # generic "verify you recognise them" while a new fixed-port daemon sat in
     # it unnamed as new.
+    #
+    # Risk-tagged, so the email digest carries them. These lines were printed
+    # as "  + not in the baseline: ..." — a form nothing downstream reads: the
+    # TL;DR counts flagged lines and change lines, so a week whose only event
+    # was a new TCP 4444 listener was mailed as "no changes" with the one line
+    # that said otherwise buried under the table. A fixed port is REVIEW (a
+    # fixed port is a choice somebody made, and a new one is what this section
+    # exists to catch); a named process on a dynamic port is INFO, since those
+    # are compared by name alone and come and go with the apps that are open.
     if before and now != before:
         for fp in sorted(now - before, key=str):
-            print(f"  + not in the baseline: {_describe_fingerprint(fp)}")
+            tag = "INFO  " if fp[2] == "dynamic" else "REVIEW"
+            print(f"  [{tag}] Listening: not in the baseline: {_describe_fingerprint(fp)}")
         for fp in sorted(before - now, key=str):
-            print(f"  - in the baseline, gone now: {_describe_fingerprint(fp)}")
+            print(f"  [INFO  ] Listening: in the baseline, gone now: {_describe_fingerprint(fp)}")
 
     return services
 
@@ -9464,7 +9504,9 @@ def action_compare_baseline(state, unmonitored=False):
 # in the printing only: check, record, and say in a few lines what was found.
 
 _BRIEF_KEEP = re.compile(r"^\s*\[(REVIEW|UNKNOWN)\s*\]")
-_BRIEF_FORCES_FULL = re.compile(r"^\s*\[(HIGH|MEDIUM)\s*\]|^\s*\+ not in the baseline", re.M)
+_BRIEF_FORCES_FULL = re.compile(r"^\s*\[(HIGH|MEDIUM)\s*\]"
+                                r"|^\s*\[REVIEW\s*\] Listening: not in the baseline"
+                                r"|^\s*\+ not in the baseline", re.M)
 
 
 def capture_section(fn, *args, **kwargs):

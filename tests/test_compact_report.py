@@ -33,18 +33,18 @@ class TestListeners:
     def test_a_new_fixed_port_prints_the_whole_table_and_names_the_newcomer(self, listeners):
         _, out = listeners(BASE + [{"proto": "TCP", "port": 4444, "pid": "9", "process": "nc"}], BASE)
         assert "4444" in out and "none of them new" not in out
-        assert "+ not in the baseline: nc on TCP port 4444" in out
+        assert "[REVIEW] Listening: not in the baseline: nc on TCP port 4444" in out
 
     def test_a_listener_that_went_away_is_named_but_does_not_hold_the_table_open(self, listeners):
         # Short-lived system sockets come and go all day; a closed port is not
         # what this section watches for. It is still said, never silently dropped.
         _, out = listeners(BASE[:2], BASE)
         assert "none of them new" in out and "19292" not in out
-        assert "- in the baseline, gone now: homed on UDP a dynamic port" in out
+        assert "[INFO  ] Listening: in the baseline, gone now: homed on UDP a dynamic port" in out
 
     def test_gone_and_new_together_still_prints_everything(self, listeners):
         _, out = listeners(BASE[:2] + [{"proto": "TCP", "port": 4444, "pid": "9", "process": "nc"}], BASE)
-        assert "4444" in out and "+ not in the baseline" in out and "- in the baseline, gone now" in out
+        assert "4444" in out and "Listening: not in the baseline" in out and "Listening: in the baseline, gone now" in out
 
     def test_an_unnamed_listener_on_a_dynamic_port_is_counted_not_compared(self, listeners):
         # No process name, no fixed port: nothing to tell one from the next, and
@@ -58,11 +58,11 @@ class TestListeners:
     def test_an_unnamed_listener_on_a_fixed_port_is_still_new(self, listeners):
         # A fixed port is a choice somebody made, named process or not.
         _, out = listeners(BASE + [{"proto": "TCP", "port": 8021, "pid": "?", "process": "?"}], BASE)
-        assert "+ not in the baseline: unattributed on TCP port 8021" in out
+        assert "[REVIEW] Listening: not in the baseline: unattributed on TCP port 8021" in out
 
     def test_a_named_listener_on_a_dynamic_port_is_still_new(self, listeners):
         _, out = listeners(BASE + [{"proto": "TCP", "port": 50000, "pid": "7", "process": "nc"}], BASE)
-        assert "+ not in the baseline: nc on TCP a dynamic port" in out
+        assert "[INFO  ] Listening: not in the baseline: nc on TCP a dynamic port" in out
 
     def test_with_no_baseline_the_table_is_always_printed(self, listeners):
         _, out = listeners(BASE, None)
