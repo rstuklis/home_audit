@@ -66,11 +66,55 @@ class MailError(Exception):
 
 def _load(name):
     """A sibling tool, loaded by path so this works from any directory."""
-    spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec = importlib.util.spec_from_file_location(name, HERE / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:                                    # noqa: BLE001 - a broken checkout
+        raise MailError(f"could not load tools/{name}.py beside this script ({exc.__class__.__name__}: "
+                        f"{str(exc)[:120]}); is the checkout complete?") from None
     return module
+
+
+class Snapshot:
+    """A file's contents before a step, so a failed step can put them back.
+
+    The TL;DR's memory of the previous report is moved on while the email is
+    composed, before it is sent. A send that fails after that — the Mac woke
+    without its network, Mail.app was waiting on a dialog — left the memory
+    saying the owner had seen a report nobody received, and next week's email
+    then called a never-seen HIGH "standing". So the memory is put back when
+    the send fails, and next week's email calls those items new.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.before, self.existed = None, False
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                self.before = f.read()
+            self.existed = True
+        except FileNotFoundError:
+            self.existed = False
+        except OSError:
+            self.path = None            # cannot be read, so cannot be restored; left alone
+
+    def restore(self):
+        if not self.path:
+            return
+        try:
+            if self.existed:
+                tmp = self.path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(self.before)
+                os.replace(tmp, self.path)
+            elif os.path.exists(self.path):
+                os.unlink(self.path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +230,11 @@ def version_check(repo, runner=subprocess.run):
         if ahead_behind.returncode != 0:
             return f"Could not compare with origin/master: {ahead_behind.stderr.strip()[:120] or 'git failed'}."
         ahead, behind = (int(x) for x in ahead_behind.stdout.split())
-        dirty = git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+        status = git("status", "--porcelain", "--untracked-files=no")
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         return f"Could not check the version ({exc.__class__.__name__}: {str(exc)[:100]})."
-    if behind == 0 and ahead == 0 and not dirty:
+    dirty = status.stdout.strip() if status.returncode == 0 else None
+    if behind == 0 and ahead == 0 and dirty == "":
         return "Up to date with origin/master."
     parts = []
     if behind:
@@ -198,6 +243,8 @@ def version_check(repo, runner=subprocess.run):
         parts.append(f"{ahead} commit(s) not on origin/master")
     if dirty:
         parts.append("local edits in the checkout")
+    if dirty is None:
+        parts.append("could not check for local edits")
     return "; ".join(parts) + "."
 
 
@@ -488,21 +535,40 @@ def do_send(args):
                 body = f.read()
         except OSError as exc:
             raise MailError(f"could not read --body {args.body}: {exc.strerror or exc}") from None
+        memory = None
     else:
         if not args.reports:
             raise MailError("give the reports as NAME=REPORT.txt, or an assembled body with --body FILE")
+        memory = Snapshot(args.state)
         body = compose(args.reports, site=args.site, title=args.title, state=args.state,
                        claude=args.claude, skipped=args.skipped, repo=args.repo)
     html = _load("report_email_html").render(body, site=args.site)
+    subject = subject_for(body, args.site)
+    try:
+        recipients = deliver(args, subject, body, html)
+    except MailError as exc:
+        # Nothing went: the memory of the previous report is put back, the
+        # last email that WAS sent stays where it is, and the one that did
+        # not go is kept beside it for a resend by hand.
+        if memory is not None:
+            memory.restore()
+        unsent = ""
+        if args.save_body:
+            try:
+                write_file(args.save_body + ".unsent", body)
+                unsent = (f" The email that did not go is at {args.save_body}.unsent; once the Mac can "
+                          f"send again: audit_mail.py ... send --body {args.save_body}.unsent")
+            except OSError:
+                pass
+        raise MailError(f"{exc}{unsent}") from None
     try:
         if args.save_body:
             write_file(args.save_body, body)
         if args.save_html:
             write_file(args.save_html, html)
     except OSError as exc:
-        raise MailError(f"could not keep a copy: {exc.strerror or exc} ({exc.filename})") from None
-    subject = subject_for(body, args.site)
-    recipients = deliver(args, subject, body, html)
+        print(f"audit_mail: sent, but could not keep a copy: {exc.strerror or exc} ({exc.filename})",
+              file=sys.stderr)
     print(f"EMAIL SENT to {', '.join(recipients)}  (subject: {subject})")
     return 0
 

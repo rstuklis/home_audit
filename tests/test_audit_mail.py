@@ -528,3 +528,96 @@ class TestSmtpWithAnExistingKeychainItem:
         monkeypatch.setattr(am, "keychain_mail_account", lambda service=None: ("me@mac.com", "pw"))
         assert am.main(["send", "--to", "a@b", "--body", "/nowhere/body.txt"]) == 1
         assert "could not read --body" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A send that fails leaves the memory of the previous report where it was
+# ---------------------------------------------------------------------------
+
+class TestAFailedSendMovesNothingOn:
+    @pytest.fixture
+    def keychain(self, am, monkeypatch):
+        monkeypatch.setattr(am, "keychain_mail_account", lambda service=am.KEYCHAIN_SERVICE: ("me@mac.com", "pw"))
+
+    def _send_that(self, am, monkeypatch, outcome):
+        def fake(msg, sender, pw, host, port, retry_wait=None, smtp_class=None):
+            if outcome == "fails":
+                raise am.MailError("could not send through smtp.mail.me.com:587: Network is unreachable")
+        monkeypatch.setattr(am, "send", fake)
+
+    def test_the_memory_is_put_back_and_the_unsent_email_kept(self, am, monkeypatch, keychain, report, tmp_path, capsys):
+        state, last = tmp_path / "digest_state.json", tmp_path / "last_run.txt"
+        # Week 1 goes out: one MEDIUM on record, last_run.txt holds that email.
+        self._send_that(am, monkeypatch, "works")
+        assert am.main(["send", "--to", "a@b", "--state", str(state), "--save-body", str(last), report()]) == 0
+        week1_state, week1_body = state.read_bytes(), last.read_text(encoding="utf-8")
+        # Week 2 adds a HIGH and the send fails.
+        self._send_that(am, monkeypatch, "fails")
+        loud_path = tmp_path / "loud.txt"
+        loud_path.write_text(REPORT.format(verdict="CHANGES DETECTED:\n  ! NEW open port 23 on the router").replace(
+            "  [MEDIUM]    80  HTTP admin     Unencrypted web admin page.\n",
+            "  [MEDIUM]    80  HTTP admin     Unencrypted web admin page.\n"
+            "  [HIGH  ]    23  Telnet         Unencrypted remote login; should not be exposed.\n"), encoding="utf-8")
+        loud = f"loveshack-h={loud_path}"
+        rc = am.main(["send", "--to", "a@b", "--state", str(state), "--save-body", str(last), loud])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Network is unreachable" in err and f"{last}.unsent" in err and "send --body" in err
+        assert state.read_bytes() == week1_state                 # the memory did not move on
+        assert last.read_text(encoding="utf-8") == week1_body    # the last email SENT is still there
+        assert (tmp_path / "last_run.txt.unsent").read_text(encoding="utf-8").startswith("#" * 64)
+        # Week 3 goes out and still calls week 2's items new.
+        self._send_that(am, monkeypatch, "works")
+        assert am.main(["send", "--to", "a@b", "--state", str(state), "--save-body", str(last), loud]) == 0
+        assert "new since the previous report" in last.read_text(encoding="utf-8")
+        assert "0 new since" not in last.read_text(encoding="utf-8")
+
+    def test_a_first_run_that_fails_leaves_no_memory_behind(self, am, monkeypatch, keychain, report, tmp_path):
+        state = tmp_path / "digest_state.json"
+        self._send_that(am, monkeypatch, "fails")
+        assert am.main(["send", "--to", "a@b", "--state", str(state), report()]) == 1
+        assert not state.exists()
+
+    def test_a_successful_send_keeps_both_copies(self, am, monkeypatch, keychain, report, tmp_path):
+        last, html = tmp_path / "last_run.txt", tmp_path / "last_run.html"
+        self._send_that(am, monkeypatch, "works")
+        assert am.main(["send", "--to", "a@b", "--save-body", str(last), "--save-html", str(html), report()]) == 0
+        assert last.exists() and html.exists() and not (tmp_path / "last_run.txt.unsent").exists()
+
+    def test_a_copy_that_cannot_be_kept_does_not_undo_a_sent_email(self, am, monkeypatch, keychain, report, tmp_path, capsys):
+        self._send_that(am, monkeypatch, "works")
+        rc = am.main(["send", "--to", "a@b", "--save-body", str(tmp_path / "nodir" / "last_run.txt"), report()])
+        assert rc == 0
+        out = capsys.readouterr()
+        assert "EMAIL SENT" in out.out and "could not keep a copy" in out.err
+
+    def test_the_mail_app_way_is_covered_too(self, am, monkeypatch, report, tmp_path):
+        state = tmp_path / "digest_state.json"
+        state.write_text('{"flagged": ["before"]}', encoding="utf-8")
+        monkeypatch.setattr(am, "send_via_mail_app",
+                            lambda *a, **k: (_ for _ in ()).throw(am.MailError("Mail.app refused the message")))
+        assert am.main(["--via", "mail-app", "send", "--to", "a@b", "--state", str(state), report()]) == 1
+        assert state.read_text(encoding="utf-8") == '{"flagged": ["before"]}'
+
+
+class TestSmallHardenings:
+    def test_a_failed_git_status_is_not_up_to_date(self, am):
+        def git(cmd, **kw):
+            text = " ".join(cmd)
+            if "rev-list" in text:
+                return subprocess.CompletedProcess(cmd, 0, "0\t0\n", "")
+            if "status" in text:
+                return subprocess.CompletedProcess(cmd, 128, "", "fatal: not a git repository")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        line = am.version_check("/r", git)
+        assert "Up to date" not in line and "could not check for local edits" in line
+
+    def test_an_unwritable_memory_file_keeps_the_facts(self, am, report, tmp_path):
+        body = am.compose([report()], state=str(tmp_path / "nodir" / "state.json"))
+        assert "Networks audited : 1 of 1   (loveshack-h)" in body
+        assert "could not be kept" in body and am.verdict(body) == "no changes"
+
+    def test_a_missing_sibling_tool_is_a_plain_error(self, am, monkeypatch, tmp_path):
+        monkeypatch.setattr(am, "HERE", tmp_path)
+        with pytest.raises(am.MailError, match="could not load tools/report_email_html.py"):
+            am._load("report_email_html")
