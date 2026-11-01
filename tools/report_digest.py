@@ -65,6 +65,7 @@ def parse_report(text, fallback_name="network"):
     flagged, changes = [], []
     verdict = "AUDIT DID NOT COMPLETE"
     devices = unidentified = None
+    vendor_only = 0
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -111,11 +112,16 @@ def parse_report(text, fallback_name="network"):
         m = re.match(r"^\s*(\d+) unidentified device\(s\)", line)
         if m:
             unidentified = int(m.group(1))
+        # A vendor name is a hint, not an identification: these devices have
+        # no label from the owner and are counted apart, on their own line.
+        m = re.match(r"^\s*(\d+) device\(s\) known only by vendor", line)
+        if m:
+            vendor_only = int(m.group(1))
         i += 1
     if verdict == "AUDIT DID NOT COMPLETE" and "Full audit complete" in text:
         verdict = "audited"
     return {"name": name, "verdict": verdict, "changes": changes, "flagged": flagged,
-            "devices": devices, "unidentified": unidentified or 0}
+            "devices": devices, "unidentified": unidentified or 0, "vendor_only": vendor_only}
 
 
 def fingerprint(network, item):
@@ -164,6 +170,8 @@ def build_facts(reports, skipped=(), previous=None):
     width = max([len(r["name"]) for r in reports] + [len(s.split(':')[0]) for s in skipped] + [1])
     for r in reports:
         dev = "" if r["devices"] is None else f"   {r['devices']} devices, {r['unidentified']} unidentified"
+        if r.get("vendor_only"):
+            dev += f", {r['vendor_only']} known only by vendor"
         out.append(f"    {r['name']:<{width}}  {r['verdict']}{dev}")
     for s in skipped:
         net, _, why = s.partition(":")

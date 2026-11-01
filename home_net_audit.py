@@ -1857,7 +1857,9 @@ def save_baseline(state, passphrase=None):
     # render them and stripped here so the baseline holds only measurements.
     given = state
     state = {k: v for k, v in state.items() if not str(k).startswith("_")}
-    memory = update_device_memory(load_baseline() or {}, state)
+    # With the owner's labels: a labelled address is a device whatever its
+    # locally-administered bit says, and is remembered like any other.
+    memory = update_device_memory(load_baseline() or {}, state, load_labels())
     state = carry_forward_unmeasured(state)
     state = carry_forward_unconfirmed_listeners(state)
     # Only when there is something to remember: a state that says nothing about
@@ -4474,7 +4476,30 @@ def _parse_stamp(value):
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
-def remembered_devices(state):
+def labelled_macs(labels):
+    """The addresses the owner has named, lowercased: the one proof this tool
+    accepts that an address with the locally-administered bit is a fixed
+    device and not a phone's rotating private address."""
+    return {k.lower() for k, v in (labels or {}).items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()}
+
+
+def is_rotating_mac(mac, labels=None):
+    """Whether `mac` is treated as a rotating private address: the
+    locally-administered bit set AND no label from the owner.
+
+    The bit alone decided this, and the household's fixed devices with that
+    bit — the LinkTap irrigation gateways, the IoT network's gateway, "This
+    Mac" on each network — were handled as phones: never reported gone or
+    replaced, never remembered, only counted, and padding the rotating count
+    so a stranger arriving while one of them was off read as no change. A
+    label is a statement by the owner that the address is a device; it is
+    honoured here and nowhere else.
+    """
+    return is_randomized_mac(mac) and str(mac).lower() not in labelled_macs(labels)
+
+
+def remembered_devices(state, labels=None):
     """{mac: {"first_seen", "last_seen"}} for a saved state, read defensively.
 
     A baseline written before the memory existed still remembers one thing: the
@@ -4482,6 +4507,7 @@ def remembered_devices(state):
     the first run after the upgrade behave, instead of starting from nothing.
     """
     state = state or {}
+    fixed = labelled_macs(labels)
     memory = {}
     saved = state.get("device_memory")
     if isinstance(saved, dict):
@@ -4490,7 +4516,8 @@ def remembered_devices(state):
                 continue
             mac = mac.lower()
             last = entry.get("last_seen")
-            if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac) or _parse_stamp(last) is None:
+            if (not _MAC_SHAPE.match(mac) or (is_randomized_mac(mac) and mac not in fixed)
+                    or _parse_stamp(last) is None):
                 continue
             first = entry.get("first_seen")
             memory[mac] = {"first_seen": first if _parse_stamp(first) else last, "last_seen": last}
@@ -4501,18 +4528,20 @@ def remembered_devices(state):
             if not isinstance(mac, str):
                 continue
             mac = mac.lower()
-            if _MAC_SHAPE.match(mac) and not is_randomized_mac(mac) and mac not in memory:
+            if (_MAC_SHAPE.match(mac) and not (is_randomized_mac(mac) and mac not in fixed)
+                    and mac not in memory):
                 memory[mac] = {"first_seen": stamp, "last_seen": stamp}
     return memory
 
 
-def update_device_memory(previous, state):
+def update_device_memory(previous, state, labels=None):
     """The memory to save with `state`: what was remembered, plus what was seen now.
 
     A run that did not sweep learns nothing about devices and so changes nothing
     — not even expiry, since "not looked for" is not "not seen".
     """
-    memory = remembered_devices(previous)
+    fixed = labelled_macs(labels)
+    memory = remembered_devices(previous, labels)
     if not devices_identified(state):
         return memory
     stamp = state.get("timestamp")
@@ -4524,7 +4553,7 @@ def update_device_memory(previous, state):
         if not isinstance(mac, str):
             continue
         mac = mac.lower()
-        if not _MAC_SHAPE.match(mac) or is_randomized_mac(mac):
+        if not _MAC_SHAPE.match(mac) or (is_randomized_mac(mac) and mac not in fixed):
             continue
         entry = memory.setdefault(mac, {"first_seen": stamp, "last_seen": stamp})
         entry["last_seen"] = stamp
@@ -4536,22 +4565,25 @@ def update_device_memory(previous, state):
     return memory
 
 
-def returning_devices(old, new):
+def returning_devices(old, new, labels=None):
     """{mac: last_seen} for devices present now, absent from the last run, but
     seen on this network within the memory window."""
     if not (devices_identified(old) and devices_identified(new)):
         return {}
+    fixed = labelled_macs(labels)
+
     def stable(entry):
         out = set()
         for d in entry.get("devices") or []:
             mac = d.get("mac") if isinstance(d, dict) else None
-            if isinstance(mac, str) and mac != "unknown" and not is_randomized_mac(mac.lower()):
+            if (isinstance(mac, str) and mac != "unknown"
+                    and not (is_randomized_mac(mac.lower()) and mac.lower() not in fixed)):
                 out.add(mac.lower())
         return out
     arrived = stable(new) - stable(old)
     if not arrived:
         return {}
-    memory = remembered_devices(old)
+    memory = remembered_devices(old, labels)
     now = _parse_stamp(new.get("timestamp"))
     back = {}
     for mac in arrived:
@@ -4568,7 +4600,7 @@ def returning_devices(old, new):
 
 def describe_returning_devices(old, new, labels=None):
     """The lines naming devices that came back, or None. Never a change, always said."""
-    back = returning_devices(old, new)
+    back = returning_devices(old, new, labels)
     if not back:
         return None
     labels = labels or {}
@@ -4638,7 +4670,7 @@ def describe_critical_absences(old, new, critical, labels=None):
         mac = d.get("mac") if isinstance(d, dict) else None
         if isinstance(mac, str):
             present.add(mac.lower())
-    memory = remembered_devices(old)
+    memory = remembered_devices(old, labels)
     missing = []
     for mac in sorted(critical - present):
         entry = memory.get(mac)
@@ -4893,8 +4925,13 @@ def diff_baseline(old, new, labels=None, critical=None):
             subnet = d.get("subnet")
             if isinstance(subnet, str) and subnet:
                 subnets.setdefault(mac, set()).add(subnet)
-        stable = {m for m in macs if not is_randomized_mac(m)}
+        # A labelled address is a device, whatever its locally-administered
+        # bit says (is_rotating_mac): compared by name, reported gone, and
+        # kept out of the rotating count it used to pad.
+        stable = {m for m in macs if not (is_randomized_mac(m) and m not in fixed)}
         return stable, macs - stable, subnets
+
+    fixed = labelled_macs(labels)
 
     # A run that did not sweep has no "devices" key at all, and that is not the
     # same as a sweep that found nothing. Read as an empty set, every device in
@@ -4932,7 +4969,7 @@ def diff_baseline(old, new, labels=None, critical=None):
     # A device remembered from an earlier run on this network is back, not new.
     # It is reported by describe_returning_devices — every time, by name — but
     # it is not a change. See "Remembering devices for longer than one run".
-    appeared -= set(returning_devices(old, new))
+    appeared -= set(returning_devices(old, new, labels))
     # An arrival is described from this run, where it was seen; a departure from
     # the baseline, the only place it still exists.
     # A device the owner marked critical (--critical) leaving is said first and
@@ -9295,6 +9332,7 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             display_order.append(key)
 
     unlabelled = []
+    vendor_only = []
     total = 0
     for subnet_str in display_order:
         group = by_subnet.get(subnet_str, [])
@@ -9309,13 +9347,17 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             name = labels.get(mac.lower(), "")
             vend = d.get("vendor", "")
             # "(randomized/private MAC)" is what lookup_vendor returns when it
-            # declines to look one up. It reads as a vendor here and suppressed
-            # the "unlabelled" flag, so a device the tool explicitly could not
-            # identify was presented as identified — and left out of the count
-            # that tells the reader how many they still have to account for.
-            identified = name or (vend if vend != PRIVATE_MAC_VENDOR else "")
-            display_name = name or vend
-            tag = f"  {display_name}" if display_name else ""
+            # declines to look one up; it is not a vendor.
+            vend = "" if vend == PRIVATE_MAC_VENDOR else vend
+            # Only a label the owner typed identifies a device. A vendor name
+            # is a registry lookup of a prefix the device itself chose, fetched
+            # from a third party over the network being audited; it used to
+            # count as identification, so any registered OUI escaped the
+            # "unlabelled" flag and the count below, and seven unlabelled Tuya
+            # plugs read as "0 unidentified" while a private-address phone was
+            # flagged every week. It is shown as what it is: a hint.
+            identified = bool(name)
+            tag = f"  {name}" if name else (f"  vendor says {vend}" if vend else "")
             flag = "" if identified else "  <-- unlabelled"
             # What the device calls itself. Shown, quoted and attributed — and
             # deliberately not part of `identified`: a name is free to claim,
@@ -9325,13 +9367,58 @@ def _print_devices_grouped(all_devices, labels, networks, scanned_subnets=None):
             claim = f'  announces "{said}" [{source}]' if said else ""
             print(f"    {d['ip']:<15} {mac}{tag}{claim}{flag}")
             if not identified:
-                unlabelled.append(mac)
+                (vendor_only if vend else unlabelled).append(mac)
             total += 1
 
     print(f"\n  Total: {total} device(s) across {len(display_order)} subnet(s) scanned.")
+    duplicates = describe_duplicate_addresses(all_devices, labels)
+    if duplicates:
+        print(duplicates)
+    if vendor_only:
+        # Its own line, which the email digest carries: these are not
+        # identified, and they are not the same as a device nothing is known
+        # about either.
+        print(f"  {len(vendor_only)} device(s) known only by vendor name, which is a hint from "
+              "the address the device chose, not an identification.")
     if unlabelled:
-        print(f"  {len(unlabelled)} unidentified device(s). Tag them with:")
+        print(f"  {len(unlabelled)} unidentified device(s).")
+    if unlabelled or vendor_only:
+        print(f"  Tag them with:")
         print(f"    python3 home_net_audit.py --label MAC='Device Name' ...")
+
+
+def describe_duplicate_addresses(devices, labels=None):
+    """A REVIEW line naming every hardware address answering at more than one
+    IP on one subnet, or None.
+
+    The device list is indexed by MAC everywhere it is compared, so a MAC at
+    two addresses collapsed to one row and was never said. One device holding
+    two leases happens (a Mac with two interfaces on one network, a printer
+    that renewed under a new address while the old entry lingers); so does
+    two devices sharing a hardware address, which is what ARP spoofing of a
+    host looks like from the neighbour table. Either way the reader should
+    know, and the comparison cannot say it.
+    """
+    by_mac = {}
+    for d in devices or []:
+        if not isinstance(d, dict):
+            continue
+        mac, ip = d.get("mac"), d.get("ip")
+        if not (isinstance(mac, str) and isinstance(ip, str)) or mac == "unknown":
+            continue
+        mac = mac.lower()
+        if not _MAC_SHAPE.match(mac) or is_rotating_mac(mac, labels):
+            continue
+        by_mac.setdefault((mac, d.get("subnet")), set()).add(ip)
+    doubled = {key: ips for key, ips in by_mac.items() if len(ips) > 1}
+    if not doubled:
+        return None
+    parts = [f"{describe_mac(mac, labels, {'devices': devices})} at "
+             f"{', '.join(sorted(ips, key=lambda a: [int(x) if x.isdigit() else x for x in a.split('.')]))}"
+             for (mac, _subnet), ips in sorted(doubled.items())]
+    return ("  [REVIEW] Hardware address answering at more than one IP: " + "; ".join(parts)
+            + ". One device holding two leases, or two devices sharing one address — "
+            "which is what ARP spoofing of a host looks like. The comparison counts it once.")
 
 
 def onlink_coverage(subnets_to_sweep, interfaces):
