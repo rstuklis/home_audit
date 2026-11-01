@@ -29,6 +29,14 @@ def audit(mod, monkeypatch):
         monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (NET, None))
         monkeypatch.setattr(mod, "describe_current_network", lambda *a, **k: "")
         monkeypatch.setattr(mod, "is_onlink", lambda addr, interfaces: addr == GW)
+        # The identity work (PR #45) pings the gateway and reads the ARP cache
+        # to bind the baseline to its network; neither may leave the sandbox.
+        monkeypatch.setattr(mod, "live_link_identity",
+                            lambda gateway: ("b0:2a:43:c8:22:5b", {"b0:2a:43:c8:22:5b"}))
+        # The same branch's IPv6-only sweep pings the all-nodes group and reads
+        # the neighbour table; stubbed at those two readers so its own logic runs.
+        monkeypatch.setattr(mod, "probe_ipv6_all_nodes", lambda ifaces: None)
+        monkeypatch.setattr(mod, "get_ipv6_neighbours", lambda: {})
 
         def fake_audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None,
                             outcomes=None, identities=None):
