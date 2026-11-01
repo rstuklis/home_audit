@@ -49,6 +49,9 @@ def _stub_startup(mod, monkeypatch):
     """
     monkeypatch.setattr(mod, "use_current_network_baseline",
                         lambda *a, **k: (None, None))
+    # And since round 5 the loop re-identifies the network on every poll from
+    # the interfaces and the local address; test_network_identity drives that.
+    monkeypatch.setattr(mod, "identify_monitor_network", lambda snapshot: (None, None))
     monkeypatch.setattr(mod, "ping", lambda ip: None)
 
 
@@ -763,6 +766,8 @@ class TestNeighboursAreDevicesNotGroups:
     def test_broadcast_and_multicast_rows_are_not_neighbours(self, mod, monkeypatch):
         monkeypatch.setattr(mod, "get_default_gateway", lambda: GW)
         monkeypatch.setattr(mod, "get_ipv6_router_entries", lambda: [])
+        monkeypatch.setattr(mod, "get_ipv6_prefixes", lambda: {})
+        monkeypatch.setattr(mod, "get_ipv6_route_hops", lambda: {})
         monkeypatch.setattr(mod, "get_dns_servers", lambda: [GW])
         monkeypatch.setattr(mod, "read_arp_table", lambda: {
             GW: ROUTER_MAC,

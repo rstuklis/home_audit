@@ -276,12 +276,25 @@ table empty, a swap inside one poll is what ARP spoofing of a host looks like.
 ### Several networks, one monitor
 
 A Mac that audits several networks in turn still runs one monitor, on the
-network it lives on. The heartbeat log is keyed by network, and it cannot know
-which network the monitor was meant for: when the Mac spent four days on the
-IoT network, the monitor heartbeated under that network's chain, and every
-audit of it afterwards read the silence since as "the monitor is not running
-now" at HIGH — for ever, since nothing leaves an append-only log. Tell the
-audit which networks have no monitor of their own:
+network it lives on — and it follows the Mac. The network is identified on
+every poll, from the interfaces, this machine's address and the gateway the
+poll read, the same way the audit identifies its own. When it changes, the
+monitor switches to that network's own state file, chain, alert queue and
+device memory, says so once (`[REVIEW] Network changed from X to Y; reference
+switched`), and compares nothing until the next poll, which is then compared
+against the reference it last left on that network, across the time since.
+Nothing is saved or heartbeated under a chain that is not the network the
+snapshot was taken on. It used to bind all of that once at start-up, so a roam
+diffed the new network against the old one's reference — three false HIGHs
+per move, one of them wording a changed address as "ARP poisoning" — and
+heartbeated the wrong chain as continuous coverage.
+
+The heartbeat log is keyed by network, and it cannot know which network the
+monitor was meant for: when the Mac spent four days on the IoT network, the
+monitor heartbeated under that network's chain, and every audit of it
+afterwards read the silence since as "the monitor is not running now" at HIGH
+— for ever, since nothing leaves an append-only log. Tell the audit which
+networks have no monitor of their own:
 
 ```sh
 python3 home_net_audit.py --compact --unmonitored      # a network without a monitor
@@ -290,6 +303,52 @@ python3 home_net_audit.py --compact --unmonitored      # a network without a mon
 Gaps found under that network's chain are then reported as information, with
 the last heartbeat named, and never as a stopped monitor. The home network's
 audit runs without the flag and keeps the HIGH.
+
+### What the reference is, and what it is not
+
+Three more things about the monitor's reference point, each learned from the
+round-4 attack audit.
+
+**A gap inside the process is a gap.** The restart case has been handled since
+the state file existed; a Mac that sleeps for an hour does not restart the
+process, it just stops polling, and that used to go unnoticed — whatever the
+monitor saw on waking was alerted as if witnessed that minute. The gap test now
+runs on every poll, against the previous poll's time, and the events of the
+poll after a gap say they were observed across a window with no monitoring.
+
+**A missing state file is not a first run.** The file is one `rm` away for
+anything running as the user, and deleting it used to re-baseline the monitor
+silently onto whatever the network looked like, heartbeats flowing on. The
+monitor now reads the heartbeat record back at start-up: a reference missing
+where heartbeats say a monitor was watching this chain is HIGH, and the first
+poll is compared against a reference built from the weekly baseline — the
+gateway and its MAC, the resolvers, the routers and what they hand out, the
+swept devices and the device memory — across the window since the last
+heartbeat. Only with no weekly baseline either is the poll adopted, and the
+alert says so. A state file that describes another network, as the one a
+roaming monitor used to write did, is discarded with a REVIEW and the baseline
+stands in the same way.
+
+**A baseline is bound to the gateway it was taken behind.** The subnet is not
+an identity: the beach house, a friend's Google Wifi and this household's
+pearl are all 192.168.86.0/24, and until now any of them would have been
+audited into pearl's chain, sealed as its next run, and the modem password
+sent to whatever answered at 192.168.1.1. Every baseline now records its
+gateway's MAC, and a chain whose recorded MAC is not the one in the ARP table
+is refused — `[REVIEW] The baseline for 192.168.86.0/24 was taken on a
+different network` — by the audit, which then compares nothing and saves
+nothing, and by the monitor, which neither compares, saves nor heartbeats
+under it. A different gateway MAC is also what ARP poisoning on the home
+network looks like, and refusing the chain there would silence the HIGH the
+comparison exists to raise; so the chain is refused only when nothing else
+ties the network to the baseline. A matching SSID, or a device the baseline
+knows answering on the link, means the same network with a changed gateway
+MAC, and the comparison says so. The monitor asks again on every poll, so an
+ARP cache that held only the gateway when it joined decides nothing for long.
+A lease with a wider mask than the network's own (a /23 on a /24 network)
+starts a fresh baseline rather than adopting the one inside it, and says
+which baseline it did not adopt; a narrower lease inside a known network
+adopts that network's chain, and says so too.
 
 ### Devices whose silence matters
 

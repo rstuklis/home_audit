@@ -79,6 +79,7 @@ def _quiet_startup(mod, monkeypatch):
     """The two things the loop and the snapshot do that these tests are not about
     (covered by test_monitor); both are forbidden by the sandbox, correctly."""
     monkeypatch.setattr(mod, "use_current_network_baseline", lambda *a, **k: (None, None))
+    monkeypatch.setattr(mod, "identify_monitor_network", lambda snapshot: (None, None))
     monkeypatch.setattr(mod, "ping", lambda ip: None)
 
 
@@ -206,7 +207,7 @@ class TestRoutersAreKnownByMac:
         monkeypatch.setattr(mod, "run", readers(NDP_R_HUB, prefixes_out=NDP_P))
         details = mod.check_ipv6_routers(known=[HUB_NEW])["details"]
         assert details[HUB_NEW] == {"mac": HUB_MAC, "installed": False,
-                                    "prefixes": ["fdca:7af7:13bd:4743::/64"]}
+                                    "prefixes": ["fdca:7af7:13bd:4743::/64"], "routes": []}
 
     def test_prefixes_are_read_per_router_and_link_local_is_nobodys(self, mod):
         assert mod.parse_ndp_prefixes(NDP_P) == {HUB_NEW: ["fdca:7af7:13bd:4743::/64"]}
