@@ -469,7 +469,77 @@ are, and nothing new has to be set up or stored: `tools/audit_mail.py`
 composes that email from the audit's output files and hands it to whatever
 the Mac already sends with.
 
-**The city Mac already sends this email.** Nothing to change there.
+**The city Mac** sent this email through its own `send_report.py`, outside
+the repository, and that script is retired. Its subject was a substring test
+over the whole body — a device announcing itself as `CHANGES DETECTED` made
+every Sunday say so, and an aborted audit said "no changes" — it tried the
+mail server once and told nobody when that failed, and the TL;DR's memory had
+already moved on when it tried, so the week after a lost email called that
+week's new HIGHs "standing". The last line of `~/.home_net_audit/run_audit.sh`
+becomes:
+
+```sh
+"$PY" "$REPO/tools/audit_mail.py" --smtp smtp.gmail.com:587 --keychain homenetaudit-smtp \
+    --from robert.stuklis@gmail.com send --to robert.stuklis@gmail.com \
+    --state "$DIR/digest_state.json" --body "$LAST"
+```
+
+Same Gmail account, same Keychain item, same text-and-HTML message with the
+same 100 KB guard on the HTML part (`HOME_NET_AUDIT_PLAIN_EMAIL=1` still sends
+the text alone). The `--state` is the file the digest step already names: the
+send is what moves its memory on (below). What the subject says is decided by
+the TL;DR's per-network lines, which carry nothing a device chose: `CHANGES
+DETECTED` when any network changed, `AUDIT INCOMPLETE` when any network was
+not audited — not joined, aborted, its report unreadable or without its
+closing line — and both when both. The run number from the report goes in
+too: `[Home Net Audit] 2026-11-08 — run 19 — no changes`. The numbers run on
+by one a week, so a week whose email never came shows as a gap in the inbox
+rather than as a quiet Sunday.
+
+**When the email does not go.** The send is tried twice, ninety seconds
+apart (`--retry-wait`), since a Mac that has just woken may not have its
+network back. When it still fails, the message is kept in the outbox —
+`~/.home_net_audit/outbox/` (`--outbox` for another) — under its own
+subject and date, the log gets one line beginning `EMAIL NOT SENT:` that names
+the file, and the step exits 1. Nothing else moves: `tools/report_digest.py`
+writes its memory of the report as `digest_state.json.pending`, and only a
+send that went moves it into place, so a lost week's items are still "new"
+the week after. `resend` sends whatever the outbox holds, oldest first, each
+with a fresh date under its old subject, and moves that week's memory into
+place when it goes (unless a later email already moved the memory past it);
+the first failure stops the pass and an empty outbox is silent, so it can run
+from a schedule or by hand:
+
+```sh
+"$PY" "$REPO/tools/audit_mail.py" --smtp smtp.gmail.com:587 --keychain homenetaudit-smtp \
+    --from robert.stuklis@gmail.com resend          # the beach Mac: --via mail-app --from robert@stuklis.net resend
+```
+
+**The monitor's alerts are in the TL;DR.** They went to a file nothing read:
+four HIGHs — a changed gateway MAC among them — sat in `alerts.jsonl` for
+eleven days without reaching any report, TL;DR or email. The digest now reads
+the file `HOME_NET_AUDIT_ALERT` names, or `alerts.jsonl` beside the receipts
+in the folder `HOME_NET_AUDIT_SINK` names, and `alerts-beach.jsonl` there
+too when the other Mac writes one, and prints under the facts:
+
+```
+  MONITOR ALERTS SINCE THE PREVIOUS REPORT: 1 HIGH, 31 REVIEW
+    alerts.jsonl: 32 alert(s), 2026-10-25 09:03 to 2026-11-01 08:59
+      [HIGH] 2026-10-27 10:48  ipv6_router_appeared · New IPv6 router advertising: fe80::87e:f5b1:f821:c252%en0. …
+      [REVIEW] neighbour_appeared ×29, observation_gap ×2
+```
+
+Every HIGH is listed with its time, kind and detail and is a flagged item in
+its own right — new the week it is raised, standing if it is raised again,
+dropped without being called cleared when it is not — and the REVIEWs are
+counted by kind. The state file remembers the last alert time each file had
+reported, so an alert is reported once. A file that cannot be read says so,
+and clears nothing; no file configured says so too, rather than nothing.
+Both wrappers export `HOME_NET_AUDIT_SINK` before the digest runs, so there
+is nothing to set; a Mac that should read only its own monitor's file sets
+`HOME_NET_AUDIT_ALERT` to it in its `run_audit.sh`. Claude's paragraph is
+given the kinds and counts, never the details: an alert's detail is what the
+monitor saw on the network, and it is withheld the way an announced name is.
 
 **The beach Mac** has sent through Mail.app all along, from its own account
 to the usual address, by an AppleScript in its wrapper, with the report
@@ -490,13 +560,15 @@ file over as `NAME=FILE`:
 What those do: `--via mail-app` sends through Mail.app, from the account
 `--from` names, so no password is stored anywhere. `--state` is
 `report_digest.py`'s memory of the previous report, which is what makes "new
-since the previous report" mean something. `--claude` adds the plain-English
-paragraph when the Claude CLI is on the Mac, and goes without it when not.
-`--repo` prints the version check. `--save-body` keeps the text that was
-sent, `--save-html` the same report as the city Mac's HTML page, to open in a
-browser. `--site` goes into the subject and the page heading, so the two
-Macs' emails can be told apart: `[Home Net Audit] 2026-10-25 — beach house —
-no changes`.
+since the previous report" mean something; it moves on only when the email
+has gone. `--claude` adds the plain-English paragraph when the Claude CLI is
+on the Mac, and goes without it when not. `--repo` prints the version check.
+`--save-body` keeps the text that was sent, `--save-html` the same report as
+the city Mac's HTML page, to open in a browser; both are written once the
+email has gone, so they are of the email that was sent, and one that did not
+go waits in the outbox instead. `--site` goes into the subject and the page
+heading, so the two Macs' emails can be told apart: `[Home Net Audit]
+2026-10-25 — beach house — run 12 — no changes`.
 
 The step that printed the HTML report to PDF and the `osascript` that handed
 it to Mail.app go; `--html-report` can stay for the copy on disk. The audit's
@@ -540,3 +612,75 @@ another script already stored is used in place: `--smtp smtp.gmail.com:587
 --keychain homenetaudit-smtp --from robert.stuklis@gmail.com` reads the city
 Mac's Gmail item. Leave `--via` out, or say `--via smtp`, and the `send` and
 `notify` lines above are otherwise the same.
+
+---
+
+## The city Mac's wrapper, by hand
+
+`~/.home_net_audit/run_audit.sh` is not in this repository; the round-4 audit
+found four things in it that only the owner can change, listed here so the
+change is made once and the same way. None of them alters what the audit
+measures.
+
+**The version check's `git fetch` has no timeout.** Apple's git applies no
+transfer timeout unless `http.lowSpeedLimit`/`http.lowSpeedTime` are set,
+and the LaunchAgent sets no environment: a peer that accepts the connection
+and then sends nothing holds the fetch for ever, between the audits and the
+email — after the TL;DR has been written and before the report and the email
+exist. The call in `version_check` becomes:
+
+```sh
+GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 git -C "$REPO" fetch --quiet origin 2>/dev/null
+```
+
+(Below one byte a second for twenty seconds, the fetch fails and the check
+says GitHub could not be reached, as it does for any other failure.) Moving
+the check after the email step would do as well.
+
+**The two Keychain reads at the top are equally unbounded.** A login
+keychain that locks when the Mac sleeps answers a scheduled run with a
+dialog nobody can see, and `security` waits on it. macOS has no `timeout`
+command; `perl` is on every Mac and its alarm does the same:
+
+```sh
+HOME_NET_AUDIT_PASSPHRASE="$(perl -e 'alarm shift; exec @ARGV' 120 \
+    security find-generic-password -s "homenetaudit-baseline" -a "rgs_work" -w 2>/dev/null)"
+```
+
+The audit then runs unsealed for the week and says so, which is the
+degradation the wrapper already chose for a missing item.
+
+**The sealing passphrase and the sink token are exported into every child.**
+Including the external `claude` CLI the digest starts, which contacts the
+network and has no use for either. The digest now starts Claude with every
+`HOME_NET_AUDIT_*` variable and `TPLINK_PASSWORD` removed from its
+environment; the wrapper keeps them out of the digest and the mailer
+altogether by putting `env -u` in front of both steps:
+
+```sh
+env -u HOME_NET_AUDIT_PASSPHRASE -u TPLINK_PASSWORD -u HOME_NET_AUDIT_SINK_TOKEN \
+    "$PY" "$DIGEST" "${CLAUDE_FLAG[@]}" --state "$DIR/digest_state.json" "${SKIPPED[@]}" "${PARTS[@]}"
+env -u HOME_NET_AUDIT_PASSPHRASE -u TPLINK_PASSWORD -u HOME_NET_AUDIT_SINK_TOKEN \
+    "$PY" "$REPO/tools/audit_mail.py" --smtp smtp.gmail.com:587 --keychain homenetaudit-smtp \
+    --from robert.stuklis@gmail.com send --to robert.stuklis@gmail.com --state "$DIR/digest_state.json" --body "$LAST"
+```
+
+`HOME_NET_AUDIT_SINK` stays: the digest reads the monitor's alerts from the
+folder it names.
+
+**The modem password is read and exported every week for nothing.** The DSL
+statistics need the modem on-link, and from every one of the three networks
+here it is behind the router, so that section has been skipped on all 24
+scheduled audits since August while the password sat in the environment of
+each of them, of the version check, of the Wi-Fi helper, of Claude and of
+the mailer. Delete the `TPLINK_PASSWORD` block (the `security` read, the
+`export` and the note), and the Keychain item with it:
+
+```sh
+security delete-generic-password -s homenetaudit-tplink -a admin
+```
+
+If the statistics are ever wanted, the login has to be rebuilt first: the
+firmware never accepted the legacy one the tool speaks, and that one sent the
+password base64-encoded over plain HTTP.
+

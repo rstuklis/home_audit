@@ -143,6 +143,14 @@ def sandbox(monkeypatch, tmp_path):
 
     # Anything that still resolves ~ lands in the tmp dir rather than $HOME.
     monkeypatch.setenv("HOME", str(tmp_path))
+    # And nothing the developer's shell exports for a real run reaches a test:
+    # the digest reads the monitor's alert file from HOME_NET_AUDIT_ALERT or the
+    # folder HOME_NET_AUDIT_SINK names, which on the owner's Mac is the live
+    # iCloud folder. A test that wants one of these sets it itself.
+    for var in ("HOME_NET_AUDIT_SINK", "HOME_NET_AUDIT_ALERT", "HOME_NET_AUDIT_SINK_TOKEN",
+                "HOME_NET_AUDIT_ALERT_TOKEN", "HOME_NET_AUDIT_PASSPHRASE", "HOME_NET_AUDIT_DIR",
+                "HOME_NET_AUDIT_PLAIN_EMAIL", "TPLINK_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
 
     # --- the working tree ---------------------------------------------------
     # Pin cwd so a relative-path write lands in tmp rather than in the repo.
