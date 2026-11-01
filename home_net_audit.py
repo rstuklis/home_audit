@@ -1750,9 +1750,11 @@ def describe_modified_save_refusal():
     """
     return ("\n  [HIGH  ] Baseline NOT saved: the sealed baseline does not verify with "
             "the passphrase given. Either the passphrase is wrong, or the baseline was "
-            "altered since it was sealed. Re-seal from a state you trust with "
-            "seal_baseline.py, or fix the passphrase; until then the record is left as "
-            "it is and this line repeats.")
+            "altered since it was sealed. Fix the passphrase, or review the record line "
+            "by line — every device, every remembered device, every port — and only then "
+            "re-seal it with seal_baseline.py --force-reviewed (it verifies first and "
+            "refuses a modified record otherwise); until then the record is left as it "
+            "is and this line repeats.")
 
 
 def load_baseline_record():
