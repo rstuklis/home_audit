@@ -10091,7 +10091,7 @@ def action_save_baseline(state):
         print(describe_unkeyed_save_refusal())
         return
     _record = save_baseline(state, passphrase=passphrase)
-    print(f"Baseline saved to {BASELINE_FILE}")
+    print(f"Baseline saved to {BASELINE_FILE}  (run {_record.get('seq')})")
     _pub = describe_publish_result(_record.get("_receipt"))
     if _pub:
         print(_pub)
@@ -10956,7 +10956,9 @@ def _main():
         else:
             _record = save_baseline(state, passphrase=passphrase)
             _RUN_PROGRESS["baseline_saved"] = True
-            tell(f"\nBaseline saved to {BASELINE_FILE}")
+            # The run number goes into the report so the email's subject can
+            # carry it: a week whose email never arrived then shows as a gap.
+            tell(f"\nBaseline saved to {BASELINE_FILE}  (run {_record.get('seq')})")
             _pub = describe_publish_result(_record.get("_receipt"))
             if _pub:
                 tell(_pub)

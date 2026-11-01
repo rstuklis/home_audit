@@ -46,7 +46,10 @@ fixture afterwards. Several tests here exist because that was done — see
 **2. An autouse sandbox.** Every test is isolated from the real world: `subprocess`,
 outbound sockets, DNS resolution and `urllib` all raise `EscapedSandbox`, and
 `BASELINE_DIR` and friends are redirected into `tmp_path` so tests can never touch
-`~/.home_net_audit`.
+`~/.home_net_audit`. The `HOME_NET_AUDIT_*` variables (and `TPLINK_PASSWORD`) are
+cleared too: the digest reads the monitor's alert file from the sink the environment
+names, and on the owner's Mac that is the live iCloud folder. A test that wants one
+sets it itself.
 
 `EscapedSandbox` derives from `BaseException`, not `Exception`, and that detail is
 load-bearing. The code under test wraps most system calls in `except Exception` or
