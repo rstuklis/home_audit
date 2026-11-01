@@ -1859,7 +1859,16 @@ def save_baseline(state, passphrase=None):
     state = {k: v for k, v in state.items() if not str(k).startswith("_")}
     # With the owner's labels: a labelled address is a device whatever its
     # locally-administered bit says, and is remembered like any other.
-    memory = update_device_memory(load_baseline() or {}, state, load_labels())
+    previous = load_baseline() or {}
+    labels = load_labels()
+    memory = update_device_memory(previous, state, labels)
+    # Which departures this run's comparison reported, so the next run can
+    # call their return a change. Only when both sides were compared: a run
+    # that did not sweep reported nothing gone.
+    if devices_identified(previous) and devices_identified(state):
+        state["departed"] = sorted(device_departures(previous, state, labels))
+    else:
+        state.pop("departed", None)
     state = carry_forward_unmeasured(state)
     state = carry_forward_unconfirmed_listeners(state)
     # Only when there is something to remember: a state that says nothing about
@@ -4111,6 +4120,85 @@ def describe_evidence_basis(state, compact=False):
     return "\n".join(lines)
 
 
+def all_network_baselines():
+    """The saved state of every baseline in BASELINE_DIR — one per network,
+    plus a legacy shared one if it is still there — read defensively.
+    Unreadable or malformed files are skipped, not raised."""
+    states = []
+    try:
+        names = sorted(os.listdir(BASELINE_DIR))
+    except OSError:
+        return states
+    for name in names:
+        if not re.fullmatch(r"baseline(-[0-9A-Za-z-]+)?\.json", name):
+            continue
+        try:
+            with open(os.path.join(BASELINE_DIR, name)) as f:
+                record = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            continue
+        state = (record.get("state") if isinstance(record, dict)
+                 and record.get("format") == BASELINE_FORMAT else record)
+        if isinstance(state, dict):
+            states.append(state)
+    return states
+
+
+def label_sightings(labels, states):
+    """{mac: latest last_seen} over every labelled address seen in any of
+    `states` — their device lists and device memories."""
+    latest = {}
+    for state in states or []:
+        for mac, entry in remembered_devices(state, labels).items():
+            if mac not in labelled_macs(labels):
+                continue
+            seen = _parse_stamp(entry.get("last_seen"))
+            if seen is None:
+                continue
+            if mac not in latest or seen > latest[mac][0]:
+                latest[mac] = (seen, entry.get("last_seen"))
+    return {mac: stamp for mac, (_seen, stamp) in latest.items()}
+
+
+def stale_labels(labels, states, now=None, days=None):
+    """[(mac, name, last_seen)] for labels whose address no network has seen
+    for `days` (DEVICE_MEMORY_DAYS). A label never seen anywhere is not listed:
+    its age is unknown.
+
+    Listed, never removed. labels.json was only ever added to, so a retired
+    device kept its name for good, and a stranger reusing the address — the
+    nine Tuya, Arlo and Apple TV addresses retired this week are on the air
+    for anyone nearby to copy — would have printed as the owner's labelled
+    device. Pruning is the owner's call (--unlabel); this names the candidates.
+    """
+    now = now or datetime.now(timezone.utc)
+    days = DEVICE_MEMORY_DAYS if days is None else days
+    latest = label_sightings(labels, states)
+    out = []
+    for mac in sorted(labelled_macs(labels)):
+        stamp = latest.get(mac)
+        seen = _parse_stamp(stamp)
+        if seen is None or now - seen <= timedelta(days=days):
+            continue
+        name = next((v for k, v in labels.items() if isinstance(k, str) and k.lower() == mac), "")
+        out.append((mac, _banner_text(name, 60), stamp))
+    return out
+
+
+def describe_stale_labels(labels, states, now=None, days=None):
+    """A REVIEW line listing labels whose address no network has seen for
+    `days` (DEVICE_MEMORY_DAYS), with the way to remove them, or None."""
+    days = DEVICE_MEMORY_DAYS if days is None else days
+    stale = stale_labels(labels, states, now, days)
+    if not stale:
+        return None
+    named = "; ".join(f"{mac} [{name}] (last seen {(stamp or '')[:10]})" for mac, name, stamp in stale)
+    return (f"  [REVIEW] Label(s) on addresses no network has seen for {days} days: {named}. "
+            "A label left on a retired address would present a stranger reusing it as your "
+            "own device; when the device is gone for good, remove the label with "
+            "`python3 home_net_audit.py --unlabel MAC`. Nothing is removed by itself.")
+
+
 def load_labels():
     """The owner's {mac: name}, read defensively: the monitor reads this every
     poll, and a hand edit that leaves the file unreadable or shaped as a list
@@ -4598,9 +4686,57 @@ def returning_devices(old, new, labels=None):
     return back
 
 
+def device_departures(old, new, labels=None):
+    """The stable addresses in `old` that `new` looked for and did not find.
+
+    The set the change line "Device(s) gone since baseline" names, factored
+    out so save_baseline can record it: a baseline that remembers which
+    departures its own run reported is what lets the next run tell "back
+    after the gone line named it" from an ordinary return.
+    """
+    if not (devices_identified(old) and devices_identified(new)):
+        return set()
+    fixed = labelled_macs(labels)
+
+    def stable(entry):
+        macs, subnets = set(), {}
+        for d in entry.get("devices") or []:
+            if not isinstance(d, dict):
+                continue
+            mac = d.get("mac")
+            if not isinstance(mac, str) or mac == "unknown":
+                continue
+            mac = mac.lower()
+            if is_randomized_mac(mac) and mac not in fixed:
+                continue
+            macs.add(mac)
+            subnet = d.get("subnet")
+            if isinstance(subnet, str) and subnet:
+                subnets.setdefault(mac, set()).add(subnet)
+        return macs, subnets
+
+    old_macs, old_subnets = stable(old)
+    new_macs, _ = stable(new)
+    vanished = old_macs - new_macs
+    new_cov = {s for s in (new.get("scanned_subnets") or ()) if isinstance(s, str)}
+    if new_cov:
+        vanished = {m for m in vanished if old_subnets.get(m, set()) <= new_cov}
+    return vanished
+
+
+def reported_departures(state):
+    """The addresses the run that saved `state` reported as gone, lowercased."""
+    return {m.lower() for m in ((state or {}).get("departed") or []) if isinstance(m, str)}
+
+
 def describe_returning_devices(old, new, labels=None):
-    """The lines naming devices that came back, or None. Never a change, always said."""
-    back = returning_devices(old, new, labels)
+    """The lines naming devices that came back, or None. Never a change, always said.
+
+    A device the previous run's own "gone" line named is left out here: its
+    return is a change line in diff_baseline, which the digest carries.
+    """
+    back = {m: when for m, when in returning_devices(old, new, labels).items()
+            if m not in reported_departures(old)}
     if not back:
         return None
     labels = labels or {}
@@ -4969,7 +5105,23 @@ def diff_baseline(old, new, labels=None, critical=None):
     # A device remembered from an earlier run on this network is back, not new.
     # It is reported by describe_returning_devices — every time, by name — but
     # it is not a change. See "Remembering devices for longer than one run".
-    appeared -= set(returning_devices(old, new, labels))
+    #
+    # With one exception, which is a change: a device the previous run's own
+    # "gone" line named. The INFO line the return used to get is dropped by
+    # the email digest, so a MAC retired last week and back this week — the
+    # owner's hardware, or a clone of it, since 802.11 headers are cleartext
+    # and the address was on the air for months — printed as the owner's own
+    # labelled device under "No changes since baseline".
+    back = returning_devices(old, new, labels)
+    appeared -= set(back)
+    returned = sorted(m for m in back if m in reported_departures(old))
+    if returned:
+        notes.append(
+            "Device(s) back after an absence the previous run reported as gone: "
+            + ", ".join(f"{describe_mac(m, labels, new, old)} (last seen "
+                        f"{(back[m] or '')[:16].replace('T', ' ')} UTC)" for m in returned)
+            + ". The same hardware address as the device that left — or a clone of it, "
+            "since a MAC seen on the air can be reused by anyone with the Wi-Fi key.")
     # An arrival is described from this run, where it was seen; a departure from
     # the baseline, the only place it still exists.
     # A device the owner marked critical (--critical) leaving is said first and
@@ -8372,8 +8524,9 @@ RENDERED_STATE_KEYS = frozenset({
     "upstream_identity",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
-    # Bookkeeping written by save_baseline: which devices this network has seen.
-    "device_memory",
+    # Bookkeeping written by save_baseline: which devices this network has seen,
+    # and which departures the saving run reported.
+    "device_memory", "departed",
     # This run's change-detection text, rendered first; never saved.
     "_comparison",
 })
@@ -9984,6 +10137,14 @@ def action_compare_baseline(state, unmonitored=False):
     _freshness = describe_baseline_freshness(old)
     if _freshness:
         print(_freshness)
+    # Across every network's baseline, not only this one's: a label is for
+    # the household, and a device seen last week on another network is not
+    # a label to prune. Said before the baseline check below, since the
+    # labels exist whether or not this network has a baseline yet.
+    _stale = describe_stale_labels(load_labels(), all_network_baselines(),
+                                   now=_parse_stamp((state or {}).get("timestamp")))
+    if _stale:
+        print(_stale)
     if not old:
         print("No baseline saved yet.")
         print("Run option 5 (Save baseline) after a full audit to enable this.")
@@ -10333,6 +10494,13 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     _freshness = describe_baseline_freshness(old)
     if _freshness:
         tell(_freshness)
+    # Across every network's baseline, not only this one's: a label is for
+    # the household, and a device seen last week on another network is not
+    # a label to prune.
+    _stale = describe_stale_labels(load_labels(), all_network_baselines(),
+                                   now=_parse_stamp(state.get("timestamp")))
+    if _stale:
+        tell(_stale)
     if old:
         changes = diff_baseline(old, state, load_labels(), critical=load_critical())
         tell(f"Baseline from: {old.get('timestamp', '?')}")
@@ -10603,6 +10771,11 @@ def _main():
                     help="Skip saving this run as the comparison baseline")
     ap.add_argument("--label", nargs="+", metavar="MAC=NAME",
                     help="Tag a device MAC with a friendly name")
+    ap.add_argument("--unlabel", nargs="+", metavar="MAC",
+                    help="Remove the label from device(s) that are gone for good. The "
+                         "report lists labels no network has seen for "
+                         f"{DEVICE_MEMORY_DAYS} days; nothing is removed by itself. Given "
+                         "on its own, saves and exits.")
     ap.add_argument("--critical", nargs="+", metavar="MAC",
                     help="Mark device(s) whose silence matters — a camera hub, an alarm. "
                          "Gone from a network it was seen on, a critical device is HIGH "
@@ -10661,8 +10834,8 @@ def _main():
         args.tplink_password_prompt, args.probe_creds, args.html_report,
         args.seal_baseline, args.publish_to,
     ]
-    cli_args_given = any(audit_flags + [args.label, args.critical, args.not_critical,
-                                        args.monitor])
+    cli_args_given = any(audit_flags + [args.label, args.unlabel, args.critical,
+                                        args.not_critical, args.monitor])
 
     if args.monitor:
         run_monitor(interval=args.interval, alert_to=args.alert_to)
@@ -10696,6 +10869,21 @@ def _main():
                 labels[mac.strip().lower()] = name.strip()
         save_labels(labels)
         print(f"Labels saved ({len(labels)} total).\n")
+
+    if args.unlabel:
+        labels = load_labels()
+        for mac in args.unlabel:
+            mac = mac.strip().lower()
+            removed = next((k for k in labels if isinstance(k, str) and k.lower() == mac), None)
+            if removed is None:
+                print(f"No label for {mac}; nothing removed.")
+            else:
+                print(f"Label removed: {mac} [{_banner_text(labels.pop(removed), 60)}]")
+        save_labels(labels)
+        print(f"Labels saved ({len(labels)} total).\n")
+        # Bookkeeping, like --critical: on its own it is not a request for an audit.
+        if not any(audit_flags) and not args.label and not (args.critical or args.not_critical):
+            return
 
     if args.critical or args.not_critical:
         critical = load_critical()
