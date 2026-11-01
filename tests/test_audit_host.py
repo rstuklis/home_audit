@@ -36,6 +36,8 @@ def host(mod, monkeypatch):
         monkeypatch.setattr(mod, "scan_ports_detailed",
                             lambda h, ports, workers=100: scan_result)
         monkeypatch.setattr(mod, "check_tls", lambda h, port=443: tls or {"present": False})
+        # Read only when 22 is open; a socket of its own, tested in its own module.
+        monkeypatch.setattr(mod, "read_ssh_banner", lambda h, port=22, timeout=3: "")
         return mod.audit_host(label, ip, full_scan)
     return run
 

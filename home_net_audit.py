@@ -1255,6 +1255,69 @@ def check_tls(host, port=443):
         return {"present": False, "sha256": None}
 
 
+def read_ssh_banner(host, port=22, timeout=3):
+    """The identification string an SSH server sends first, or "".
+
+    RFC 4253 has the server speak first: one line, "SSH-2.0-<software>", before
+    any key exchange. Nothing is sent; the line is read and the connection
+    closed. Cleaned through _banner_text like every other string a device
+    chooses, and kept only when it has that shape.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            data = sock.recv(256)
+    except (OSError, ValueError):
+        return ""
+    line = data.split(b"\n", 1)[0].decode("utf-8", "ignore").strip()
+    return _banner_text(line, 80) if line.startswith("SSH-") else ""
+
+
+IDENTITY_FIELDS = (
+    ("tls_443", "certificate"),
+    ("tls_8443", "certificate on port 8443"),
+    ("ssh_banner", "SSH banner"),
+    ("upnp_server", "UPnP server banner"),
+)
+
+
+def host_identity(host, open_ports, verdict=None, tls=None):
+    """What a host presents on the ports that carry an identity: the
+    certificate digests on 443 and 8443, the SSH banner, the UPnP server
+    banner. Only measured fields are present; an absent field means the port
+    was closed or nothing was read, never that the value is empty.
+
+    The modem's certificate was measured every week, printed as a 16-hex
+    prefix and dropped: router_tls records the gateway's, and every gateway
+    here is a Nest with no 443, so certificate-change detection was dead on
+    the one device in the house that has a certificate. It changed on
+    2026-09-20 and no line said so.
+    """
+    identity = {}
+    tls = tls if isinstance(tls, dict) else check_tls(host)
+    if tls.get("sha256"):
+        identity["tls_443"] = tls["sha256"]
+    ports = set(open_ports or ())
+    if 8443 in ports:
+        alt = check_tls(host, 8443)
+        if alt.get("sha256"):
+            identity["tls_8443"] = alt["sha256"]
+    if 22 in ports:
+        banner = read_ssh_banner(host)
+        if banner:
+            identity["ssh_banner"] = banner
+    server = verdict.get("server") if isinstance(verdict, dict) else None
+    if isinstance(server, str) and server.strip():
+        identity["upnp_server"] = _banner_text(server, 80)
+    return identity
+
+
+def describe_identity_field(field, value):
+    """One field of an identity, as the report prints it."""
+    text = str(value or "")
+    return f"{text[:16]}…" if field.startswith("tls_") and len(text) > 16 else _banner_text(text, 80)
+
+
 # ---------------------------------------------------------------------------
 # Interception detection
 # ---------------------------------------------------------------------------
@@ -1596,7 +1659,7 @@ def resolve_passphrase(prompt=False):
 # changed during the outage was never reported: not on that run, and not after
 # the next successful one re-established a baseline from the new cert.
 CARRY_FORWARD_KEYS = ("router_open_ports", "upstream_open_ports",
-                      "devices", "scanned_subnets", "router_tls")
+                      "devices", "scanned_subnets", "router_tls", "upstream_identity")
 
 # The two keys that record one measurement between them: what was found, and
 # where it was possible to find anything. They are measured together or not at
@@ -1613,6 +1676,17 @@ def tls_measured(state):
     measurement, so its absence is what "not measured" means here.
     """
     return (state.get("router_tls") or {}).get("sha256") is not None
+
+
+def identity_measured(state):
+    """Whether `state` holds any reading of the upstream modem's identity.
+
+    host_identity records only the fields it could measure, so an empty dict
+    is a run in which nothing was read — the scan was filtered or blocked, or
+    no port carrying an identity was open — and must not overwrite a reading.
+    """
+    identity = state.get("upstream_identity")
+    return isinstance(identity, dict) and bool(identity)
 
 
 def swept_anywhere(state):
@@ -1732,6 +1806,8 @@ def carry_forward_unmeasured(state, previous=None):
             measured = devices_identified(state)
         elif key == "router_tls":
             measured = tls_measured(state)
+        elif key == "upstream_identity":
+            measured = identity_measured(state)
         else:
             measured = state.get(key) is not None
         if measured:
@@ -1741,6 +1817,7 @@ def carry_forward_unmeasured(state, previous=None):
             # scanned_subnets. Leaving the key absent is right: carrying the
             # previous run's coverage would attach it to this run's devices.
         elif (tls_measured(previous) if key == "router_tls"
+              else identity_measured(previous) if key == "upstream_identity"
               else previous.get(key) is not None):
             carried.append(key)
             # The origin of the reading, not the run that inherited it. Falling
@@ -3669,6 +3746,8 @@ _CARRIED_LABELS = {
     "scanned_subnets": "scan coverage",
     "router_open_ports": "router ports",
     "upstream_open_ports": "upstream modem ports",
+    "router_tls": "router certificate",
+    "upstream_identity": "upstream modem identity",
 }
 
 
@@ -3842,6 +3921,7 @@ EVIDENCE = {
     "router_open_ports":   (MEASURED, "TCP connections this tool opened to the gateway", "Router port scan"),
     "upstream_open_ports": (MEASURED, "TCP connections this tool opened to the modem", "Upstream port scan"),
     "router_tls":          (MEASURED, "the certificate the gateway presented", "Router TLS"),
+    "upstream_identity":   (MEASURED, "the certificates and banners the modem presented", "Upstream modem identity"),
     # Measured, because the tool asked and watched what came back. The DORMANT
     # verdict in particular is a measurement of silence, and says so itself.
     "upnp_listeners":      (MEASURED, "how port 1900 answered UPnP discovery and description requests", "UPnP listener probe"),
@@ -4655,6 +4735,27 @@ def diff_trust_store(old, new):
     return notes
 
 
+def diff_upstream_identity(old, new):
+    """Change notes for identity fields of the upstream modem that differ."""
+    old_id, new_id = (old or {}).get("upstream_identity"), (new or {}).get("upstream_identity")
+    if not (isinstance(old_id, dict) and isinstance(new_id, dict)):
+        return []
+    notes = []
+    for field, what in IDENTITY_FIELDS:
+        was, now = old_id.get(field), new_id.get(field)
+        if not (isinstance(was, str) and isinstance(now, str) and was and now) or was == now:
+            continue
+        note = (f"Upstream modem {what} CHANGED: {describe_identity_field(field, was)} -> "
+                f"{describe_identity_field(field, now)}. ")
+        if field.startswith("tls_"):
+            note += ("The modem's certificate is self-signed and stable, so it was re-issued, the "
+                     "modem was replaced, or something is answering in its place.")
+        else:
+            note += "A firmware change, or a different device answering at the modem's address."
+        notes.append(note)
+    return notes
+
+
 def diff_listeners(old, new):
     """Change notes for fixed-port listeners that appeared on or left this Mac."""
     old_l, new_l = (old or {}).get("listening"), (new or {}).get("listening")
@@ -4954,6 +5055,12 @@ def diff_baseline(old, new, labels=None, critical=None):
             f"{old_cert[:16]}… -> {new_cert[:16]}…. The admin certificate is "
             "self-signed and stable, so this means it was re-issued or something "
             "is answering in the router's place.")
+
+    # The modem's identity, field by field, where both runs measured the
+    # field. Each gateway here is a Nest with no 443, so router_tls above has
+    # never compared anything on this deployment while the modem's certificate
+    # — the only one in the house — was printed and dropped every week.
+    notes.extend(diff_upstream_identity(old, new))
 
     # This Mac's listeners, by the same fingerprint the section prints them
     # under. The section always said "not in the baseline"; the diff never
@@ -8046,6 +8153,8 @@ RENDERED_STATE_KEYS = frozenset({
     "upnp_listeners",
     # How each port scan went (measured / blocked / filtered), beside its list.
     "router_scan", "upstream_scan",
+    # The modem's certificates and banners (host_identity).
+    "upstream_identity",
     # Bookkeeping written by carry_forward_unmeasured, not findings.
     "carried_forward", "measured_at",
     # Bookkeeping written by save_baseline: which devices this network has seen.
@@ -8487,6 +8596,23 @@ def generate_html_report(state, output_path=None):
             body = f"<p>{risk_badge('OK')} No open ports found on the upstream modem.</p>"
         sections_html += section("Upstream Modem Ports", body)
 
+    # The modem's identity: certificates and banners, recorded so a change
+    # between runs is a change line.
+    if "upstream_identity" in state:
+        identity = state["upstream_identity"] if isinstance(state["upstream_identity"], dict) else {}
+        rows = [[what[0].upper() + what[1:], _esc(describe_identity_field(field, identity[field]))]
+                for field, what in IDENTITY_FIELDS if isinstance(identity.get(field), str) and identity[field]]
+        if rows:
+            body = (table(["What the modem presented", "Value"], rows)
+                    + "<p>Recorded so a change between runs is visible: a different certificate "
+                    "or banner means the modem was re-issued, replaced, or something is "
+                    "answering in its place.</p>")
+        else:
+            body = (f"<p>{risk_badge('REVIEW')} Nothing identifying the upstream modem could "
+                    "be read this run (no certificate, SSH banner or UPnP banner), so there is "
+                    "nothing to compare against next run.</p>")
+        sections_html += section("Upstream Modem Identity", body)
+
     # What an open port 1900 turned out to be
     listeners = state.get("upnp_listeners")
     if isinstance(listeners, dict) and listeners:
@@ -8732,9 +8858,11 @@ def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
     was classified as — so that a later network can say "same as from there"
     instead of repeating the section.
 
-    Returns {"ports", "upnp_state", "network", "age_min"} or None. None whenever
-    the reference cannot honestly be called the same report: unreadable, no
-    modem scan in it, about this very network, or older than an hour.
+    Returns {"ports", "upnp_state", "identity", "network", "age_min"} or None.
+    None whenever the reference cannot honestly be called the same report:
+    unreadable, no modem scan in it, about this very network, or older than an
+    hour. `identity` is what that network read of the modem's certificates
+    and banners (host_identity), or None when it read nothing or carried it.
 
     The file is NOT trusted for anything the reader will see. The ports printed
     are always the ones this run measured; the reference can only make the
@@ -8767,14 +8895,21 @@ def load_upstream_reference(path, upstream_ip, current_subnet=None, now=None):
     verdict = listeners.get(upstream_ip) if isinstance(listeners, dict) else None
     upnp_state = verdict.get("state") if isinstance(verdict, dict) else None
     name = network_name_for_subnet(subnet, load_networks()) if subnet else ""
+    identity = state.get("upstream_identity")
+    if not (isinstance(identity, dict) and identity) \
+            or "upstream_identity" in (state.get("carried_forward") or []):
+        identity = None
+    else:
+        identity = {k: v for k, v in identity.items() if isinstance(k, str) and isinstance(v, str)}
     return {"ports": sorted(ports),
             "upnp_state": upnp_state if isinstance(upnp_state, str) else None,
+            "identity": identity,
             "network": _device_name_text(name or subnet or "an earlier network", 40),
             "age_min": int((now - stamp).total_seconds() // 60)}
 
 
 def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, reference=None,
-               outcomes=None):
+               outcomes=None, identities=None):
     """Port-scan one host, print a risk-annotated summary, and return open ports.
 
     Shared by action_port_scan and action_full_audit (previously duplicated).
@@ -8795,10 +8930,16 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
 
     `reference` (see load_upstream_reference) is what an earlier network in the
     same report found on this host. When this scan agrees with it — the same
-    open ports and the same verdict on port 1900 — the section is printed in
-    brief: the measured ports, every line rated above INFO, the certificate, and
-    a pointer to the full section. Everything is still measured and returned;
-    any disagreement at all prints the section in full, with a note saying so.
+    open ports, the same verdict on port 1900 and the same identity — the
+    section is printed in brief: the measured ports, every line rated above
+    INFO, the certificate, and a pointer to the full section. Everything is
+    still measured and returned; any disagreement at all prints the section in
+    full, with a note saying so.
+
+    If `identities` is a dict, the host's identity (host_identity: certificate
+    digests on 443 and 8443, the SSH banner, the UPnP server banner) is stored
+    in it under the host's address, so the caller can seal it beside the ports
+    and the next run can compare it.
     """
     port_set = range(1, 65536) if full_scan else COMMON_PORTS
     n = "all 65535" if full_scan else str(len(COMMON_PORTS))
@@ -8858,14 +8999,25 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
         if verdicts is not None:
             verdicts[host] = verdict
 
+    # The host's identity, measured before the brief decision because it is
+    # part of it: a modem that answers one network with a different
+    # certificate than another is the finding, not the repetition.
+    tls = check_tls(host)
+    identity = host_identity(host, open_ports, verdict, tls)
+    if identities is not None:
+        identities[host] = identity
+
     brief = False
     if isinstance(reference, dict):
         same_ports = sorted(open_ports) == reference.get("ports")
         same_upnp = (verdict or {}).get("state") == reference.get("upnp_state")
-        brief = same_ports and same_upnp
+        ref_identity = reference.get("identity")
+        same_identity = not isinstance(ref_identity, dict) or ref_identity == identity
+        brief = same_ports and same_upnp and same_identity
         if brief:
             print(f"  The same open ports"
                   + (f", and the same verdict on port 1900 ({verdict['state']})," if verdict else "")
+                  + (", and the same certificate and banners," if isinstance(ref_identity, dict) else "")
                   + f" as seen from {reference['network']} "
                   f"{reference['age_min']} min ago. The full section is under that network;")
             print("  below are only the lines rated above INFO, measured again from here.")
@@ -8875,13 +9027,23 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
             # sees nothing, every week — so rating the difference would mint a
             # permanent false flag. What is worth an alarm is this network's view
             # CHANGING, and its own baseline comparison already watches for that.
-            what = "open ports" if not same_ports else "verdict on port 1900"
+            what = ("open ports" if not same_ports else "verdict on port 1900" if not same_upnp
+                    else "identity (certificates and banners)")
             print(f"  Note: the {what} seen from here differ from what {reference['network']} "
                   f"saw {reference['age_min']} min ago")
             print(f"  ({reference['ports']}"
                   + (f", port 1900 {reference['upnp_state']}" if reference.get("upnp_state") else "")
                   + "), so this section is printed in full. A guest network that is")
             print("  isolated from the modem is expected to differ.")
+            if not same_identity:
+                # Printed in full, both sides: the same modem presenting two
+                # certificates to two networks is interception's signature.
+                for field, what in IDENTITY_FIELDS:
+                    was, now = ref_identity.get(field), identity.get(field)
+                    if was != now:
+                        print(f"  {what} from {reference['network']}: "
+                              f"{describe_identity_field(field, was) if was else '(not read)'}; "
+                              f"from here: {describe_identity_field(field, now) if now else '(not read)'}")
 
     for p in open_ports:
         svc, risk, note = PORTS_OF_INTEREST.get(
@@ -8897,11 +9059,16 @@ def audit_host(label, host, full_scan=False, onlink=None, verdicts=None, referen
         if brief and risk == "INFO":
             continue
         print(f"  [{risk:6}] {p:>5}  {svc:<14} {note}")
-    tls = check_tls(host)
     if tls.get("sha256"):
         print(f"  HTTPS (TLS) certificate: present, sha256 {tls['sha256'][:16]}…")
     else:
         print(f"  HTTPS (TLS) certificate present: {tls.get('present')}")
+    if not brief:
+        # The rest of the identity, recorded so a change between runs is a
+        # change line rather than two prefixes forty lines apart in the log.
+        for field, what in IDENTITY_FIELDS[1:]:
+            if identity.get(field):
+                print(f"  {what[0].upper() + what[1:]}: {describe_identity_field(field, identity[field])}")
     if open_ports and 80 in open_ports and 443 not in open_ports:
         print("  Note: port 80 open without 443. App-managed mesh systems")
         print("  (Google Nest, eero) use 80/5000 locally — not a web admin panel.")
@@ -9690,6 +9857,8 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
     # answered). Sealed beside the port lists, so a baseline whose port list
     # was carried forward from an earlier run also says why.
     scan_outcomes = {}
+    # What the modem presented: certificates and banners (host_identity).
+    identities = {}
     if gateway:
         state["router_open_ports"] = audit_host(
             "default gateway", gateway, full_scan,
@@ -9704,8 +9873,12 @@ def action_full_audit(full_scan=False, no_vendors=False, no_speedtest=False,
             onlink=is_onlink(upstream_ip, interfaces), verdicts=upnp_listeners,
             reference=(load_upstream_reference(upstream_reference, upstream_ip, _subnet)
                        if upstream_reference else None),
-            outcomes=scan_outcomes)
+            outcomes=scan_outcomes, identities=identities)
         state["upstream_scan"] = scan_outcomes.get(upstream_ip)
+        # Empty when nothing was read (a filtered or blocked scan, or no port
+        # carrying an identity open): carry_forward_unmeasured keeps the last
+        # reading then, as it does for the port list.
+        state["upstream_identity"] = identities.get(upstream_ip) or {}
     if upnp_listeners:
         state["upnp_listeners"] = upnp_listeners
 
