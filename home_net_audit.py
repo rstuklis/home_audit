@@ -5929,12 +5929,30 @@ def _upnp_url_points_at(url, gateway):
     return parts.scheme in ("http", "https") and parts.hostname == gateway
 
 
+# The budget for the whole exchange after discovery: one description fetch and
+# up to a hundred SOAP calls. Each call is bounded on its own by _http_plain;
+# this bounds their sum, so a gateway that answers each one slowly cannot hold
+# the audit for a hundred times the per-call budget.
+UPNP_MAPPINGS_TOTAL_SECONDS = 40.0
+
+
 def get_upnp_port_mappings(gateway):
     """
     Discover the UPnP (Universal Plug and Play) control URL via SSDP
     (Simple Service Discovery Protocol), then query all port mappings.
-    Returns (mappings_list, error_string).
+    Returns (mappings_list, note). The note is an error when the list is
+    empty, and a caveat (the list was cut short) when it is not.
     Each mapping: {ext_port, protocol, int_ip, int_port, description, enabled}
+
+    The description and every SOAP reply are fetched with _http_get_plain and
+    _http_post_plain — a byte cap, a wall-clock budget per exchange, no
+    redirects, no proxy — and the loop as a whole runs under one deadline.
+    This path used raw urllib with a per-operation timeout and an unbounded
+    read, the slow-loris exposure its two siblings were rebuilt without: a
+    device answering the audit's own M-SEARCH as the gateway could serve the
+    description a byte every few seconds, or as a multi-gigabyte body, and
+    hold the audit here, before the baseline, the report and the email, with
+    no abort line and no next run. Only plain http on the gateway is followed.
     """
     # Step 1: SSDP M-SEARCH to find the UPnP root device
     SSDP_ADDR = "239.255.255.250"
@@ -5991,13 +6009,35 @@ def get_upnp_port_mappings(gateway):
                     "not an http(s) address on the gateway itself. Not followed, so "
                     "port mappings were not read.")
 
+    def _plain_http_target(url):
+        """(port, path) for a plain-http URL on the gateway, else None."""
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "http":
+            return None
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        return parts.port or 80, path
+
+    target = _plain_http_target(location)
+    if target is None:
+        return [], (f"The UPnP reply from {gateway} pointed at {_banner_text(location, 120)}; only "
+                    "plain http on the gateway is fetched. Not followed, so port mappings "
+                    "were not read.")
+    deadline = time.monotonic() + UPNP_MAPPINGS_TOTAL_SECONDS
+
+    def _budget():
+        return min(HTTP_GET_TOTAL_SECONDS, deadline - time.monotonic())
+
     # Step 2: Fetch the device description XML to find the control URL
-    try:
-        req = urllib.request.Request(location, headers={"User-Agent": "home_net_audit"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            xml = r.read().decode("utf-8", "ignore")
-    except Exception as e:
-        return [], f"Could not fetch UPnP device description: {_banner_text(str(e), 160)}"
+    desc_port, desc_path = target
+    got = _http_get_plain(gateway, desc_port, desc_path, total=_budget())
+    if got is None:
+        return [], (f"Could not fetch UPnP device description: no HTTP answer from "
+                    f"{gateway}:{desc_port}{_banner_text(desc_path, 80)} within the time allowed")
+    status, _server, xml = got
+    if status != 200:
+        return [], f"Could not fetch UPnP device description: HTTP {status}"
 
     # Extract base URL and control URL
     base_url_m = re.match(r"(https?://[^/]+)", location)
@@ -6014,9 +6054,16 @@ def get_upnp_port_mappings(gateway):
     if not _upnp_url_points_at(ctrl_url, gateway):
         return [], (f"The UPnP description named a control URL at {_banner_text(ctrl_url, 120)}, which is "
                     "not on the gateway. Not followed, so port mappings were not read.")
+    ctrl_target = _plain_http_target(ctrl_url)
+    if ctrl_target is None:
+        return [], (f"The UPnP description named a control URL at {_banner_text(ctrl_url, 120)}; only "
+                    "plain http on the gateway is fetched. Not followed, so port mappings "
+                    "were not read.")
+    ctrl_port, ctrl_path = ctrl_target
 
     # Step 3: GetGenericPortMappingEntry in a loop
     mappings = []
+    truncated = False
     soap_tpl = """<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -6028,24 +6075,19 @@ def get_upnp_port_mappings(gateway):
 </s:Envelope>"""
 
     for i in range(100):  # cap at 100 mappings
-        body = soap_tpl.format(index=i).encode()
-        req = urllib.request.Request(
-            ctrl_url, data=body,
-            headers={
-                "Content-Type": "text/xml; charset=utf-8",
-                "SOAPAction": '"urn:schemas-upnp-org:service:WANIPConnection:1#GetGenericPortMappingEntry"',
-                "User-Agent": "home_net_audit",
-            }
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                resp = r.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as e:
-            if e.code in (500, 501):
-                break  # no more entries
+        if _budget() <= 0:
+            truncated = True
             break
-        except Exception:
+        got = _http_post_plain(
+            gateway, ctrl_port, ctrl_path, soap_tpl.format(index=i),
+            {"Content-Type": "text/xml; charset=utf-8",
+             "SOAPAction": '"urn:schemas-upnp-org:service:WANIPConnection:1#GetGenericPortMappingEntry"'},
+            total=_budget())
+        if got is None:
             break
+        status, _server, resp = got
+        if status >= 400:
+            break  # 500 is how most stacks say "no more entries"; anything else ends it too
 
         if "SpecifiedArrayIndexInvalid" in resp or "InvalidIndex" in resp:
             break
@@ -6070,6 +6112,9 @@ def get_upnp_port_mappings(gateway):
             "enabled":     xtag("NewEnabled", resp),
         })
 
+    if truncated:
+        return mappings, (f"Stopped after {len(mappings)} mapping(s): the gateway took longer than "
+                          f"{UPNP_MAPPINGS_TOTAL_SECONDS:.0f}s to answer, so the list may be incomplete.")
     return mappings, None
 
 
@@ -6608,7 +6653,7 @@ def action_upnp_dump():
     print(f"  Querying UPnP on gateway {gateway} via SSDP...")
     mappings, err = get_upnp_port_mappings(gateway)
 
-    if err:
+    if err and not mappings:
         print(f"  [INFO] {err}")
         return {"mappings": [], "note": err}
 
@@ -6636,6 +6681,11 @@ def action_upnp_dump():
 
     print("\n  Note: Each mapping above is a hole punched through your router to an")
     print("  internal device. Review any you don't recognise — malware can add these.")
+    if err:
+        # Some mappings were read before the budget ran out: they are kept,
+        # and the reader is told the list may not be the whole table.
+        print(f"  [REVIEW] {err}")
+        return {"mappings": mappings, "note": err}
     return {"mappings": mappings}
 
 

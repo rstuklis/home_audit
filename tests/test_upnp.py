@@ -9,11 +9,13 @@ and the HTTP calls) and assert on what the parser extracts and when it stops.
 
 Each returned mapping is a hole punched through the router's NAT, so a parse
 error here either invents a hole that isn't there or hides one that is.
+
+The HTTP stage is _http_get_plain / _http_post_plain — the bounded helpers the
+other two UPnP fetchers use — and not urllib: the sandbox forbids urlopen, so a
+test here reaching it would escape rather than pass.
 """
 
 import socket
-import urllib.error
-import urllib.request
 
 import pytest
 
@@ -81,30 +83,30 @@ class _FakeSsdpSocket:
     def close(self): pass
 
 
-class _Resp:
-    def __init__(self, body):
-        self._body = body.encode()
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
-    def read(self): return self._body
-
-
 def _wire(monkeypatch, mod, ssdp_reply, http):
-    """Wire up both I/O stages.
+    """Wire up both I/O stages. Returns the list of HTTP exchanges made.
 
     `ssdp_reply` is the text of the SSDP datagram (or None for no responder).
-    `http` is a callable (url, req) -> body-string, or it may raise
-    urllib.error.HTTPError to drive the loop-termination branch.
+    `http` is a callable (url, body) -> body-string, or -> (status, body-string)
+    to drive the loop-termination branches. Each exchange is recorded as
+    {"url", "body", <the keyword arguments the code passed>}.
     """
     monkeypatch.setattr(mod.socket, "socket",
                         lambda *a, **k: _FakeSsdpSocket(ssdp_reply))
+    calls = []
 
-    def fake_urlopen(req, timeout=None):
-        url = req.full_url if hasattr(req, "full_url") else req
-        body = http(url, req)
-        return _Resp(body)
+    def answer(host, port, path, body, kwargs):
+        url = f"http://{host}:{port}{path}"
+        calls.append({"url": url, "body": body, **kwargs})
+        reply = http(url, body)
+        status, text = reply if isinstance(reply, tuple) else (200, reply)
+        return status, "fake-server", text
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mod, "_http_get_plain",
+                        lambda host, port, path, **k: answer(host, port, path, None, k))
+    monkeypatch.setattr(mod, "_http_post_plain",
+                        lambda host, port, path, body, headers, **k: answer(host, port, path, body, k))
+    return calls
 
 
 SSDP_OK = ("HTTP/1.1 200 OK\r\n"
@@ -276,12 +278,105 @@ class TestMappingParse:
             if state["n"] == 0:
                 state["n"] += 1
                 return _mapping_soap("21", "TCP", "192.168.1.9", "21", "ftp", "1")
-            raise urllib.error.HTTPError(url, 500, "Internal Error", {}, None)
+            return (500, "<s:Fault/>")
 
         _wire(monkeypatch, mod, SSDP_OK, http)
         mappings, _ = mod.get_upnp_port_mappings("192.168.1.1")
         assert len(mappings) == 1
         assert mappings[0]["description"] == "ftp"
+
+    def test_no_http_answer_at_all_ends_the_loop_with_what_was_read(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, SSDP_OK, lambda u, b: DESC_XML if u.endswith("/desc.xml")
+              else _mapping_soap("21", "TCP", "192.168.1.9", "21", "ftp", "1"))
+        monkeypatch.setattr(mod, "_http_post_plain", lambda *a, **k: None)
+        mappings, note = mod.get_upnp_port_mappings("192.168.1.1")
+        assert mappings == [] and note is None
+
+
+class TestTheFetchesAreBounded:
+    """Round 4, F9. The description and up to a hundred SOAP replies were read
+    with urllib: a per-operation timeout that a peer dripping one byte every
+    few seconds never trips, an unbounded read, and redirects followed to any
+    host — the slow-loris class rounds 2 and 3 rebuilt the other two UPnP
+    fetchers without. This path runs before the baseline, the report and the
+    email, so one such answer to the audit's own M-SEARCH suppressed the week.
+    """
+
+    def _serve(self, monkeypatch, mod, entries=2):
+        state = {"n": 0}
+
+        def http(url, body):
+            if url.endswith("/desc.xml"):
+                return DESC_XML
+            i, state["n"] = state["n"], state["n"] + 1
+            if i < entries:
+                return _mapping_soap(str(8000 + i), "TCP", "192.168.1.50", "80", f"m{i}", "1")
+            return INVALID_INDEX_SOAP
+        return _wire(monkeypatch, mod, SSDP_OK, http)
+
+    def test_every_exchange_goes_through_the_bounded_helpers_not_urllib(self, mod, monkeypatch):
+        # The sandbox forbids urlopen outright, so reaching it would raise
+        # EscapedSandbox here rather than quietly pass.
+        calls = self._serve(monkeypatch, mod)
+        mappings, note = mod.get_upnp_port_mappings("192.168.1.1")
+        assert len(mappings) == 2 and note is None
+        assert [c["url"] for c in calls] == ["http://192.168.1.1:5000/desc.xml"] + ["http://192.168.1.1:5000/ctl/IPConn"] * 3
+        assert all(c["body"] is None for c in calls[:1]) and all("GetGenericPortMappingEntry" in c["body"] for c in calls[1:])
+
+    def test_each_exchange_carries_a_wall_clock_budget_no_larger_than_the_helpers_default(self, mod, monkeypatch):
+        calls = self._serve(monkeypatch, mod)
+        mod.get_upnp_port_mappings("192.168.1.1")
+        assert calls and all(0 < c["total"] <= mod.HTTP_GET_TOTAL_SECONDS for c in calls)
+
+    def test_the_whole_loop_runs_under_one_deadline(self, mod, monkeypatch):
+        # A gateway that answers every SOAP call just inside the per-call
+        # budget used to hold the audit for a hundred of them. The clock here
+        # advances 15 s per exchange against a 40 s budget.
+        clock = {"now": 1000.0}
+
+        def monotonic():
+            clock["now"] += 15.0
+            return clock["now"]
+        monkeypatch.setattr(mod.time, "monotonic", monotonic)
+        monkeypatch.setattr(mod, "UPNP_MAPPINGS_TOTAL_SECONDS", 40.0)
+        calls = self._serve(monkeypatch, mod, entries=50)
+        mappings, note = mod.get_upnp_port_mappings("192.168.1.1")
+        assert len(calls) < 6, "the loop must stop at the deadline, not at the hundredth entry"
+        assert mappings, "what was read before the deadline is kept"
+        assert note and "may be incomplete" in note and str(len(mappings)) in note
+        assert all(c["total"] <= mod.HTTP_GET_TOTAL_SECONDS for c in calls)
+
+    def test_an_https_location_on_the_gateway_is_not_followed(self, mod, monkeypatch):
+        # The bounded helper speaks plain http only, like its siblings; a
+        # LOCATION that would need TLS is reported rather than fetched by
+        # some other means.
+        reply = ("HTTP/1.1 200 OK\r\nLOCATION: https://192.168.1.1/desc.xml\r\n\r\n")
+        _wire(monkeypatch, mod, [(reply, ("192.168.1.1", 1900))],
+              lambda u, b: pytest.fail(f"must not fetch {u}"))
+        mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
+        assert mappings == [] and "not followed" in err.lower()
+
+    def test_a_description_that_is_not_200_is_an_error_not_a_parse(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, SSDP_OK, lambda u, b: (404, "<html>nope</html>"))
+        mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
+        assert mappings == [] and "HTTP 404" in err
+
+    def test_a_description_that_never_answers_is_an_error(self, mod, monkeypatch):
+        _wire(monkeypatch, mod, SSDP_OK, lambda u, b: "")
+        monkeypatch.setattr(mod, "_http_get_plain", lambda *a, **k: None)
+        mappings, err = mod.get_upnp_port_mappings("192.168.1.1")
+        assert mappings == [] and "within the time allowed" in err
+
+    def test_the_dump_keeps_a_cut_short_list_and_says_so(self, mod, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "get_default_gateway", lambda: "192.168.1.1")
+        monkeypatch.setattr(mod, "get_upnp_port_mappings", lambda gw: (
+            [{"ext_port": "443", "protocol": "TCP", "int_ip": "192.168.1.50", "int_port": "443",
+              "description": "cam", "enabled": "1"}],
+            "Stopped after 1 mapping(s): the gateway took longer than 40s to answer, so the list may be incomplete."))
+        result = mod.action_upnp_dump()
+        out = capsys.readouterr().out
+        assert len(result["mappings"]) == 1 and "may be incomplete" in result["note"]
+        assert "443" in out and "[REVIEW] Stopped after 1 mapping(s)" in out
 
 
 class TestSsdpRefusedIsNotAnAbsentRouter:
