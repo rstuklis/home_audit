@@ -1215,37 +1215,112 @@ def check_tls(host, port=443):
 # Interception detection
 # ---------------------------------------------------------------------------
 
-def check_trust_store():
-    """List admin-added trust settings on macOS.
+TRUST_ROOT_RESULTS = ("kSecTrustSettingsResultTrustRoot", "kSecTrustSettingsResultTrustAsRoot")
+TRUST_DOMAINS = ("admin", "user")
 
-    A clean Mac has none: `security dump-trust-settings -d` prints a "No Trust
-    Settings" line and nothing else. Installing a root CA is how TLS
-    interception is set up in practice, so anything here is worth reading —
-    this is one of very few endpoint signals that is both cheap and unambiguous.
+
+def parse_trust_settings(out):
+    """[{name, results}] from `security dump-trust-settings` output.
+
+    None when nothing readable came back (the command failed or printed
+    nothing); [] when it said there are no trust settings. Each entry is one
+    "Cert N:" block with the result types its trust settings carry, in the
+    form the command prints them (kSecTrustSettingsResultTrustRoot, ...).
+    Older output spelled the result "Result = ..."; current output "Result
+    Type : ..."; both are read.
+    """
+    text = out or ""
+    if not text.strip():
+        return None
+    if "no trust settings" in text.lower():
+        return []
+    entries = []
+    current = None
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"(?i)^cert\s+\d+\s*:\s*(.*)$", s)
+        if m:
+            current = {"name": _banner_text(m.group(1), 80) or "(unnamed)", "results": []}
+            entries.append(current)
+            continue
+        m = re.match(r"(?i)^result(?:\s+type)?\s*[:=]\s*(\S+)", s)
+        if m and current is not None and m.group(1) not in current["results"]:
+            current["results"].append(m.group(1))
+    return entries
+
+
+def _trust_result_names(results):
+    return "/".join(r.replace("kSecTrustSettingsResult", "") for r in results) or "no result type"
+
+
+def check_trust_store():
+    """List added trust settings on macOS, in BOTH trust domains.
+
+    A clean Mac has none: `security dump-trust-settings` prints a "No Trust
+    Settings" line and nothing else, for the admin domain (-d) and for the
+    user domain alike. Installing a root CA is how TLS interception is set up
+    in practice, so anything here is worth reading — this is one of very few
+    endpoint signals that is both cheap and unambiguous.
+
+    The user domain is the one that matters most and the one this check used
+    to skip. -d selects the admin domain, which needs sudo to change and is
+    empty on most Macs. Overrides added by a non-root process — Keychain
+    Access "Always Trust", `security add-trusted-cert` into login.keychain,
+    Safari's trust-anyway, a mkcert or mitmproxy install for one user — live
+    in the user domain, and CFNetwork, Safari, Chrome and curl honour a
+    TrustRoot override there for that user. So a root planted without a
+    password read as "the expected state" every week; on the Mac this was
+    written on, the user domain already held 21 overrides the audit could not
+    see. Every entry is labelled with its domain; any entry granting root
+    trust (TrustRoot or TrustAsRoot) in either domain is HIGH; the structured
+    list (`overrides`) is what diff_baseline compares, so a newly added
+    setting is a change.
 
     Host-posture, so it is macOS-only by the same rule as the firewall and
     sharing checks: on an observer it would describe the wrong machine.
     """
     if sys.platform != "darwin":
-        return {"supported": False, "entries": [], "risk": "INFO",
-                "note": "Trust-store inspection is macOS-only; skipped here."}
+        return {"supported": False, "entries": [], "overrides": [], "domains": {},
+                "risk": "INFO", "note": "Trust-store inspection is macOS-only; skipped here."}
 
-    out = run(["security", "dump-trust-settings", "-d"], timeout=10,
-              merge_stderr=True)
-    if not out.strip():
-        return {"supported": True, "entries": [], "risk": "REVIEW",
-                "note": "Could not read the admin trust settings."}
-    if "no trust settings" in out.lower():
-        return {"supported": True, "entries": [], "risk": "OK",
-                "note": "No admin-added trust settings — the expected state."}
+    parsed = {
+        "admin": parse_trust_settings(run(["security", "dump-trust-settings", "-d"],
+                                          timeout=10, merge_stderr=True)),
+        "user": parse_trust_settings(run(["security", "dump-trust-settings"],
+                                         timeout=10, merge_stderr=True)),
+    }
+    domains = {d: parsed[d] is not None for d in TRUST_DOMAINS}
+    overrides = [{"domain": d, "name": e["name"], "results": list(e["results"])}
+                 for d in TRUST_DOMAINS for e in (parsed[d] or [])]
+    entries = [f"{o['domain']} domain, {_trust_result_names(o['results'])}: {o['name']}"
+               for o in overrides]
+    result = {"supported": True, "entries": entries, "overrides": overrides, "domains": domains}
 
-    entries = [ln.strip() for ln in out.splitlines()
-               if ln.strip().lower().startswith("cert ")]
-    return {"supported": True, "entries": entries, "risk": "HIGH",
-            "note": f"{len(entries) or 'Some'} admin-added trust setting(s) present. "
-                    "A root certificate installed here lets whoever holds its key "
-                    "read TLS traffic from this machine without a warning. Confirm "
-                    "every one of these is yours."}
+    unreadable = [d for d in TRUST_DOMAINS if not domains[d]]
+    root = [o for o in overrides if any(r in TRUST_ROOT_RESULTS for r in o["results"])]
+    if unreadable:
+        which = " and ".join(f"{d} domain" for d in unreadable)
+        extra = (f" The {' and '.join(d for d in TRUST_DOMAINS if domains[d])} domain was read and holds "
+                 f"{len(overrides)} setting(s){', ' + str(len(root)) + ' granting root trust' if root else ''}."
+                 if any(domains.values()) else "")
+        result.update(risk="REVIEW",
+                      note=f"Could not read the {which} trust settings.{extra}")
+    elif root:
+        by_domain = {d: sum(1 for o in root if o["domain"] == d) for d in TRUST_DOMAINS}
+        result.update(risk="HIGH",
+                      note=f"{len(root)} trust setting(s) grant root trust: {by_domain['admin']} in the "
+                           f"admin domain, {by_domain['user']} in the user domain (which needs no "
+                           "password to add to). A root certificate trusted here lets whoever holds "
+                           "its key read TLS traffic from this machine without a warning. Confirm "
+                           "every one of these is yours.")
+    elif overrides:
+        result.update(risk="REVIEW",
+                      note=f"{len(overrides)} trust setting(s) present, none of them granting root "
+                           "trust. Confirm they are yours.")
+    else:
+        result.update(risk="OK",
+                      note="No added trust settings in the admin or the user domain — the expected state.")
+    return result
 
 
 def build_dns_query(name="example.com", qid=0x4a4a):
@@ -4496,6 +4571,46 @@ def describe_unconfirmed_listeners(old, new):
     return "\n".join(lines) if lines else None
 
 
+def _trust_overrides(state):
+    trust = ((state or {}).get("interception") or {}).get("trust_store")
+    return trust if isinstance(trust, dict) else None
+
+
+def diff_trust_store(old, new):
+    """Change notes for trust settings added or removed between two runs."""
+    old_t, new_t = _trust_overrides(old), _trust_overrides(new)
+    if not (old_t and new_t and isinstance(old_t.get("overrides"), list)
+            and isinstance(new_t.get("overrides"), list)):
+        return []
+    readable = {d for d in TRUST_DOMAINS
+                if (old_t.get("domains") or {}).get(d) and (new_t.get("domains") or {}).get(d)}
+
+    def keyed(entries):
+        out = set()
+        for o in entries:
+            if isinstance(o, dict) and o.get("domain") in readable:
+                results = tuple(r for r in (o.get("results") or []) if isinstance(r, str))
+                out.add((str(o.get("domain")), _banner_text(o.get("name"), 80), results))
+        return out
+
+    def describe(key):
+        domain, name, results = key
+        return f"{name} ({domain} domain, {_trust_result_names(results)})"
+
+    was, now = keyed(old_t["overrides"]), keyed(new_t["overrides"])
+    notes = []
+    added, removed = sorted(now - was), sorted(was - now)
+    if added:
+        notes.append("NEW trust-store override(s) on this Mac since baseline: "
+                     + "; ".join(describe(k) for k in added)
+                     + ". A root trusted here lets whoever holds its key read this machine's "
+                     "TLS traffic without a warning; the user domain needs no password to add to.")
+    if removed:
+        notes.append("Trust-store override(s) removed on this Mac since baseline: "
+                     + "; ".join(describe(k) for k in removed))
+    return notes
+
+
 def diff_baseline(old, new, labels=None, critical=None):
     notes = []
     # Randomised addresses are compared as a population, not as identities.
@@ -4761,6 +4876,15 @@ def diff_baseline(old, new, labels=None, critical=None):
             f"{old_cert[:16]}… -> {new_cert[:16]}…. The admin certificate is "
             "self-signed and stable, so this means it was re-issued or something "
             "is answering in the router's place.")
+
+    # The trust store is this Mac's, not the network's, but a root added to it
+    # is how TLS interception of this Mac is set up, and the section's own
+    # rating repeats every week once an entry is there: only a comparison
+    # says WHEN one arrived. Compared by (domain, name, result types) over the
+    # domains both runs could read; a baseline written before the structured
+    # list existed is not compared, so the first run after the upgrade
+    # establishes it rather than reporting every entry as new.
+    notes.extend(diff_trust_store(old, new))
 
     # Routers are compared by MAC where both sides recorded one. A router at a
     # new link-local address with a MAC the baseline knows is the same router,

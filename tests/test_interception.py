@@ -23,7 +23,8 @@ import pytest
 
 from conftest import make_run
 
-SECURITY_CMD = "security dump-trust-settings -d"
+SECURITY_CMD = "security dump-trust-settings -d"          # the admin domain
+USER_CMD = "security dump-trust-settings"                 # the user domain (no -d)
 CLEAN = "No Trust Settings were found.\n"
 DIRTY = (
     "Number of trusted certs = 1\n"
@@ -32,6 +33,39 @@ DIRTY = (
     "   Trust Setting 0:\n"
     "      Result = kSecTrustSettingsResultTrustRoot\n"
 )
+# What the current `security` prints for a user-domain override: the form a
+# Keychain Access "Always Trust" click or `security add-trusted-cert` leaves.
+USER_DIRTY = (
+    "Number of trusted certs = 2\n"
+    "Cert 0: tplinkmodem.net\n"
+    "   Number of trust settings : 2\n"
+    "   Trust Setting 0:\n"
+    "      Policy OID            : SSL\n"
+    "      Allowed Error         : CSSMERR_TP_CERT_EXPIRED\n"
+    "      Result Type           : kSecTrustSettingsResultTrustAsRoot\n"
+    "   Trust Setting 1:\n"
+    "      Policy OID            : SSL\n"
+    "      Allowed Error         : Host name mismatch\n"
+    "      Result Type           : kSecTrustSettingsResultTrustAsRoot\n"
+    "Cert 1: mitmproxy\n"
+    "   Number of trust settings : 1\n"
+    "   Trust Setting 0:\n"
+    "      Result Type           : kSecTrustSettingsResultTrustRoot\n"
+)
+USER_DENY = (
+    "Number of trusted certs = 1\n"
+    "Cert 0: Some Distrusted CA\n"
+    "   Number of trust settings : 1\n"
+    "   Trust Setting 0:\n"
+    "      Result Type           : kSecTrustSettingsResultDeny\n"
+)
+
+
+def trust_run(admin=CLEAN, user=CLEAN):
+    """A `run` fake answering both trust-settings commands. Exact matches win
+    in make_run, so the user-domain command (no -d) does not also match the
+    admin one."""
+    return make_run({SECURITY_CMD: admin, USER_CMD: user})
 
 
 class TestCertificateFingerprint:
@@ -115,14 +149,14 @@ class TestCertificateChangeIsDiffed:
 class TestTrustStore:
     def test_a_clean_mac_reports_ok(self, mod, monkeypatch):
         monkeypatch.setattr(mod.sys, "platform", "darwin")
-        monkeypatch.setattr(mod, "run", make_run({SECURITY_CMD: CLEAN}))
+        monkeypatch.setattr(mod, "run", trust_run())
         result = mod.check_trust_store()
         assert result["risk"] == "OK"
         assert result["entries"] == []
 
     def test_an_admin_added_root_is_high(self, mod, monkeypatch):
         monkeypatch.setattr(mod.sys, "platform", "darwin")
-        monkeypatch.setattr(mod, "run", make_run({SECURITY_CMD: DIRTY}))
+        monkeypatch.setattr(mod, "run", trust_run(admin=DIRTY))
         result = mod.check_trust_store()
         assert result["risk"] == "HIGH"
         assert any("Corporate Proxy Root CA" in e for e in result["entries"])
@@ -135,6 +169,132 @@ class TestTrustStore:
         result = mod.check_trust_store()
         assert result["risk"] == "REVIEW"
         assert result["risk"] != "OK"
+
+
+class TestBothTrustDomainsAreRead:
+    """Round 4, F10. `-d` selects the ADMIN domain, which needs sudo to change
+    and is empty on most Macs. A root installed by a non-root process — a
+    Keychain Access "Always Trust", `security add-trusted-cert` into the login
+    keychain, a mkcert or mitmproxy install — lives in the USER domain, which
+    Safari, Chrome and curl honour for that user, and which the check never
+    read: a root planted without a password was "the expected state" weekly.
+    """
+
+    def test_both_commands_are_issued(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        fake = trust_run()
+        monkeypatch.setattr(mod, "run", fake)
+        mod.check_trust_store()
+        assert SECURITY_CMD in fake.calls and USER_CMD in fake.calls
+
+    def test_a_user_domain_root_is_high_and_labelled_by_domain(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", trust_run(user=USER_DIRTY))
+        result = mod.check_trust_store()
+        assert result["risk"] == "HIGH"
+        assert "user domain, TrustAsRoot: tplinkmodem.net" in result["entries"]
+        assert "user domain, TrustRoot: mitmproxy" in result["entries"]
+        assert "2 in the user domain" in result["note"] and "0 in the admin domain" in result["note"]
+        assert result["domains"] == {"admin": True, "user": True}
+
+    def test_the_structured_list_carries_domain_name_and_result_types(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", trust_run(admin=DIRTY, user=USER_DIRTY))
+        overrides = mod.check_trust_store()["overrides"]
+        assert {"domain": "admin", "name": "Corporate Proxy Root CA",
+                "results": ["kSecTrustSettingsResultTrustRoot"]} in overrides
+        assert {"domain": "user", "name": "tplinkmodem.net",
+                "results": ["kSecTrustSettingsResultTrustAsRoot"]} in overrides
+        assert len(overrides) == 3
+
+    def test_an_override_that_grants_no_root_trust_is_review(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", trust_run(user=USER_DENY))
+        result = mod.check_trust_store()
+        assert result["risk"] == "REVIEW" and "none of them granting root trust" in result["note"]
+        assert result["entries"] == ["user domain, Deny: Some Distrusted CA"]
+
+    def test_an_unreadable_user_domain_is_review_even_when_the_admin_domain_is_clean(self, mod, monkeypatch):
+        # Reading the admin domain alone is exactly the blindness being fixed.
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", make_run({SECURITY_CMD: CLEAN}))
+        result = mod.check_trust_store()
+        assert result["risk"] == "REVIEW" and "user domain" in result["note"]
+        assert result["domains"] == {"admin": True, "user": False}
+
+    def test_what_the_readable_domain_found_is_still_said(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", trust_run(admin="", user=USER_DIRTY))
+        result = mod.check_trust_store()
+        assert result["risk"] == "REVIEW"
+        assert "admin domain" in result["note"] and "2 granting root trust" in result["note"]
+        assert len(result["overrides"]) == 2
+
+    def test_a_certificate_name_cannot_forge_a_report_line(self, mod, monkeypatch):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        hostile = DIRTY.replace("Corporate Proxy Root CA", "x\n  [OK    ] all fine")
+        monkeypatch.setattr(mod, "run", trust_run(admin=hostile))
+        entries = mod.check_trust_store()["entries"]
+        assert not any("\n" in e or "[OK" in e for e in entries)
+
+    def test_the_parser_reads_both_result_spellings(self, mod):
+        assert mod.parse_trust_settings(DIRTY)[0]["results"] == ["kSecTrustSettingsResultTrustRoot"]
+        assert mod.parse_trust_settings(USER_DIRTY)[1]["results"] == ["kSecTrustSettingsResultTrustRoot"]
+        assert mod.parse_trust_settings(CLEAN) == []
+        assert mod.parse_trust_settings("") is None
+
+
+class TestATrustSettingArrivingIsAChange:
+    """interception.trust_store was sealed into every baseline and never
+    compared, so the section's HIGH repeated weekly without ever saying when
+    the entry had appeared."""
+
+    def _state(self, mod, monkeypatch, admin=CLEAN, user=CLEAN):
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", trust_run(admin=admin, user=user))
+        return {"interception": {"trust_store": mod.check_trust_store()}}
+
+    def test_a_new_user_domain_root_is_a_change_note(self, mod, monkeypatch):
+        old = self._state(mod, monkeypatch)
+        new = self._state(mod, monkeypatch, user=USER_DIRTY)
+        notes = mod.diff_baseline(old, new)
+        assert len(notes) == 1 and notes[0].startswith("NEW trust-store override(s)")
+        assert "mitmproxy (user domain, TrustRoot)" in notes[0]
+        assert "tplinkmodem.net (user domain, TrustAsRoot)" in notes[0]
+
+    def test_a_removed_override_is_said_too(self, mod, monkeypatch):
+        old = self._state(mod, monkeypatch, admin=DIRTY)
+        new = self._state(mod, monkeypatch)
+        notes = mod.diff_baseline(old, new)
+        assert len(notes) == 1 and "removed" in notes[0] and "Corporate Proxy Root CA" in notes[0]
+
+    def test_the_same_overrides_are_silent(self, mod, monkeypatch):
+        old = self._state(mod, monkeypatch, user=USER_DIRTY)
+        new = self._state(mod, monkeypatch, user=USER_DIRTY)
+        assert mod.diff_baseline(old, new) == []
+
+    def test_a_baseline_from_before_the_structured_list_is_not_compared(self, mod, monkeypatch):
+        # Entries were bare "Cert 0: name" strings; comparing them with the
+        # new form would call every standing entry new on the first run.
+        old = {"interception": {"trust_store": {"supported": True, "risk": "HIGH",
+                                                "entries": ["Cert 0: Corporate Proxy Root CA"]}}}
+        new = self._state(mod, monkeypatch, admin=DIRTY, user=USER_DIRTY)
+        assert mod.diff_baseline(old, new) == []
+
+    def test_a_domain_unreadable_on_either_side_is_not_compared(self, mod, monkeypatch):
+        # Not read is not "none": the admin domain's root did not arrive this
+        # week just because last week's read of that domain failed.
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        monkeypatch.setattr(mod, "run", trust_run(admin="", user=USER_DIRTY))
+        old = {"interception": {"trust_store": mod.check_trust_store()}}
+        new = self._state(mod, monkeypatch, admin=DIRTY, user=USER_DIRTY)
+        assert mod.diff_baseline(old, new) == []
+
+    def test_a_hostile_override_list_does_not_raise(self, mod):
+        old = {"interception": {"trust_store": {"overrides": [None, 7, {"domain": "user"}], "domains": {"user": True}}}}
+        new = {"interception": {"trust_store": {"overrides": [{"domain": "user", "name": 3, "results": "x"}],
+                                                "domains": {"user": True}}}}
+        assert isinstance(mod.diff_baseline(old, new), list)
 
     def test_it_is_skipped_off_macos_rather_than_guessed(self, mod, monkeypatch):
         # Host-posture, same rule as the firewall and sharing checks: on an
@@ -322,7 +482,7 @@ class TestTheAnswerIsValidatedBeforeItIsBelieved:
 class TestReporting:
     def test_the_action_reports_both_checks(self, mod, monkeypatch, capsys):
         monkeypatch.setattr(mod.sys, "platform", "darwin")
-        monkeypatch.setattr(mod, "run", make_run({SECURITY_CMD: CLEAN}))
+        monkeypatch.setattr(mod, "run", trust_run())
         monkeypatch.setattr(mod, "probe_dns_interception",
                             lambda: {"intercepted": False, "responder": None,
                                      "risk": "OK", "note": "clean"})
@@ -333,7 +493,7 @@ class TestReporting:
 
     def test_a_dirty_trust_store_prints_its_entries(self, mod, monkeypatch, capsys):
         monkeypatch.setattr(mod.sys, "platform", "darwin")
-        monkeypatch.setattr(mod, "run", make_run({SECURITY_CMD: DIRTY}))
+        monkeypatch.setattr(mod, "run", trust_run(admin=DIRTY, user=USER_DIRTY))
         monkeypatch.setattr(mod, "probe_dns_interception",
                             lambda: {"intercepted": False, "responder": None,
                                      "risk": "OK", "note": "clean"})
