@@ -791,3 +791,66 @@ class TestNeighboursAreDevicesNotGroups:
         # departure is a non-event, so the transition is silent.
         old = snap(neighbours=[GW, "192.168.1.42", "255.255.255.255"])
         assert mod.diff_snapshots(old, snap()) == []
+
+
+NEST_MAC = "38:8b:59:e0:f1:70"
+NEST_ON_IOT = "3a:8b:59:e0:f1:70"
+NEST_LABEL = "Google Nest - Back corner (loveshack router)"
+RANDOM_MAC = "1a:4b:9f:2b:a2:ab"
+
+
+class TestAGatewayOnTheLabelledRoutersOwnSecondAddress:
+    """A router serving a guest or IoT network from the same radio answers there
+    on its burned-in address with the locally-administered bit set. Measured on
+    the IoT network here: the gateway moved onto that address three times in
+    two days, and each was a HIGH that read as ARP poisoning of a router the
+    owner had already labelled."""
+
+    LABELS = {NEST_MAC: NEST_LABEL}
+
+    def test_the_derived_address_of_a_labelled_device_is_recognised(self, mod):
+        assert mod.derived_from_labelled(NEST_ON_IOT, self.LABELS) == NEST_LABEL
+        assert mod.derived_from_labelled(NEST_ON_IOT.upper(), {NEST_MAC.upper(): NEST_LABEL}) == NEST_LABEL
+
+    def test_nothing_else_is(self, mod):
+        derived = mod.derived_from_labelled
+        assert derived(NEST_MAC, self.LABELS) is None, "the burned-in address is not derived from itself"
+        assert derived(ATTACKER_MAC, self.LABELS) is None
+        assert derived("3e:8b:59:e0:f1:70", self.LABELS) is None, "one more bit different"
+        assert derived("3a:8b:59:e0:f1:71", self.LABELS) is None
+        assert derived(NEST_ON_IOT, None) is None
+        assert derived(NEST_ON_IOT, {}) is None
+        assert derived(NEST_ON_IOT, {NEST_MAC: ""}) is None, "an empty label names nobody"
+        assert derived(NEST_ON_IOT, {NEST_MAC: {"name": "x"}}) is None
+        assert derived(None, self.LABELS) is None
+        assert derived("not a mac", self.LABELS) is None
+
+    def test_a_gateway_moving_onto_it_is_review_and_names_the_router(self, mod):
+        events = mod.diff_snapshots(snap(gateway_mac=RANDOM_MAC), snap(gateway_mac=NEST_ON_IOT),
+                                    labels=self.LABELS)
+        assert [(e["severity"], e["kind"]) for e in events] == [("REVIEW", "gateway_mac_changed")]
+        assert NEST_LABEL in events[0]["detail"]
+        assert RANDOM_MAC in events[0]["detail"] and NEST_ON_IOT in events[0]["detail"]
+        assert "reported, not assumed" in events[0]["detail"]
+
+    def test_without_the_label_it_is_still_high(self, mod):
+        events = mod.diff_snapshots(snap(gateway_mac=RANDOM_MAC), snap(gateway_mac=NEST_ON_IOT))
+        assert events[0]["severity"] == "HIGH" and "ARP poisoning" in events[0]["detail"]
+
+    def test_moving_away_from_it_to_an_unnamed_address_is_still_high(self, mod):
+        events = mod.diff_snapshots(snap(gateway_mac=NEST_ON_IOT), snap(gateway_mac=RANDOM_MAC),
+                                    labels=self.LABELS)
+        assert [(e["severity"], e["kind"]) for e in events] == [("HIGH", "gateway_mac_changed")]
+
+    def test_a_label_on_some_other_device_changes_nothing(self, mod):
+        events = mod.diff_snapshots(snap(), snap(gateway_mac=ATTACKER_MAC),
+                                    labels={NEST_MAC: NEST_LABEL, "aa:bb:cc:00:11:22": "Printer"})
+        assert events[0]["severity"] == "HIGH"
+
+    def test_a_gateway_whose_address_also_moved_is_not_softened(self, mod):
+        events = mod.diff_snapshots(snap(gateway_mac=RANDOM_MAC),
+                                    snap(gateway="192.168.1.99", gateway_mac=NEST_ON_IOT),
+                                    labels=self.LABELS)
+        changed = [e for e in events if e["kind"] == "gateway_mac_changed"]
+        assert all(e["severity"] == "HIGH" for e in changed)
+        assert "gateway_changed" in [e["kind"] for e in events]
