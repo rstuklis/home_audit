@@ -11,14 +11,23 @@ permissions:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # The tool targets macOS, but the suite is fixture-driven and fully
         # sandboxed, so it runs anywhere. Linux is the fast default; the macOS
         # job is what would catch a real behavioural difference in the stdlib.
-        python-version: ["3.9", "3.11", "3.13"]
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.13"]
+        # 3.9 is the python3 that macOS itself ships (/usr/bin/python3), so it
+        # stays tested. setup-python has no 3.9 build for the image
+        # ubuntu-latest moved to (Ubuntu 26.04, November 2026: the job failed
+        # at set-up without running a test), so it is pinned to the last image
+        # that has one.
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.9"
 
     steps:
       - uses: actions/checkout@v4
