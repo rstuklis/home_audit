@@ -3153,6 +3153,29 @@ def describe_monitor_mac(mac, labels=None):
     return named
 
 
+def derived_from_labelled(mac, labels=None):
+    """The owner's label for the device whose hardware address `mac` is with
+    the locally-administered bit set, or None.
+
+    A router that serves a second network from the same radio (a guest or IoT
+    network) answers on it with its own burned-in address and that one bit
+    flipped: 38:8b:59:e0:f1:70 on the main network is 3a:8b:59:e0:f1:70 on the
+    guest one. The owner has already said whose the burned-in address is, by
+    labelling it, so the derived one is not an unknown address. It is still an
+    address anyone on the link can claim, which is why a gateway that moves to
+    it is said out loud at REVIEW rather than passed over.
+    """
+    mac = str(mac or "").lower()
+    if not _MAC_SHAPE.match(mac) or not is_randomized_mac(mac) or not isinstance(labels, dict):
+        return None
+    first = int(mac[:2], 16) & ~0x02
+    burned_in = f"{first:02x}{mac[2:]}"
+    for known, name in labels.items():
+        if str(known).lower() == burned_in and isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
 def diff_snapshots(old, new, memory=None, labels=None):
     """Compare two snapshots into a list of {severity, kind, detail}.
 
@@ -3191,7 +3214,23 @@ def diff_snapshots(old, new, memory=None, labels=None):
             detail = (f"The gateway's MAC changed from {old_mac} to {new_mac} while "
                       "its IP stayed the same. That is what ARP poisoning looks "
                       "like — someone may now be between this machine and the router.")
-        events.append({"severity": "HIGH", "kind": "gateway_mac_changed", "detail": detail})
+        severity = "HIGH"
+        owner = None if address_changed else derived_from_labelled(new_mac, labels)
+        if owner:
+            # The address the labelled router itself uses on a second network.
+            # Measured here: the guest network's gateway moved between random
+            # addresses and this one three times in two days, each a HIGH that
+            # read as ARP poisoning. Moving TO the derived address is the
+            # router settling on its own; moving AWAY from it to an address
+            # nobody has named stays HIGH above.
+            severity = "REVIEW"
+            detail = (f"The gateway's MAC changed from {old_mac} to {new_mac} while its IP "
+                      f"stayed the same. The new address is the one labelled [{owner}] with "
+                      "the locally-administered bit set, which is how a router answers on a "
+                      "second network of its own (a guest or IoT network), so this is most "
+                      "likely that router. It is an address anyone on the link could claim, "
+                      "so it is reported, not assumed.")
+        events.append({"severity": severity, "kind": "gateway_mac_changed", "detail": detail})
 
     # An address that answered with one hardware address a minute ago and
     # another now. A DHCP lease moving to a different device takes hours and
@@ -3372,6 +3411,13 @@ CRITICAL_ABSENT_POLLS = 10
 # within one heartbeat interval, which observation_gaps reports rather than
 # rounds away.
 HEARTBEAT_INTERVAL = 900
+# A Mac left on another of the owner's networks takes the monitor with it, and
+# the home network then goes unwatched without anything saying so: measured
+# here, six days on the IoT network after a manual hop. Said once after this
+# long away, and again each day it lasts.
+HOME_SUBNET_ENV = "HOME_NET_AUDIT_HOME_SUBNET"
+AWAY_AFTER = 3 * 3600
+AWAY_REPEAT = 24 * 3600
 # The largest cadence a heartbeat is believed to claim. The sink is append-only
 # by design and the threat model assumes the host can append: one line with
 # "interval": 10**12 raised observation_gaps' threshold for every pair of beats
@@ -3965,9 +4011,27 @@ def monitor_state_missing_event(beats, reference):
     return {"severity": "HIGH", "kind": "monitor_state_missing", "detail": detail}, last
 
 
+def normal_subnet(text):
+    """`text` as a canonical network ("192.168.87.0/24"), or None if it is not one."""
+    try:
+        return str(ipaddress.ip_network(str(text).strip(), strict=False))
+    except ValueError:
+        return None
+
+
+def away_from_home_event(subnet, home, seconds):
+    hours = int(seconds // 3600)
+    return {"severity": "REVIEW", "kind": "away_from_home",
+            "detail": f"This Mac has been on {subnet} for {hours} hour(s), not on its home "
+                      f"network {home}. The monitor follows the Mac, so the home network "
+                      "is not being watched while it is here. If it was left on this "
+                      "network by mistake, join the home network again."}
+
+
 def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 sleeper=time.sleep, printer=print,
-                heartbeat_interval=HEARTBEAT_INTERVAL, clock=None):
+                heartbeat_interval=HEARTBEAT_INTERVAL, clock=None,
+                home_subnet=None, away_after=AWAY_AFTER, away_repeat=AWAY_REPEAT):
     """Poll the cheap checks and alert on change.
 
     `iterations=None` runs until interrupted; a number bounds it, which is what
@@ -3996,7 +4060,15 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
     A missing state file is not a fresh start when the off-host record holds
     heartbeats for this chain: the file was deleted, and the first poll is
     compared against the weekly baseline, at HIGH, instead of adopted.
+
+    With `home_subnet`, a Mac that stays on another network of the owner's (one
+    that has a weekly baseline of its own, so not a hotel or a tether) for
+    `away_after` seconds is told so at REVIEW, and again every `away_repeat`
+    seconds while it lasts: the home network is not watched from there.
     """
+    home = normal_subnet(home_subnet) if home_subnet else None
+    away_since = None       # when this process first saw the Mac on another known network
+    away_said = None        # when it last said so
     # A callable, not an instant: the loop reads it once per poll. The
     # pure-function siblings (observation_gaps, describe_baseline_freshness)
     # take a datetime under the name `now`, so this one is named for what it is.
@@ -4207,6 +4279,24 @@ def run_monitor(interval=MONITOR_INTERVAL, iterations=None, alert_to=None,
                 if iterations is None or count < iterations:
                     sleeper(interval)
                 continue
+
+            # Left on another of the owner's networks? Known by having a weekly
+            # baseline of its own that describes this network (a refused one
+            # never gets here): away from home altogether there is nothing to
+            # rejoin and nothing to say.
+            if home and watched_subnet:
+                here = normal_subnet(watched_subnet)
+                if here and here != home and os.path.exists(BASELINE_FILE):
+                    if away_since is None:
+                        away_since = polled_at
+                    spent = (polled_at - away_since).total_seconds()
+                    if spent >= away_after and (
+                            away_said is None
+                            or (polled_at - away_said).total_seconds() >= away_repeat):
+                        away_said = polled_at
+                        _say(away_from_home_event(here, home, spent))
+                elif here:
+                    away_since = away_said = None
 
             if switched:
                 # The first snapshot on a newly selected chain is neither
@@ -6287,11 +6377,18 @@ def diff_baseline(old, new, labels=None, critical=None):
     old_macs = set((old.get("arp_spoof") or {}).get("macs_seen") or [])
     new_macs = set((new.get("arp_spoof") or {}).get("macs_seen") or [])
     if old_macs and new_macs and old_macs != new_macs:
-        notes.append(
+        note = (
             f"Gateway MAC CHANGED: was {sorted(old_macs)}, now {sorted(new_macs)}. "
             "A stable MAC that is stable at a DIFFERENT value than the baseline is "
             "what an ARP poisoner who was already in place before this run looks "
             "like — the per-run 'stable across all polls' check cannot see it.")
+        owners = [derived_from_labelled(m, labels) for m in sorted(new_macs)]
+        if len(owners) == 1 and owners[0]:
+            note += (f" The new address is the one labelled [{owners[0]}] with the "
+                     "locally-administered bit set, which is how a router answers on a "
+                     "second network of its own, so this is most likely that router; "
+                     "it is still an address anyone on the link could claim.")
+        notes.append(note)
     return notes
 
 
@@ -11728,6 +11825,10 @@ def _main():
                          "rogue RA or ARP poisoning that is withdrawn between scans.")
     ap.add_argument("--interval", type=int, default=MONITOR_INTERVAL, metavar="SECONDS",
                     help=f"Seconds between monitor polls (default {MONITOR_INTERVAL}).")
+    ap.add_argument("--home-subnet", metavar="CIDR",
+                    help="With --monitor: this Mac's home network, e.g. 192.168.87.0/24. "
+                         "Left on another of your networks for three hours, the monitor "
+                         f"says the home network is not being watched. Or set {HOME_SUBNET_ENV}.")
     ap.add_argument("--alert-to", metavar="DEST",
                     help="Where monitor alerts go — a path or https:// URL off this "
                          f"machine. Or set {ALERT_ENV}.")
@@ -11757,7 +11858,10 @@ def _main():
                                         args.not_critical, args.monitor])
 
     if args.monitor:
-        run_monitor(interval=args.interval, alert_to=args.alert_to)
+        home_subnet = args.home_subnet or os.environ.get(HOME_SUBNET_ENV) or None
+        if home_subnet and not normal_subnet(home_subnet):
+            ap.error(f"--home-subnet: {home_subnet!r} is not a network such as 192.168.87.0/24")
+        run_monitor(interval=args.interval, alert_to=args.alert_to, home_subnet=home_subnet)
         return
 
     if not cli_args_given or args.menu:

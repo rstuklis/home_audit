@@ -952,3 +952,99 @@ class TestIPv6OnlyHostsAreDevices:
 
     def test_names_are_only_asked_of_hosts_with_an_ipv4_address(self, mod):
         assert mod.collect_device_names([{"ip": None, "ip6": CAMERA_V6, "mac": CAMERA_MAC}]) == ""
+
+
+# ---------------------------------------------------------------------------
+# Left on another of the owner's networks
+# ---------------------------------------------------------------------------
+
+def iot_baseline(mod):
+    mod.select_network_baseline(IOT)
+    mod.save_baseline({"timestamp": at(days=-1).isoformat(), "gateway": IOT_GW,
+                       "gateway_mac": IOT_GW_MAC, "dns": [IOT_GW], "ipv6_routers": [],
+                       "devices": [{"ip": IOT_GW, "mac": IOT_GW_MAC, "subnet": IOT},
+                                   {"ip": "192.168.85.20", "mac": "d4:a6:51:00:00:20", "subnet": IOT}],
+                       "scanned_subnets": [IOT], "router_open_ports": [80]})
+
+
+class TestAMacLeftOnAnotherOfItsOwnNetworks:
+    """2 to 8 November: after a manual hop the Mac sat on the IoT network for six
+    days. The monitor followed it, correctly, and the home network went
+    unwatched with nothing saying so."""
+
+    def away(self, mod, monkeypatch, snapshots, *times, **kw):
+        on_network(mod, monkeypatch, IOT)
+        events = watch(mod, monkeypatch, snapshots, clock=ticking(*times), home_subnet=HOME, **kw)
+        return [e for e in events if e["kind"] == "away_from_home"]
+
+    def test_it_is_said_after_three_hours(self, mod, monkeypatch):
+        iot_baseline(mod)
+        said = self.away(mod, monkeypatch, [iot_snap()] * 3, at(), at(hours=2), at(hours=4))
+        assert len(said) == 1 and said[0]["severity"] == "REVIEW"
+        assert IOT in said[0]["detail"] and HOME in said[0]["detail"]
+        assert "4 hour(s)" in said[0]["detail"]
+        assert "not being watched" in said[0]["detail"]
+
+    def test_not_before(self, mod, monkeypatch):
+        iot_baseline(mod)
+        assert self.away(mod, monkeypatch, [iot_snap()] * 3, at(), at(hours=1), at(hours=2)) == []
+
+    def test_once_a_day_while_it_lasts(self, mod, monkeypatch):
+        iot_baseline(mod)
+        said = self.away(mod, monkeypatch, [iot_snap()] * 6,
+                         at(), at(hours=4), at(hours=5), at(hours=27), at(hours=29), at(hours=53))
+        assert len(said) == 3
+        assert "53 hour(s)" in said[2]["detail"]
+
+    def test_a_network_with_no_baseline_of_its_own_is_somewhere_else_entirely(self, mod, monkeypatch):
+        """A hotel, a tether: nothing of the owner's to rejoin from here."""
+        assert self.away(mod, monkeypatch, [iot_snap()] * 3, at(), at(hours=4), at(hours=30)) == []
+
+    def test_at_home_nothing_is_said(self, mod, monkeypatch):
+        home_baseline(mod)
+        on_network(mod, monkeypatch, HOME)
+        events = watch(mod, monkeypatch, [snap()] * 3, clock=ticking(at(), at(hours=4), at(hours=30)),
+                       home_subnet=HOME)
+        assert "away_from_home" not in [e["kind"] for e in events]
+
+    def test_without_a_home_network_named_nothing_is_said(self, mod, monkeypatch):
+        iot_baseline(mod)
+        on_network(mod, monkeypatch, IOT)
+        events = watch(mod, monkeypatch, [iot_snap()] * 3, clock=ticking(at(), at(hours=4), at(hours=30)))
+        assert "away_from_home" not in [e["kind"] for e in events]
+
+    def test_going_home_starts_the_count_again(self, mod, monkeypatch):
+        iot_baseline(mod)
+        home_baseline(mod)
+        said = self.away(mod, monkeypatch,
+                         [iot_snap(), iot_snap(), snap(), snap(), iot_snap(), iot_snap(), iot_snap()],
+                         at(), at(hours=2), at(hours=2, minutes=1), at(hours=2, minutes=2),
+                         at(hours=4), at(hours=5), at(hours=8))
+        assert len(said) == 1, "two hours away, home, then away again: counted from the return"
+        assert "4 hour(s)" in said[0]["detail"], "back at hour 4, said at hour 8"
+
+    def test_the_home_network_is_matched_however_it_is_written(self, mod, monkeypatch):
+        home_baseline(mod)
+        on_network(mod, monkeypatch, HOME)
+        events = watch(mod, monkeypatch, [snap()] * 2, clock=ticking(at(), at(hours=5)),
+                       home_subnet="192.168.87.1/24")
+        assert "away_from_home" not in [e["kind"] for e in events]
+
+    def test_a_home_network_that_is_not_one_is_refused_on_the_command_line(self, mod, monkeypatch, capsys):
+        monkeypatch.setattr(mod.sys, "argv", ["home_net_audit.py", "--monitor", "--home-subnet", "loveshack"])
+        monkeypatch.setattr(mod, "run_monitor", lambda **k: pytest.fail("the monitor started"))
+        with pytest.raises(SystemExit):
+            mod.main()
+        assert "is not a network" in capsys.readouterr().err
+
+    def test_the_command_line_and_the_environment_both_reach_the_loop(self, mod, monkeypatch):
+        got = []
+        monkeypatch.setattr(mod, "run_monitor", lambda **k: got.append(k.get("home_subnet")))
+        monkeypatch.setattr(mod.sys, "argv", ["home_net_audit.py", "--monitor", "--home-subnet", HOME])
+        mod.main()
+        monkeypatch.setattr(mod.sys, "argv", ["home_net_audit.py", "--monitor"])
+        monkeypatch.setenv(mod.HOME_SUBNET_ENV, IOT)
+        mod.main()
+        monkeypatch.delenv(mod.HOME_SUBNET_ENV)
+        mod.main()
+        assert got == [HOME, IOT, None]

@@ -137,6 +137,17 @@ It watches the default gateway, **the gateway's MAC** (a change there with the
 IP unchanged is what ARP poisoning looks like), the set of advertising IPv6
 routers, the DNS resolvers, and arrivals in the neighbour table.
 
+Two things soften or add to that, both at REVIEW:
+
+- A gateway that moves onto the address of a device **you have labelled** with
+  the locally-administered bit set (`38:…` labelled, `3a:…` seen) is how a
+  router answers on a guest or IoT network of its own. It is reported at REVIEW
+  and names the label. Any other change of the gateway's MAC stays HIGH.
+- `--home-subnet 192.168.87.0/24` (or `HOME_NET_AUDIT_HOME_SUBNET`) names the
+  network this machine normally lives on. The monitor follows the machine, so
+  one left on another of your networks (one with a weekly baseline of its own)
+  stops watching home: after three hours there it says so, and again each day.
+
 Alerts go to a **separate** destination from receipts, with a **separate**
 credential. Routine bookkeeping and things a person must wake up for usually
 belong on different channels — and an alert printed to a terminal on the host
