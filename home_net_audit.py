@@ -5261,7 +5261,8 @@ def known_network_macs(state):
     return macs
 
 
-def baseline_describes_another_network(state, subnet_str, gateway_mac, ssid=None, seen_macs=()):
+def baseline_describes_another_network(state, subnet_str, gateway_mac, ssid=None, seen_macs=(),
+                                       labels=None):
     """Why `state` must not be read as this network's baseline, or None.
 
     A baseline is bound to the gateway it was taken behind. The same subnet
@@ -5283,6 +5284,17 @@ def baseline_describes_another_network(state, subnet_str, gateway_mac, ssid=None
     gateway on an otherwise empty ARP cache is at worst a REVIEW that resolves
     itself as soon as a household device answers — the monitor asks again every
     poll — and never a false all-clear.
+
+    One more tie, short of an SSID: the live gateway answering on the address
+    of a device the owner has labelled with the locally-administered bit set
+    (derived_from_labelled) is the owner's own router on its guest or IoT
+    network, which re-draws that network's address when it restarts. Measured
+    here: the IoT network's baseline recorded a random address, the router went
+    back to its derived one, and the audit, asked straight after a Wi-Fi hop
+    with no SSID and an empty ARP cache, refused the baseline and compared
+    nothing that week. Tied, the comparison runs and reports the gateway's
+    changed MAC itself; an address anyone can claim earns a comparison, not
+    silence. `labels` defaults to the owner's saved ones.
     """
     recorded = baseline_gateway_mac(state)
     live = str(gateway_mac or "").lower()
@@ -5300,6 +5312,8 @@ def baseline_describes_another_network(state, subnet_str, gateway_mac, ssid=None
                 "mixed into the other's.")
     seen = {str(m).lower() for m in (seen_macs or ()) if isinstance(m, str)} - {live}
     if seen & (known_network_macs(state) - {recorded}):
+        return None
+    if derived_from_labelled(live, load_labels() if labels is None else labels):
         return None
     return (f"The baseline for {subnet_str} was taken on a different network, or this "
             f"network's gateway now answers from different hardware: the baseline recorded "
