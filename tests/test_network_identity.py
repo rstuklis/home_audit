@@ -1048,3 +1048,45 @@ class TestAMacLeftOnAnotherOfItsOwnNetworks:
         monkeypatch.delenv(mod.HOME_SUBNET_ENV)
         mod.main()
         assert got == [HOME, IOT, None]
+
+
+class TestAGatewayOnALabelledRoutersDerivedAddressIsTheSameNetwork:
+    """12 November: the IoT network's baseline recorded a random gateway address,
+    the Nest went back to its own address with the local bit set, and the audit
+    refused the baseline: nothing compared, nothing saved, every week."""
+
+    NEST, DERIVED, RANDOM = "38:8b:59:e0:f1:70", "3a:8b:59:e0:f1:70", "1a:4b:9f:2b:a2:ab"
+    LABELS = {NEST: "Google Nest - Back corner (loveshack router)"}
+    STATE = {"gateway": IOT_GW, "gateway_mac": RANDOM,
+             "devices": [{"ip": IOT_GW, "mac": RANDOM, "subnet": IOT}]}
+
+    def test_it_ties_the_network_to_its_baseline(self, mod):
+        assert mod.baseline_describes_another_network(
+            self.STATE, IOT, self.DERIVED, labels=self.LABELS) is None
+
+    def test_the_saved_labels_are_read_when_none_are_passed(self, mod):
+        assert mod.baseline_describes_another_network(self.STATE, IOT, self.DERIVED)
+        mod.save_labels(self.LABELS)
+        assert mod.baseline_describes_another_network(self.STATE, IOT, self.DERIVED) is None
+
+    def test_an_unlabelled_router_is_still_refused(self, mod):
+        reason = mod.baseline_describes_another_network(self.STATE, IOT, self.DERIVED, labels={})
+        assert reason and "different network" in reason
+
+    def test_any_other_address_is_still_refused(self, mod):
+        assert mod.baseline_describes_another_network(
+            self.STATE, IOT, ATTACKER_MAC, labels=self.LABELS)
+
+    def test_a_different_ssid_still_wins(self, mod):
+        state = dict(self.STATE, wifi={"ssid": "loveshack-iot"})
+        reason = mod.baseline_describes_another_network(
+            state, IOT, self.DERIVED, ssid="BeachHouse", labels=self.LABELS)
+        assert reason and "BeachHouse" in reason
+
+    def test_the_comparison_then_reports_the_change_and_names_the_router(self, mod):
+        new = dict(self.STATE, gateway_mac=self.DERIVED,
+                   arp_spoof={"gateway": IOT_GW, "macs_seen": [self.DERIVED], "spoofing_suspected": False})
+        old = dict(self.STATE, arp_spoof={"gateway": IOT_GW, "macs_seen": [self.RANDOM],
+                                          "spoofing_suspected": False})
+        text = "\n".join(str(x) for x in mod.diff_baseline(old, new, labels=self.LABELS))
+        assert "Gateway MAC CHANGED" in text and "Back corner" in text
